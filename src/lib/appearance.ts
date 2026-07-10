@@ -40,6 +40,11 @@ interface AppearanceState {
   /** Open the full Now Playing view automatically when a new song starts. */
   openNowPlayingOnPlay: boolean;
   setOpenNowPlayingOnPlay: (v: boolean) => void;
+  /** Native audio engine (beta): drive downloaded tracks through the Rust
+   *  engine instead of the WebKit <audio> element. Off = the proven webview
+   *  player. See src/lib/nativeEngine.ts + src-tauri/src/engine. */
+  nativeEngine: boolean;
+  setNativeEngine: (v: boolean) => void;
   /** Restore appearance defaults (zoom 100%, no auto-open). */
   reset: () => void;
 }
@@ -51,6 +56,8 @@ export const useAppearanceStore = create<AppearanceState>()(
       setZoom: (z) => set({ zoom: clampZoom(z) }),
       openNowPlayingOnPlay: false,
       setOpenNowPlayingOnPlay: (v) => set({ openNowPlayingOnPlay: v }),
+      nativeEngine: false,
+      setNativeEngine: (v) => set({ nativeEngine: v }),
       reset: () => set({ zoom: 1, openNowPlayingOnPlay: false }),
     }),
     {

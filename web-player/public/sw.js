@@ -310,11 +310,11 @@
 // so an app relaunch paints the last feed instantly (stale-while-revalidate,
 // no skeleton), and the server serves Home card art at 500×500 instead of
 // 1000×1000 (~4× fewer image bytes per feed; full-res stays everywhere else).
-// v245: "Recently played" updates live — as the queue advances, the new track
-// is optimistically prepended to that shelf (dedup, cap) instead of re-fetching
-// the whole feed (which would reshuffle discovery). Mirrors what the server
-// records at play-start, so it reconciles on the next natural refresh.
-const SHELL_CACHE = 'beetbot-shell-v245';
+// v249: catalog (Deezer) playlist pages now get now-playing awareness — the
+// playing row shows the equalizer bars in its # gutter and the hero Play button
+// toggles ⏸/▶ (was missing; wired isTrackCurrent/isPlaying/onTogglePlay through
+// PlaylistDetailModal to match the album + library playlist pages).
+const SHELL_CACHE = 'beetbot-shell-v252';
 // Bump the cache name to invalidate everything ever cached at v1. The
 // v1 cache held m4a files downloaded before we started embedding album
 // art via ffmpeg post-process — those old bytes have no `covr` atom,

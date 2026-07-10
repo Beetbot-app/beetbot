@@ -21,6 +21,13 @@ interface PlayerState {
    *  setQueue clears it (re-set by the card handler). */
   nowPlayingKey: string | null;
   setNowPlayingKey: (key: string | null) => void;
+  /** The most recent track that crossed the ~20s "counts as a play" threshold
+   *  and was logged to play_events. Drives Home's live "Recently played" prepend
+   *  so the optimistic shelf only shows songs the server will actually keep —
+   *  prepending at track START would surface sub-20s plays that then vanish on
+   *  the next feed fetch. Null until the first play is logged this session. */
+  lastLoggedTrack: StreamTrack | null;
+  markPlayLogged: (t: StreamTrack) => void;
   currentTime: number;
   duration: number;
   repeat: RepeatMode;
@@ -97,6 +104,7 @@ export const usePlayerStore = create<PlayerState>()(
   currentIndex: 0,
   isPlaying: false,
   nowPlayingKey: null,
+  lastLoggedTrack: null,
   currentTime: 0,
   duration: 0,
   // Default is no-repeat so a finished single/playlist flows into Autoplay
@@ -176,6 +184,7 @@ export const usePlayerStore = create<PlayerState>()(
 
   playPause: () => set((s) => ({ isPlaying: !s.isPlaying })),
   setNowPlayingKey: (key) => set({ nowPlayingKey: key }),
+  markPlayLogged: (t) => set({ lastLoggedTrack: t }),
   play: () => set({ isPlaying: true }),
   pause: () => set({ isPlaying: false }),
 

@@ -1,8 +1,16 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react';
 import { PlaylistCard } from '@/components/PlaylistCard';
 import { CardPlayButton } from '@shared/components/Marquee';
 import { ContextMenu, MenuGlyphs, type MenuItem, type MenuState } from '@shared/components/ContextMenu';
 import { formatDuration } from '@/lib/format';
+import { cn, POPOVER } from '@shared/ui';
 import { canStream, usePlayerStore } from '@/lib/store';
 import { useProfileStore } from '@/lib/profile';
 import { useNavStore } from '@/lib/nav';
@@ -43,8 +51,9 @@ const TABS: { id: Tab; label: string }[] = [
 
 const SORTS: Record<Tab, { id: string; label: string }[]> = {
   playlists: [
-    { id: 'recent', label: 'Recent' },
-    { id: 'name', label: 'Name' },
+    { id: 'recent', label: 'Recents' },
+    { id: 'added', label: 'Recently Added' },
+    { id: 'name', label: 'Alphabetical' },
   ],
   songs: [
     { id: 'title', label: 'Title' },
@@ -69,6 +78,91 @@ const DEFAULT_SORT: Record<Tab, string> = {
   artists: 'name',
 };
 
+type ViewMode = 'list' | 'grid';
+const VIEW_MODES: { id: ViewMode; label: string; icon: ReactNode }[] = [
+  {
+    id: 'list',
+    label: 'List',
+    icon: (
+      <svg width={18} height={18} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" aria-hidden>
+        <circle cx="4" cy="6" r="1.1" fill="currentColor" stroke="none" />
+        <circle cx="4" cy="12" r="1.1" fill="currentColor" stroke="none" />
+        <circle cx="4" cy="18" r="1.1" fill="currentColor" stroke="none" />
+        <path d="M9 6h11M9 12h11M9 18h11" />
+      </svg>
+    ),
+  },
+  {
+    id: 'grid',
+    label: 'Grid',
+    icon: (
+      <svg width={18} height={18} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} aria-hidden>
+        <rect x="3.5" y="3.5" width="7" height="7" rx="1.4" />
+        <rect x="13.5" y="3.5" width="7" height="7" rx="1.4" />
+        <rect x="3.5" y="13.5" width="7" height="7" rx="1.4" />
+        <rect x="13.5" y="13.5" width="7" height="7" rx="1.4" />
+      </svg>
+    ),
+  },
+];
+const DEFAULT_VIEW: Record<Tab, ViewMode> = {
+  playlists: 'grid',
+  albums: 'grid',
+  artists: 'grid',
+  songs: 'list',
+};
+
+/** A compact library list row: art (square or round) + title + subtitle.
+ *  Shared by the Playlists / Albums / Artists list views. */
+function LibRow({
+  art,
+  round,
+  title,
+  subtitle,
+  onOpen,
+  onContext,
+}: {
+  art: string | null;
+  round?: boolean;
+  title: string;
+  subtitle: string;
+  onOpen: () => void;
+  onContext: (e: React.MouseEvent) => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      onContextMenu={onContext}
+      className="group flex w-full items-center gap-3 rounded-lg px-2 py-2 text-left hover:bg-white/5 transition"
+    >
+      <div
+        className={`h-12 w-12 shrink-0 overflow-hidden bg-neutral-800 grid place-items-center ${
+          round ? 'rounded-full' : 'rounded-md'
+        }`}
+      >
+        {art ? (
+          <img
+            src={art}
+            alt=""
+            className="h-full w-full object-cover"
+            draggable={false}
+            loading="lazy"
+          />
+        ) : (
+          <span className="text-neutral-600 text-lg">{round ? '☺' : '♪'}</span>
+        )}
+      </div>
+      <div className="min-w-0">
+        <div className="truncate text-sm font-medium text-neutral-100">
+          {title}
+        </div>
+        <div className="truncate text-xs text-neutral-500">{subtitle}</div>
+      </div>
+    </button>
+  );
+}
+
 /**
  * Library page — Daft-style. The playlist grid lives in its own tab (so nothing
  * existing is lost), alongside Artists / Albums / Songs views derived from the
@@ -85,6 +179,43 @@ export function LibraryPage({ onOpenPlaylist, onOpenSettings }: Props) {
   const [filter, setFilter] = useState('');
   const [sortBy, setSortBy] = useState<string>('recent');
   const [menu, setMenu] = useState<MenuState | null>(null);
+  const sortBtnRef = useRef<HTMLButtonElement>(null);
+  // Sort/view popover (custom, so it can hold a "Sort by" header + a "View as"
+  // icon row — more than the flat ContextMenu can). Position captured on open.
+  const [sortOpen, setSortOpen] = useState(false);
+  const [sortPos, setSortPos] = useState<{ top: number; right: number }>({
+    top: 0,
+    right: 0,
+  });
+  // View mode is PER TAB (each remembers its own list/grid choice, with a
+  // sensible default: grid for the art-forward tabs, list for songs).
+  const [viewByTab, setViewByTab] = useState<Record<Tab, ViewMode>>(() => {
+    try {
+      const raw = localStorage.getItem('beetbot.library.views');
+      if (raw) return { ...DEFAULT_VIEW, ...JSON.parse(raw) };
+    } catch {
+      /* fall through */
+    }
+    return DEFAULT_VIEW;
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem('beetbot.library.views', JSON.stringify(viewByTab));
+    } catch {
+      /* private mode — ignore */
+    }
+  }, [viewByTab]);
+  const viewMode = viewByTab[tab];
+  const setViewMode = (v: ViewMode) =>
+    setViewByTab((s) => ({ ...s, [tab]: v }));
+  useEffect(() => {
+    if (!sortOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setSortOpen(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [sortOpen]);
   const [addToPlaylist, setAddToPlaylist] = useState<{
     track: SearchTrackResult;
     token: string;
@@ -155,6 +286,9 @@ export function LibraryPage({ onOpenPlaylist, onOpenSettings }: Props) {
       : playlists;
     if (sortBy === 'name')
       out = [...out].sort((a, b) => a.name.localeCompare(b.name));
+    else if (sortBy === 'added')
+      out = [...out].sort((a, b) => (b.created_at ?? 0) - (a.created_at ?? 0));
+    else out = sortPlaylistsByRecent(out); // 'recent'
     return out;
   }, [playlists, f, sortBy]);
 
@@ -474,18 +608,37 @@ export function LibraryPage({ onOpenPlaylist, onOpenSettings }: Props) {
             </span>
           )}
           <div className="ml-auto flex items-center gap-2">
-            <select
-              value={sortBy}
-              onChange={(e) => setSortBy(e.target.value)}
-              aria-label="Sort"
-              className="rounded-lg bg-neutral-900 border border-neutral-800 px-2 py-1.5 text-sm text-neutral-300 focus:outline-none focus:border-neutral-400"
+            {/* Trigger shows just the current sort value + a sort glyph (the
+                "Sort by" title lives inside the popover, Spotify-style). The
+                value sits in a fixed-width, right-aligned slot so the button —
+                and the filter beside it — don't shift as the label changes. */}
+            <button
+              ref={sortBtnRef}
+              type="button"
+              aria-label="Sort and view options"
+              aria-haspopup="menu"
+              aria-expanded={sortOpen}
+              onClick={() => {
+                const r = sortBtnRef.current?.getBoundingClientRect();
+                if (r)
+                  setSortPos({
+                    top: r.bottom + 6,
+                    right: window.innerWidth - r.right,
+                  });
+                setSortOpen((o) => !o);
+              }}
+              className="flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm text-neutral-300 hover:text-neutral-100 hover:bg-white/5 transition"
             >
-              {SORTS[tab].map((s) => (
-                <option key={s.id} value={s.id}>
-                  Sort: {s.label}
-                </option>
-              ))}
-            </select>
+              <span className="w-28 text-right truncate">
+                {SORTS[tab].find((s) => s.id === sortBy)?.label ??
+                  SORTS[tab][0].label}
+              </span>
+              {/* The trailing icon mirrors the CURRENT view mode (list/grid),
+                  like Spotify — so the button reflects what's shown. */}
+              <span className="shrink-0 text-neutral-400">
+                {VIEW_MODES.find((v) => v.id === viewMode)?.icon}
+              </span>
+            </button>
             <input
               type="search"
               value={filter}
@@ -522,6 +675,21 @@ export function LibraryPage({ onOpenPlaylist, onOpenSettings }: Props) {
       {tab === 'playlists' &&
         (playlists.length === 0 ? (
           <EmptyLibrary onOpenSettings={onOpenSettings} />
+        ) : viewMode === 'list' ? (
+          <div className="flex flex-col">
+            {visiblePlaylists.map((p) => (
+              <LibRow
+                key={p.id}
+                art={p.cover_url}
+                title={p.name}
+                subtitle={`Playlist · ${p.track_count} ${
+                  p.track_count === 1 ? 'song' : 'songs'
+                }`}
+                onOpen={() => onOpenPlaylist(p.id)}
+                onContext={(e) => openMenu(e, playlistMenu(p))}
+              />
+            ))}
+          </div>
         ) : (
           <Grid>
             {visiblePlaylists.map((p) => (
@@ -541,6 +709,38 @@ export function LibraryPage({ onOpenPlaylist, onOpenSettings }: Props) {
           <RowsSkeleton />
         ) : visibleSongs.length === 0 ? (
           <Hint>{f ? 'No matches.' : 'No songs in your library yet.'}</Hint>
+        ) : viewMode === 'grid' ? (
+          <Grid>
+            {visibleSongs.map((t) => (
+              <button
+                key={t.id}
+                type="button"
+                onClick={() => onPlaySong(t, visibleSongs ?? [])}
+                onContextMenu={(e) => openMenu(e, songMenu(t))}
+                className="group text-left"
+              >
+                <div className="aspect-square w-full overflow-hidden rounded-lg bg-neutral-800 grid place-items-center ring-1 ring-white/5 transition-shadow group-hover:shadow-2xl group-hover:shadow-black/50">
+                  {t.album_art_url ? (
+                    <img
+                      src={t.album_art_url}
+                      alt=""
+                      className="h-full w-full object-cover"
+                      draggable={false}
+                      loading="lazy"
+                    />
+                  ) : (
+                    <span className="text-3xl text-neutral-600">♪</span>
+                  )}
+                </div>
+                <div className="mt-2 truncate text-sm font-medium text-neutral-100">
+                  {t.title}
+                </div>
+                <div className="truncate text-xs text-neutral-500">
+                  {t.artists.join(', ') || '—'}
+                </div>
+              </button>
+            ))}
+          </Grid>
         ) : (
           <SongList
             songs={visibleSongs}
@@ -557,17 +757,34 @@ export function LibraryPage({ onOpenPlaylist, onOpenSettings }: Props) {
         ) : (
           <>
             {multiAlbums && multiAlbums.length > 0 && (
-              <Grid>
-                {multiAlbums.map((a) => (
-                  <AlbumCard
-                    key={`${a.album} ${a.artist ?? ''}`}
-                    album={a}
-                    onOpen={() => openAlbum(a.album, a.artist)}
-                    onPlay={() => playAlbum(a)}
-                    onContext={(e) => openMenu(e, albumMenu(a))}
-                  />
-                ))}
-              </Grid>
+              viewMode === 'list' ? (
+                <div className="flex flex-col">
+                  {multiAlbums.map((a) => (
+                    <LibRow
+                      key={`${a.album} ${a.artist ?? ''}`}
+                      art={a.album_art_url}
+                      title={a.album}
+                      subtitle={`${a.artist ?? 'Album'} · ${a.track_count} ${
+                        a.track_count === 1 ? 'song' : 'songs'
+                      }`}
+                      onOpen={() => openAlbum(a.album, a.artist)}
+                      onContext={(e) => openMenu(e, albumMenu(a))}
+                    />
+                  ))}
+                </div>
+              ) : (
+                <Grid>
+                  {multiAlbums.map((a) => (
+                    <AlbumCard
+                      key={`${a.album} ${a.artist ?? ''}`}
+                      album={a}
+                      onOpen={() => openAlbum(a.album, a.artist)}
+                      onPlay={() => playAlbum(a)}
+                      onContext={(e) => openMenu(e, albumMenu(a))}
+                    />
+                  ))}
+                </Grid>
+              )
             )}
             {singleAlbums && singleAlbums.length > 0 && (
               <section
@@ -606,19 +823,35 @@ export function LibraryPage({ onOpenPlaylist, onOpenSettings }: Props) {
                     {singleAlbums.length}
                   </span>
                 </button>
-                {singlesOpen && (
-                  <Grid>
-                    {singleAlbums.map((a) => (
-                      <AlbumCard
-                        key={`${a.album} ${a.artist ?? ''}`}
-                        album={a}
-                        onOpen={() => openAlbum(a.album, a.artist)}
-                        onPlay={() => playAlbum(a)}
-                        onContext={(e) => openMenu(e, albumMenu(a))}
-                      />
-                    ))}
-                  </Grid>
-                )}
+                {singlesOpen &&
+                  (viewMode === 'list' ? (
+                    <div className="flex flex-col">
+                      {singleAlbums.map((a) => (
+                        <LibRow
+                          key={`${a.album} ${a.artist ?? ''}`}
+                          art={a.album_art_url}
+                          title={a.album}
+                          subtitle={`${a.artist ?? 'Single'} · ${a.track_count} ${
+                            a.track_count === 1 ? 'song' : 'songs'
+                          }`}
+                          onOpen={() => openAlbum(a.album, a.artist)}
+                          onContext={(e) => openMenu(e, albumMenu(a))}
+                        />
+                      ))}
+                    </div>
+                  ) : (
+                    <Grid>
+                      {singleAlbums.map((a) => (
+                        <AlbumCard
+                          key={`${a.album} ${a.artist ?? ''}`}
+                          album={a}
+                          onOpen={() => openAlbum(a.album, a.artist)}
+                          onPlay={() => playAlbum(a)}
+                          onContext={(e) => openMenu(e, albumMenu(a))}
+                        />
+                      ))}
+                    </Grid>
+                  ))}
               </section>
             )}
           </>
@@ -629,6 +862,22 @@ export function LibraryPage({ onOpenPlaylist, onOpenSettings }: Props) {
           <GridSkeleton />
         ) : visibleArtists.length === 0 ? (
           <Hint>{f ? 'No matches.' : 'No artists in your library yet.'}</Hint>
+        ) : viewMode === 'list' ? (
+          <div className="flex flex-col">
+            {visibleArtists.map((a) => (
+              <LibRow
+                key={a.key}
+                round
+                art={a.album_art_url}
+                title={a.name}
+                subtitle={`Artist · ${a.track_count} ${
+                  a.track_count === 1 ? 'song' : 'songs'
+                }`}
+                onOpen={() => openArtist(a.name)}
+                onContext={(e) => openMenu(e, artistMenu(a))}
+              />
+            ))}
+          </div>
         ) : (
           <Grid>
             {visibleArtists.map((a) => (
@@ -644,6 +893,91 @@ export function LibraryPage({ onOpenPlaylist, onOpenSettings }: Props) {
         ))}
 
       {menu && <ContextMenu state={menu} onClose={() => setMenu(null)} />}
+      {/* Sort + View-as popover (custom: a "Sort by" header, radio options, and
+          a "View as" icon row — richer than the flat ContextMenu). */}
+      {sortOpen && (
+        <>
+          <div
+            className="fixed inset-0 z-[55]"
+            onClick={() => setSortOpen(false)}
+            aria-hidden
+          />
+          <div
+            role="menu"
+            className={cn(POPOVER, 'fixed z-[60] w-56 py-1.5')}
+            style={{ top: sortPos.top, right: sortPos.right }}
+          >
+            <div className="px-3 pt-1 pb-1.5 text-[11px] font-semibold uppercase tracking-wide text-neutral-500">
+              Sort by
+            </div>
+            {SORTS[tab].map((s) => {
+              const on = s.id === sortBy;
+              return (
+                <button
+                  key={s.id}
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={on}
+                  onClick={() => {
+                    setSortBy(s.id);
+                    setSortOpen(false);
+                  }}
+                  className="w-full flex items-center justify-between gap-3 px-3 py-2 text-sm hover:bg-white/5 transition"
+                >
+                  <span className={on ? 'text-accent font-medium' : 'text-neutral-200'}>
+                    {s.label}
+                  </span>
+                  {on && (
+                    <svg
+                      width={16}
+                      height={16}
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth={2.4}
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      className="text-accent"
+                      aria-hidden
+                    >
+                      <path d="M20 6 9 17l-5-5" />
+                    </svg>
+                  )}
+                </button>
+              );
+            })}
+            <div className="my-1.5 border-t border-white/10" />
+            <div className="px-3 pt-0.5 pb-1.5 text-[11px] font-semibold uppercase tracking-wide text-neutral-500">
+              View as
+            </div>
+            <div className="flex gap-1 px-2 pb-1">
+              {VIEW_MODES.map((v) => {
+                const on = viewMode === v.id;
+                return (
+                  <button
+                    key={v.id}
+                    type="button"
+                    title={v.label}
+                    aria-label={v.label}
+                    aria-pressed={on}
+                    onClick={() => {
+                      setViewMode(v.id);
+                      setSortOpen(false);
+                    }}
+                    className={`flex-1 grid place-items-center h-9 rounded-lg transition ${
+                      on
+                        ? 'bg-white/10 text-accent'
+                        : 'text-neutral-400 hover:bg-white/5 hover:text-neutral-200'
+                    }`}
+                  >
+                    {v.icon}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </>
+      )}
       {addToPlaylist && (
         <AddToPlaylistModal
           token={addToPlaylist.token}

@@ -21,6 +21,7 @@ mod cooccur;
 pub mod db;
 mod deezer;
 mod ddns;
+mod engine;
 mod import;
 // `pub` so the engine reuses the file helpers (download dir, basename, artwork,
 // ffmpeg) instead of carrying divergent copies.
@@ -388,6 +389,9 @@ struct PlaylistSummary {
     cover_url: Option<String>,
     /// Playlist owner / album artist (for the "Album · Artist" subtitle).
     owner: Option<String>,
+    /// When the playlist row was created (unix secs) — powers the library
+    /// "Recently Added" sort. Null for very old rows without the column set.
+    created_at: Option<i64>,
 }
 
 #[derive(serde::Serialize)]
@@ -459,7 +463,8 @@ fn list_playlists(
                      FROM playlist_tracks pt JOIN tracks t ON t.id = pt.track_id
                      WHERE pt.playlist_id = p.id AND t.status = 'needs-review')
                         AS needs_review_count,
-                    p.owner
+                    p.owner,
+                    p.created_at
              FROM playlists p
              WHERE p.profile_id = ?1
                AND EXISTS (
@@ -482,6 +487,7 @@ fn list_playlists(
                 source,
                 cover_url: r.get(5)?,
                 owner: r.get(8)?,
+                created_at: r.get(9)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -3123,6 +3129,10 @@ pub fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>>
             ddns::install_db_handle(db_arc.clone());
             app.manage(DbState(db_arc.clone()));
 
+            // Native audio engine (behind the "Native audio engine (beta)"
+            // frontend flag). Spawns its own audio thread; never fails the app.
+            app.manage(engine::AudioEngine::spawn(app.handle().clone()));
+
             // Background backfill: walk every downloaded track and
             // make sure cover art is embedded in the m4a. AirPlay
             // receivers (Apple TV, HomePod with display, Sony TVs)
@@ -3515,5 +3525,16 @@ pub fn invoke_handler(
             lastfm_clear_key,
             media::media_set_track,
             media::media_set_playback,
+            engine::engine_load,
+            engine::engine_play,
+            engine::engine_pause,
+            engine::engine_seek,
+            engine::engine_set_volume,
+            engine::engine_stop,
+            engine::engine_position,
+            engine::engine_set_crossfade,
+            engine::engine_set_repeat_one,
+            engine::engine_preload_next,
+            engine::engine_set_fx,
         ]
 }

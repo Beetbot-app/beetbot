@@ -72,6 +72,16 @@ function App() {
   // Bumped after an in-place playlist edit (e.g. rename) so the persistent
   // sidebar refetches its list even though the top-level view didn't change.
   const [playlistListTick, setPlaylistListTick] = useState(0);
+  // The shared catalog/mix pages import/remove playlists without a view change,
+  // so they announce it via a window event; bump the tick to refresh the
+  // sidebar (otherwise a just-removed playlist lingers there, reading as a
+  // no-op).
+  useEffect(() => {
+    const onLibraryChanged = () => setPlaylistListTick((t) => t + 1);
+    window.addEventListener('beetbot:library-changed', onLibraryChanged);
+    return () =>
+      window.removeEventListener('beetbot:library-changed', onLibraryChanged);
+  }, []);
   // Win-back (imp 8): true when Home has a hoisted "Welcome back" shelf; lights a
   // dot on the TopBar Home button while you're on another view.
   const [winBack, setWinBack] = useState(false);
@@ -250,7 +260,6 @@ function App() {
   }, [activeProfileId]);
 
   const nowPlayingFull = useUiStore((s) => s.nowPlayingFull);
-  const rightBar = useUiStore((s) => s.rightBar);
 
   // If the persisted profile was deleted (e.g. on another device), fall back
   // to the picker rather than querying a non-existent profile.
@@ -512,7 +521,9 @@ function App() {
             }}
           />
         </main>
-        {rightBar !== 'closed' && <RightBar floating={FLOATING_SHELL} />}
+        {/* Always mounted — RightBar animates its own open/close width (and
+            returns null when fully closed, so it adds no flex gap then). */}
+        <RightBar floating={FLOATING_SHELL} />
       </div>
       <PlayerBar floating={FLOATING_SHELL} />
       {nowPlayingFull && <NowPlayingView />}

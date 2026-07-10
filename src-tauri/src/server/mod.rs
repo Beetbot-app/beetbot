@@ -4348,27 +4348,53 @@ async fn fetch_netease(title: &str, artist: &str, duration_s: u32) -> Option<Lyr
         return None;
     }
     let songs = resp.json::<NeteaseSearchResp>().await.ok()?.result?.songs?;
-    // 2. Pick the duration-closest match (±5s) whose title loosely overlaps — so a
-    //    remix/cover/unrelated song can't slip wrong lyrics in. No duration to
-    //    match → take the first relevant hit.
+    // 2. Pick the best match. NetEase returns the original alongside remixes and
+    //    covers — and those often share the title fragment AND the exact duration
+    //    of the original, so filtering on duration + loose title-overlap alone let
+    //    a different rendition's lyrics through (the real bug: "Mask Off" grabbed a
+    //    "(… Remix)" with brand-new verses over the same beat). Fix:
+    //    (a) drop alternate renditions (remix/cover/…) unless the queried title is
+    //        itself one;
+    //    (b) prefer an EXACT normalized-title match over a loose overlap;
+    //    (c) within a tier, take the duration-closest hit (or the first, if we
+    //        don't know the length).
     let want_ms = duration_s as i64 * 1000;
     let t = norm_title(title);
-    let overlaps = |name: &str| {
-        let n = norm_title(name);
-        !n.is_empty() && !t.is_empty() && (n.contains(&t) || t.contains(&n))
+    let dur_ok = |d: i64| duration_s == 0 || (d - want_ms).abs() <= 5000;
+    let query_lower = title.to_lowercase();
+    let is_alt_version = |name: &str| {
+        const MARKERS: [&str; 8] = [
+            "remix", "bootleg", "flip", "mashup", "cover", "vip", "rework", "instrumental",
+        ];
+        let n = name.to_lowercase();
+        MARKERS
+            .iter()
+            .any(|m| n.contains(m) && !query_lower.contains(m))
     };
-    let song = if duration_s == 0 {
-        songs.into_iter().find(|s| overlaps(&s.name))?
-    } else {
-        songs
-            .into_iter()
-            .filter(|s| (s.duration - want_ms).abs() <= 5000 && overlaps(&s.name))
-            .min_by_key(|s| (s.duration - want_ms).abs())?
-    };
+    let eligible: Vec<NeteaseSong> = songs
+        .into_iter()
+        .filter(|s| dur_ok(s.duration) && !is_alt_version(&s.name))
+        .collect();
+    let mut exact: Vec<&NeteaseSong> = eligible
+        .iter()
+        .filter(|s| !t.is_empty() && norm_title(&s.name) == t)
+        .collect();
+    let mut loose: Vec<&NeteaseSong> = eligible
+        .iter()
+        .filter(|s| {
+            let n = norm_title(&s.name);
+            !n.is_empty() && !t.is_empty() && (n.contains(&t) || t.contains(&n))
+        })
+        .collect();
+    if duration_s != 0 {
+        exact.sort_by_key(|s| (s.duration - want_ms).abs());
+        loose.sort_by_key(|s| (s.duration - want_ms).abs());
+    }
+    let song_id = exact.first().or_else(|| loose.first()).map(|s| s.id)?;
     // 3. Fetch the LRC.
     let mut lurl = url::Url::parse("https://music.163.com/api/song/lyric").ok()?;
     lurl.query_pairs_mut()
-        .append_pair("id", &song.id.to_string())
+        .append_pair("id", &song_id.to_string())
         .append_pair("lv", "1")
         .append_pair("kv", "1")
         .append_pair("tv", "-1");
@@ -5685,6 +5711,10 @@ struct HomeShelf {
     /// older bundled client just ignores it and renders every shelf as a row.
     #[serde(skip_serializing_if = "Option::is_none")]
     display: Option<&'static str>,
+    /// Refresh-cadence caption for a rail (mix/tile) shelf, e.g. "New every
+    /// Monday". Omitted → the client's default ("New every day"). Serialized.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cadence: Option<&'static str>,
     /// Per-visit selection policy (N1). Server-side only — never serialized.
     #[serde(skip)]
     select: SelectPolicy,
@@ -5698,6 +5728,11 @@ struct HomeShelf {
     /// `build_external_shelves`); defaults to `Familiar`. Server-side only.
     #[serde(skip)]
     intent: ShelfIntent,
+    /// Release-day priority: 0 = not a release shelf; higher = preferred lead.
+    /// On Fridays `arrange_shelves` promotes the highest-ranked one to the top.
+    /// Server-side only.
+    #[serde(skip)]
+    release_rank: u8,
 }
 
 impl HomeShelf {
@@ -5716,9 +5751,11 @@ impl HomeShelf {
             artists: vec![],
             playlists: vec![],
             display: None,
+            cadence: None,
             select: SelectPolicy::Ranked,
             discovery: false,
             intent: ShelfIntent::Familiar,
+            release_rank: 0,
         }
     }
 
@@ -5737,9 +5774,11 @@ impl HomeShelf {
             artists: vec![],
             playlists: vec![],
             display: None,
+            cadence: None,
             select: SelectPolicy::Ranked,
             discovery: false,
             intent: ShelfIntent::Familiar,
+            release_rank: 0,
         }
     }
 
@@ -5758,9 +5797,11 @@ impl HomeShelf {
             artists: vec![],
             playlists: vec![],
             display: None,
+            cadence: None,
             select: SelectPolicy::Ranked,
             discovery: false,
             intent: ShelfIntent::Familiar,
+            release_rank: 0,
         }
     }
 
@@ -5779,9 +5820,11 @@ impl HomeShelf {
             artists,
             playlists: vec![],
             display: None,
+            cadence: None,
             select: SelectPolicy::Ranked,
             discovery: false,
             intent: ShelfIntent::Familiar,
+            release_rank: 0,
         }
     }
 
@@ -5800,9 +5843,11 @@ impl HomeShelf {
             artists: vec![],
             playlists,
             display: None,
+            cadence: None,
             select: SelectPolicy::Ranked,
             discovery: false,
             intent: ShelfIntent::Familiar,
+            release_rank: 0,
         }
     }
 
@@ -5826,6 +5871,12 @@ impl HomeShelf {
     /// and the client renders it as a portrait tile instead of a row.
     fn rail(mut self) -> Self {
         self.display = Some("rail");
+        self
+    }
+
+    /// Set the rail tile's refresh-cadence caption (e.g. "New every Monday").
+    fn cadence(mut self, c: &'static str) -> Self {
+        self.cadence = Some(c);
         self
     }
 }
@@ -6071,7 +6122,7 @@ fn rotate_cap(select: &SelectPolicy) -> usize {
 /// Guarantees intent variety (no lane can monopolize the page), a rotating lead
 /// lane, and a page budget. Degrades to a plain interleave when there are few
 /// candidates (nothing is hidden until there's genuine excess).
-fn arrange_shelves(external: Vec<HomeShelf>, seed: u64) -> Vec<HomeShelf> {
+fn arrange_shelves(external: Vec<HomeShelf>, seed: u64, weekday: chrono::Weekday) -> Vec<HomeShelf> {
     const LANES: [ShelfIntent; 4] = [
         ShelfIntent::Familiar,
         ShelfIntent::Fresh,
@@ -6087,8 +6138,31 @@ fn arrange_shelves(external: Vec<HomeShelf>, seed: u64) -> Vec<HomeShelf> {
     // the lane rotation + page budget — otherwise the artist-mix tile would blink
     // in and out of the rail visit-to-visit and eat a row slot. They re-join at
     // the end (the client renders them as tiles, not rows).
-    let (rail, external): (Vec<HomeShelf>, Vec<HomeShelf>) =
+    let (rail, mut external): (Vec<HomeShelf>, Vec<HomeShelf>) =
         external.into_iter().partition(|s| s.display == Some("rail"));
+
+    // Friday release-day lead: on Fridays, promote the best release shelf to the
+    // very top and retitle it, so the page opens on new music (like Spotify's
+    // "New Music Friday"). Pulled out of its lane so it isn't double-served;
+    // still counts toward the page budget. It's an album_row → renders as a
+    // normal first row (the client hero arm is stat/track-row only).
+    let friday_lead: Option<HomeShelf> = if weekday == chrono::Weekday::Fri {
+        external
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.release_rank > 0)
+            .max_by_key(|(_, s)| s.release_rank)
+            .map(|(i, _)| i)
+            .map(|i| {
+                let mut s = external.remove(i);
+                s.title = "New this Friday".into();
+                s.eyebrow = Some("It's release day".into());
+                s
+            })
+    } else {
+        None
+    };
+    let budget = TOTAL_MAX - usize::from(friday_lead.is_some());
 
     // Bucket by intent (preserving builder order — already quality/fatigue
     // ranked). Anything outside the known lanes passes through untouched.
@@ -6122,7 +6196,7 @@ fn arrange_shelves(external: Vec<HomeShelf>, seed: u64) -> Vec<HomeShelf> {
     loop {
         let before = out.len();
         for k in 0..LANES.len() {
-            if out.len() >= TOTAL_MAX {
+            if out.len() >= budget {
                 break;
             }
             let idx = (start + k) % LANES.len();
@@ -6130,12 +6204,17 @@ fn arrange_shelves(external: Vec<HomeShelf>, seed: u64) -> Vec<HomeShelf> {
                 out.push(s);
             }
         }
-        if out.len() == before || out.len() >= TOTAL_MAX {
+        if out.len() == before || out.len() >= budget {
             break;
         }
     }
     out.extend(misc);
     out.extend(rail);
+    // Prepend the Friday lead (after rail so tiles stay last; insert at 0 puts it
+    // above the rows). Done before the spotlight pass so indices are final.
+    if let Some(lead) = friday_lead {
+        out.insert(0, lead);
+    }
 
     // Spotlight (mid-feed band): promote exactly ONE eligible discovery track_row
     // per visit, chosen by the visit seed (salted so it doesn't lock-step with the
@@ -6530,6 +6609,69 @@ async fn build_artist_mix(
         .rotating(4, 12)
         .discovery()
         .rail(),
+    )
+}
+
+/// "Because you played {Artist}" — reacts to your RECENT listening (not all-time
+/// taste): seeds from an artist you actually finished a song by in the last week.
+/// Names the shelf after that artist (Spotify's strongest "it's reacting to me"
+/// signal). Skips the artist `build_artist_mix` chose for the day so one page
+/// never doubles up on the same artist.
+async fn build_because_you_played(
+    state: &AppState,
+    profile_id: Option<i64>,
+    sem: ResolveLimiter,
+    day_seed: u64,
+) -> Option<HomeShelf> {
+    let (recent, mix_seed): (Vec<String>, Option<String>) = {
+        let conn = state.db.lock().expect("db mutex poisoned");
+        // Artists you COMPLETED a track by in the last 7 days, most recent first.
+        let recent: Vec<String> = conn
+            .prepare(
+                "SELECT je.value FROM play_events pe JOIN tracks t ON t.id = pe.track_id, json_each(t.artists) je
+                 WHERE (pe.profile_id IS ?1) AND pe.completed = 1
+                   AND pe.played_at >= CAST(strftime('%s','now','-7 days') AS INTEGER)
+                 GROUP BY je.value ORDER BY MAX(pe.played_at) DESC LIMIT 6",
+            )
+            .and_then(|mut s| {
+                s.query_map(params![profile_id], |r| r.get::<_, String>(0))
+                    .map(|rows| rows.filter_map(|x| x.ok()).collect())
+            })
+            .unwrap_or_default();
+        // Recompute build_artist_mix's day seed so we don't collide with it.
+        let pool = top_played_artists(&conn, profile_id, 16);
+        let mix_seed = (!pool.is_empty()).then(|| pool[(day_seed % pool.len() as u64) as usize].clone());
+        (recent, mix_seed)
+    };
+    let candidates: Vec<String> = recent
+        .into_iter()
+        .filter(|a| Some(a) != mix_seed.as_ref())
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    let seed = candidates[(day_seed % candidates.len() as u64) as usize].clone();
+    let tracks = fuse_seed_set(
+        state,
+        std::slice::from_ref(&seed),
+        None,
+        30,
+        profile_id,
+        sem,
+        PopMode::Favor,
+    )
+    .await;
+    if tracks.len() < 4 {
+        return None;
+    }
+    Some(
+        HomeShelf::track_row(
+            format!("Because you played {}", seed),
+            Some("From your recent listening".into()),
+            tracks,
+        )
+        .rotating(3, 12)
+        .discovery(),
     )
 }
 
@@ -7429,6 +7571,81 @@ async fn build_more_like_favorites(
     )
 }
 
+/// Per-week cache for "Weekly finds", keyed by (profile, ISO week). Built once
+/// and reused all week — the daily home cache rebuilds every calendar day off a
+/// recency-drifting seed pool + live APIs, so without this the shelf would change
+/// mid-week despite its "New every Monday" caption. Only the last-built week is
+/// kept (prior weeks pruned on insert). Lost on restart → rebuilt once, still
+/// pinned for the rest of that week.
+fn weekly_finds_cache(
+) -> &'static Mutex<std::collections::HashMap<(Option<i64>, String), HomeShelf>> {
+    static C: std::sync::OnceLock<
+        Mutex<std::collections::HashMap<(Option<i64>, String), HomeShelf>>,
+    > = std::sync::OnceLock::new();
+    C.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// "Weekly finds" — a fixed-for-the-week discovery mix of mostly-unheard tracks
+/// from a wide draw of your taste. Materialized once per ISO week (see
+/// `weekly_finds_cache`) so it genuinely holds still Mon→Sun and turns over on
+/// Monday — the daily-mix rail's weekly sibling / return hook.
+async fn build_weekly_finds(
+    state: &AppState,
+    profile_id: Option<i64>,
+    sem: ResolveLimiter,
+    iso_week: &str,
+) -> Option<HomeShelf> {
+    let key = (profile_id, iso_week.to_string());
+    if let Some(hit) = weekly_finds_cache().lock().ok().and_then(|m| m.get(&key).cloned()) {
+        return Some(hit);
+    }
+    let mut seeds = {
+        let conn = state.db.lock().expect("db mutex poisoned");
+        top_played_artists(&conn, profile_id, 16)
+    };
+    if seeds.len() < 3 {
+        return None;
+    }
+    // Sort before shuffling so the week seed selects the SAME 5 seeds regardless
+    // of how the recency-weighted pool happens to be ordered on the build day
+    // (a rebuild after a restart lands on the same picks for the week).
+    seeds.sort();
+    let seed_norm: std::collections::HashSet<String> =
+        seeds.iter().map(|s| norm_artist(s)).collect();
+    let lib_names = library_artist_names(state, profile_id);
+    let week_seed = weekly_seed(profile_id, iso_week);
+    let fusion_seeds = seeded_shuffle_take(seeds.clone(), week_seed, 5);
+    let mut tracks =
+        fuse_seed_set(state, &fusion_seeds, None, 40, profile_id, sem, PopMode::Favor).await;
+    tracks.retain(|t| {
+        let a = norm_artist(t.artists.first().map(String::as_str).unwrap_or(""));
+        !seed_norm.contains(&a) && !lib_names.contains(&a)
+    });
+    tracks.truncate(30);
+    if tracks.len() < 8 {
+        return None;
+    }
+    {
+        let conn = state.db.lock().expect("db mutex poisoned");
+        let _ = annotate_with_library_state(&conn, &mut tracks, profile_id);
+    }
+    // Ranked (NOT rotating) so it reads as one fixed weekly object; .rail() lands
+    // it as a portrait tile; the cadence caption sets it apart from daily mixes.
+    let shelf = HomeShelf::track_row(
+        "Weekly finds",
+        Some("Fresh picks, refreshed every Monday".into()),
+        tracks,
+    )
+    .discovery()
+    .rail()
+    .cadence("New every Monday");
+    if let Ok(mut m) = weekly_finds_cache().lock() {
+        m.retain(|k, _| k.1 == *iso_week); // drop prior weeks
+        m.insert(key, shelf.clone());
+    }
+    Some(shelf)
+}
+
 // ---- Cheap (local-SQL) Home shelves ----------------------------------------
 // These read only the local DB (no external calls), so home_handler recomputes
 // them FRESH on every request — "Recently played" / "On repeat" must reflect
@@ -7510,6 +7727,23 @@ fn local_date_string() -> String {
     chrono::Local::now().date_naive().to_string()
 }
 
+/// Weekly rotation seed — same shape as `daily_seed` but keyed by ISO week, so a
+/// "Weekly finds" shelf holds still all week and turns over on Monday.
+fn weekly_seed(profile_id: Option<i64>, iso_week: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    profile_id.hash(&mut h);
+    iso_week.hash(&mut h);
+    "weekly".hash(&mut h); // domain-separate from daily_seed for the same string
+    h.finish()
+}
+
+/// Server-local ISO week as `YYYY-Www` (e.g. `2026-W28`). ISO weeks start
+/// Monday, so this rolls over Monday 00:00 local.
+fn local_iso_week() -> String {
+    chrono::Local::now().format("%G-W%V").to_string()
+}
+
 /// Deterministic seeded shuffle: permutes `items` by a SplitMix64 stream seeded
 /// from `seed`, then keeps the first `take`. A plain Fisher-Yates so the result
 /// is stable within a day and identical across devices/builds — SplitMix64 is a
@@ -7543,7 +7777,7 @@ fn build_recently_played(conn: &Connection, pid: Option<i64>) -> Option<HomeShel
             "SELECT {STAT_COLS}, COUNT(*) c
              FROM play_events pe JOIN tracks t ON t.id = pe.track_id
              WHERE (pe.profile_id IS ?1)
-             GROUP BY t.id ORDER BY MAX(pe.played_at) DESC LIMIT 16"
+             GROUP BY t.id ORDER BY MAX(pe.played_at) DESC LIMIT 40"
         ),
         &[&pid],
     );
@@ -7662,7 +7896,7 @@ fn daypart_for_hour(hour: i64) -> (&'static str, &'static str, i64, i64, bool) {
         5..=11 => ("Good morning", "Songs to start your day", 5, 12, false),
         12..=16 => ("Good afternoon", "Your afternoon rotation", 12, 17, false),
         17..=21 => ("Good evening", "Easing into the evening", 17, 22, false),
-        _ => ("Late night", "For the small hours", 22, 5, true),
+        _ => ("Late night", "After hours", 22, 5, true),
     }
 }
 
@@ -8306,6 +8540,9 @@ async fn build_new_for_you(state: &AppState, pid: Option<i64>) -> Option<HomeShe
 
 async fn build_external_shelves(state: &AppState, pid: Option<i64>, seed: u64) -> Vec<HomeShelf> {
     let sem = resolve_limiter();
+    // ISO week for the "Weekly finds" tile — it materializes per week (cached),
+    // so it holds all week even as this daily pool rebuilds.
+    let iso_week = local_iso_week();
     let (
         more_like,
         top_artists,
@@ -8317,6 +8554,8 @@ async fn build_external_shelves(state: &AppState, pid: Option<i64>, seed: u64) -
         editorial,
         under_radar,
         new_for_you,
+        because,
+        weekly,
     ) = tokio::join!(
         build_more_like_favorites(state, pid, sem.clone(), seed),
         build_top_artists(state, pid, sem.clone()),
@@ -8328,6 +8567,8 @@ async fn build_external_shelves(state: &AppState, pid: Option<i64>, seed: u64) -
         build_editorial_shelves(state, pid),
         build_under_the_radar(state, pid, sem.clone(), seed),
         build_new_for_you(state, pid),
+        build_because_you_played(state, pid, sem.clone(), seed),
+        build_weekly_finds(state, pid, sem.clone(), &iso_week),
     );
     // Tag each shelf with its intent lane (N5) so arrange_shelves can pick a
     // balanced, rotating per-visit subset. `top_artists` is your ranked roster
@@ -8339,16 +8580,27 @@ async fn build_external_shelves(state: &AppState, pid: Option<i64>, seed: u64) -
             s
         })
     };
+    // Rank the release shelves so the Friday lead prefers the most personalized:
+    // Release Radar (from artists you play) > New for you (fresh artists) > New
+    // releases (global editorial).
+    let release = |s: Option<HomeShelf>, rank: u8| -> Option<HomeShelf> {
+        s.map(|mut s| {
+            s.release_rank = rank;
+            s
+        })
+    };
     let mut out: Vec<HomeShelf> = [
         tag(more_like, ShelfIntent::Familiar),
         tag(top_artists, ShelfIntent::Familiar),
-        tag(radar, ShelfIntent::Fresh),
+        release(tag(radar, ShelfIntent::Fresh), 3),
         tag(mix, ShelfIntent::Familiar),
         tag(more_like_artist, ShelfIntent::Familiar),
-        tag(new_rel, ShelfIntent::Fresh),
+        release(tag(new_rel, ShelfIntent::Fresh), 1),
         tag(tag_shelf, ShelfIntent::Discover),
         tag(under_radar, ShelfIntent::Discover),
-        tag(new_for_you, ShelfIntent::Discover),
+        release(tag(new_for_you, ShelfIntent::Discover), 2),
+        tag(because, ShelfIntent::Discover),
+        tag(weekly, ShelfIntent::Discover), // rail shelf; intent unused (bypasses lanes)
     ]
     .into_iter()
     .flatten()
@@ -8846,7 +9098,8 @@ async fn home_handler(
     //     shelves than a page should show; pick a bounded, intent-balanced,
     //     seed-rotated subset so the LINEUP (which shelves, in what order) also
     //     varies visit to visit. Free — the candidates are already cached.
-    let external = arrange_shelves(external, visit_seed);
+    let weekday = chrono::Datelike::weekday(&chrono::Local::now());
+    let external = arrange_shelves(external, visit_seed, weekday);
 
     // 3. Final ordered feed: greeting + recent activity, then DISCOVERY, then the
     //    deeper-library shelves and history — so new music leads instead of being
@@ -10227,6 +10480,16 @@ mod tests {
     }
 
     #[test]
+    fn weekly_seed_is_stable_and_week_sensitive() {
+        // Same profile + week → same seed (holds all week); next week → different.
+        assert_eq!(weekly_seed(Some(1), "2026-W28"), weekly_seed(Some(1), "2026-W28"));
+        assert_ne!(weekly_seed(Some(1), "2026-W28"), weekly_seed(Some(1), "2026-W29"));
+        assert_ne!(weekly_seed(Some(1), "2026-W28"), weekly_seed(Some(2), "2026-W28"));
+        // Domain-separated from daily_seed for the same string input.
+        assert_ne!(weekly_seed(Some(1), "2026-07-01"), daily_seed(Some(1), "2026-07-01"));
+    }
+
+    #[test]
     fn seeded_shuffle_is_permutation_and_deterministic() {
         let src: Vec<u32> = (0..40).collect();
         let seed = daily_seed(Some(7), "2026-07-01");
@@ -11074,7 +11337,7 @@ mod tests {
             v.iter().map(|s| s.title.clone()).collect()
         };
 
-        let a = arrange_shelves(candidates(), 1);
+        let a = arrange_shelves(candidates(), 1, chrono::Weekday::Mon);
         assert!(a.len() <= 7, "page budget capped at 7, got {}", a.len());
         for lane in [Familiar, Fresh, Discover, Editorial] {
             let c = a.iter().filter(|s| s.intent == lane).count();
@@ -11087,14 +11350,49 @@ mod tests {
             "intents should interleave, not clump"
         );
         // The lineup rotates across visits (which shelves and/or their order).
-        let differs = (2u64..8).any(|s| titles(&arrange_shelves(candidates(), s)) != titles(&a));
+        let differs = (2u64..8).any(|s| titles(&arrange_shelves(candidates(), s, chrono::Weekday::Mon)) != titles(&a));
         assert!(differs, "the shelf lineup should rotate visit to visit");
         // Same seed reproduces the same lineup (per-visit stable).
-        assert_eq!(titles(&arrange_shelves(candidates(), 1)), titles(&a));
+        assert_eq!(titles(&arrange_shelves(candidates(), 1, chrono::Weekday::Mon)), titles(&a));
 
         // A small candidate set hides nothing — it's only (re)ordered.
         let small = vec![mk("F1", Familiar), mk("R1", Fresh), mk("D1", Discover)];
-        assert_eq!(arrange_shelves(small, 5).len(), 3, "small feeds keep every shelf");
+        assert_eq!(arrange_shelves(small, 5, chrono::Weekday::Mon).len(), 3, "small feeds keep every shelf");
+    }
+
+    #[test]
+    fn arrange_shelves_friday_promotes_release_lead() {
+        use ShelfIntent::*;
+        let mk = |title: &str, intent: ShelfIntent, rank: u8| {
+            let mut s = track_row_shelf(title, vec![th(1, "a", "A", 0)]);
+            s.intent = intent;
+            s.release_rank = rank;
+            s
+        };
+        let cands = || {
+            vec![
+                mk("F1", Familiar, 0),
+                mk("Release Radar", Fresh, 3),
+                mk("D1", Discover, 0),
+                mk("New releases", Fresh, 1),
+                mk("New for you", Discover, 2),
+                mk("E1", Editorial, 0),
+            ]
+        };
+        // Friday: the highest-rank release shelf leads, retitled, exactly once.
+        let fri = arrange_shelves(cands(), 1, chrono::Weekday::Fri);
+        assert_eq!(fri[0].title, "New this Friday", "Friday opens on new music");
+        assert_eq!(fri[0].eyebrow.as_deref(), Some("It's release day"));
+        assert_eq!(
+            fri.iter().filter(|s| s.eyebrow.as_deref() == Some("It's release day")).count(),
+            1,
+            "the promoted shelf isn't double-served"
+        );
+        assert!(fri.iter().all(|s| s.title != "Release Radar"), "the rank-3 shelf was the one promoted");
+        // Any other day: no promotion, release shelves keep their titles.
+        let mon = arrange_shelves(cands(), 1, chrono::Weekday::Mon);
+        assert!(mon.iter().all(|s| s.title != "New this Friday"), "no Friday lead on other days");
+        assert!(mon.iter().any(|s| s.title == "Release Radar"), "release shelf untouched on Mon");
     }
 
     // --- rail tiles + spotlight (Made-for-you) --------------------------
@@ -11146,7 +11444,7 @@ mod tests {
         rail.intent = Familiar;
         cands.push(rail);
 
-        let out = arrange_shelves(cands, 3);
+        let out = arrange_shelves(cands, 3, chrono::Weekday::Mon);
         assert_eq!(
             out.last().unwrap().title,
             "ArtistMix",
@@ -11187,7 +11485,7 @@ mod tests {
             ]
         };
         let spot_title = |seed: u64| -> Option<String> {
-            let out = arrange_shelves(candidates(), seed);
+            let out = arrange_shelves(candidates(), seed, chrono::Weekday::Mon);
             let hits: Vec<&HomeShelf> =
                 out.iter().filter(|s| s.display == Some("spotlight")).collect();
             assert!(hits.len() <= 1, "at most one spotlight per visit");
@@ -11212,7 +11510,7 @@ mod tests {
         // Zero eligible (only a stat_row) → zero spotlights, no panic.
         let mut stat = HomeShelf::stat_row("Stat", None, vec![]);
         stat.intent = Familiar;
-        let out = arrange_shelves(vec![stat], 7);
+        let out = arrange_shelves(vec![stat], 7, chrono::Weekday::Mon);
         assert!(out.iter().all(|s| s.display != Some("spotlight")));
     }
 

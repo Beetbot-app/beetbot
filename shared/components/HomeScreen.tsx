@@ -35,6 +35,7 @@ import {
   usePreviewPlayer,
 } from './SearchScreen';
 import { CollageCover } from './CollageCover';
+import { ContextMenu, MenuGlyphs, type MenuItem, type MenuState } from './ContextMenu';
 import { extractDominantColor } from '../albumColor';
 import { CardPlayButton, Marquee } from './Marquee';
 import { useHubReachable } from '../useHubReachable';
@@ -76,6 +77,12 @@ interface Props {
   } | null;
   isPlaying?: boolean;
   onTogglePlay?: () => void;
+  /** Host-built "is this row the current playback track?" — used by the mix
+   *  drill-in for its row highlight + equalizer bars + ⏸/▶ hero (same as the
+   *  library playlist page). Built from the REAL current track (matches on id /
+   *  isrc / title+artist), which HomeScreen itself doesn't have. Omit → the mix
+   *  page has no now-playing highlight. */
+  isTrackCurrent?: (t: SearchTrackResult) => boolean;
   onPlayedFrom?: (key: string | null) => void;
   /**
    * Optional override for loading the quick-access playlists. The desktop
@@ -235,7 +242,7 @@ function getHomeFeedCache(
  *  load (cold start), before the feed arrives, instead of a blank page. */
 function QuickAccessSkeleton() {
   return (
-    <div className="px-4 grid grid-cols-2 gap-2 mb-7" aria-hidden>
+    <div className="px-4 grid grid-cols-2 gap-2 mb-7 lg:mb-6" aria-hidden>
       {Array.from({ length: 8 }).map((_, i) => (
         <div
           key={i}
@@ -251,7 +258,7 @@ function QuickAccessSkeleton() {
 
 function ShelfSkeleton() {
   return (
-    <section className="mb-7" aria-hidden>
+    <section className="mb-7 lg:mb-6" aria-hidden>
       {/* ml-4 (not px-4) so the bar is inset like the real title — px-4 would
           be padding INSIDE the fixed-width box, leaving it flush to the edge. */}
       <div className="ml-4 mb-2.5 h-5 w-44 rounded bg-neutral-800 animate-pulse" />
@@ -297,6 +304,8 @@ export interface MixData {
   title: string;
   eyebrow: string | null;
   tracks: SearchTrackResult[];
+  /** Refresh-cadence caption from the server (e.g. "New every Monday"). */
+  cadence?: string;
 }
 
 /** Desktop history snapshot for an open Home drill-in — either a "Made for you"
@@ -306,6 +315,8 @@ export interface MixData {
 export interface HomeDrillSnapshot {
   mix?: MixData;
   playlist?: CatalogPlaylistSummary;
+  /** Desktop "Show all" on a big shelf → its full grid as a drill page. */
+  shelfGrid?: HomeShelf;
 }
 
 /** Convert a rail-tagged shelf (artist-mix track_row, or genre/decade stat_row)
@@ -321,6 +332,7 @@ function toMixData(shelf: HomeShelf): MixData | null {
     title: shelf.title,
     eyebrow: shelf.eyebrow ?? null,
     tracks,
+    cadence: shelf.cadence,
   };
 }
 
@@ -376,6 +388,7 @@ export function HomeScreen({
   nowPlayingTrack,
   isPlaying,
   onTogglePlay,
+  isTrackCurrent,
   onPlayedFrom,
   onOpenPlaylist,
   onOpenBrowse,
@@ -425,6 +438,9 @@ export function HomeScreen({
   // Open "Made for you" mix detail page (a captured COPY, so a feed refresh
   // under an open page can't yank it out from under the user).
   const [openMix, setOpenMix] = useState<MixData | null>(null);
+  // Desktop "Show all" drill: a big shelf's full grid as its own page (a COPY,
+  // refresh-proof like the mix page).
+  const [openShelfGrid, setOpenShelfGrid] = useState<HomeShelf | null>(null);
   // Re-tapping the Home tab (resetSignal bump) closes any open drill-in back to
   // the feed. Guarded to the first render so the mount pass is a no-op.
   const firstReset = useRef(true);
@@ -437,6 +453,7 @@ export function HomeScreen({
     setOpenAlbum(null);
     setOpenPlaylist(null);
     setOpenMix(null);
+    setOpenShelfGrid(null);
   }, [resetSignal]);
   // Desktop history replay: Back/Forward bumps mixRestore.signal with the drill
   // to show (mix OR playlist, or null to close). Pure state application — never
@@ -446,14 +463,30 @@ export function HomeScreen({
     if (mixRestore) {
       setOpenMix(mixRestore.snapshot?.mix ?? null);
       setOpenPlaylist(mixRestore.snapshot?.playlist ?? null);
+      setOpenShelfGrid(mixRestore.snapshot?.shelfGrid ?? null);
     }
   }, [mixRestore]);
+  // The Show-all page has no in-page Back button — it closes via the app's
+  // top-bar Back/Forward. Escape is the keyboard equivalent (parity with the
+  // mix/playlist pages), routed through the same history Back so Forward reopens
+  // it. The mix/playlist pages own their own Escape (inside AlbumDetailModal).
+  useEffect(() => {
+    if (!(onOpenArtist && openShelfGrid)) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      e.preventDefault();
+      if (onMixBack) onMixBack();
+      else setOpenShelfGrid(null);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onOpenArtist, openShelfGrid, onMixBack]);
   // Desktop drill-ins render in-flow, REPLACING the feed. The host's scroll
   // container keeps whatever offset the feed was at, so a fresh page would open
   // mid-scroll (hero cut off, condensed header stuck on). Reset the nearest
   // scrollable ancestor to the top whenever a desktop drill opens.
   const rootRef = useRef<HTMLDivElement>(null);
-  const anyDrillOpen = !!openMix || !!openPlaylist;
+  const anyDrillOpen = !!openMix || !!openPlaylist || !!openShelfGrid;
   useEffect(() => {
     // `onOpenArtist` present === desktop (same signal as `isDesktop` below).
     if (!(onOpenArtist && anyDrillOpen)) return;
@@ -473,6 +506,41 @@ export function HomeScreen({
   }, [anyDrillOpen]);
   // C2: long-press a track card → add-to-playlist sheet (reuses the search one).
   const [addTrack, setAddTrack] = useState<SearchTrackResult | null>(null);
+  // Desktop per-song hover "⋯" menu for an opened drill-in (mix/album/playlist),
+  // same as the library playlist + search-album pages. Built here (not host-
+  // provided) so it reuses the add-to-playlist picker + nav callbacks we already
+  // have. Only wired on desktop (isDesktop); phone uses the ⋯ bottom sheet.
+  const [trackMenu, setTrackMenu] = useState<MenuState | null>(null);
+  const showTrackMenu = (t: SearchTrackResult, x: number, y: number) => {
+    const artist = t.artists[0]?.trim() ?? '';
+    const items: MenuItem[] = [
+      {
+        label: 'Add to playlist',
+        icon: MenuGlyphs.addToPlaylist,
+        onClick: () => setAddTrack(t),
+      },
+    ];
+    if (onAlbumSaveToLiked)
+      items.push({
+        label: 'Add to Favorites',
+        icon: MenuGlyphs.star,
+        onClick: () => onAlbumSaveToLiked(t),
+      });
+    if (onAlbumAddToQueue)
+      items.push({
+        label: 'Add to queue',
+        icon: MenuGlyphs.queue,
+        onClick: () => onAlbumAddToQueue(t),
+      });
+    if (onOpenArtist)
+      items.push({
+        label: 'Go to artist',
+        icon: MenuGlyphs.artist,
+        disabled: !artist,
+        onClick: () => onOpenArtist(artist),
+      });
+    setTrackMenu({ x, y, items });
+  };
   // Long-press an album/artist card → an action sheet (add-to-library / play).
   const [cardMenu, setCardMenu] = useState<
     | { kind: 'album'; album: SearchAlbumResult }
@@ -789,7 +857,7 @@ export function HomeScreen({
     }
   };
 
-  const renderShelf = (shelf: HomeShelf, idx: number) => {
+  const renderShelf = (shelf: HomeShelf, idx: number, forceExpand = false) => {
     // Feature the lead shelf with larger cards to break the "row of rows".
     const size = idx === 0 ? 'lg' : 'md';
     // Art heights, so the shelves' hover arrows center on the cover (not the
@@ -798,6 +866,26 @@ export function HomeScreen({
     // cards' -inset-3 hover highlight room), so it lands on the cover.
     const artClass = size === 'lg' ? 'mt-4 h-40' : 'mt-4 h-32';
     const artistArtClass = size === 'lg' ? 'mt-4 h-36' : 'mt-4 h-28';
+    // Desktop: a big shelf's "Show all" opens its full grid as a drill PAGE
+    // instead of unfolding in place (a 30-item in-place expand is a wall). Phone
+    // keeps the in-place expand. `forceExpand` (set when rendering the page
+    // itself) shows the full grid with no toggle button.
+    const itemCount =
+      (shelf.tracks?.length ?? 0) +
+      (shelf.albums?.length ?? 0) +
+      (shelf.stat_tracks?.length ?? 0) +
+      (shelf.artists?.length ?? 0) +
+      (shelf.playlists?.length ?? 0);
+    const shelfExtra: { onShowAll?: () => void; forceExpand?: boolean } = forceExpand
+      ? { forceExpand: true }
+      : isDesktop && itemCount > 12 && onMixPush
+        ? {
+            onShowAll: () => {
+              setOpenShelfGrid(shelf);
+              onMixPush({ shelfGrid: shelf });
+            },
+          }
+        : {};
     // Spotlight (P4): the server marks exactly one discovery track_row per visit
     // as the mid-feed band. Checked BEFORE the hero so it wins even at idx 0
     // (both are full-width). The band replaces the whole row; Play seeds the
@@ -821,7 +909,7 @@ export function HomeScreen({
       // banners are visually identical (full-bleed art + scrim + round stateful
       // play button + hover ring), just with shelf-level title/description.
       return (
-        <section key={`spot:${idx}:${shelf.title}`} className="px-4 mb-7">
+        <section key={`spot:${idx}:${shelf.title}`} className="px-4 mb-7 lg:mb-6">
           <HeroCard
             cover={head.album_art_url ?? null}
             eyebrow={shelf.eyebrow ?? 'In the spotlight'}
@@ -850,13 +938,13 @@ export function HomeScreen({
       if (list.length === 0) return null;
       const [head, ...rest] = list;
       return (
-        <section key={`hero:${idx}:${shelf.title}`} className="mb-7">
+        <section key={`hero:${idx}:${shelf.title}`} className="mb-7 lg:mb-6">
           {shelf.eyebrow ? (
             <p className="px-4 text-[11px] uppercase tracking-wide text-neutral-500">
               {shelf.eyebrow}
             </p>
           ) : null}
-          <h2 className="px-4 mb-2.5 text-lg font-bold tracking-tight">{shelf.title}</h2>
+          <h2 className="px-4 mb-2.5 lg:mb-4 text-lg lg:text-2xl font-bold tracking-tight">{shelf.title}</h2>
           <div className="px-4 mb-3">
             <HeroCard
               cover={head.album_art_url ?? null}
@@ -874,7 +962,7 @@ export function HomeScreen({
           </div>
           {rest.length > 0 ? (
             <div className="-my-4">
-            <ShelfRow artClass="mt-4 h-32" scrollerClassName="flex gap-4 overflow-x-auto overflow-y-clip px-4 py-4 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden">
+            <ShelfRow artClass="mt-4 h-32" scrollerClassName="flex gap-4 lg:gap-6 overflow-x-auto overflow-y-clip px-4 py-4 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden">
               {rest.map((t, i) => (
                 <TrackCard
                   key={`${shelf.kind}:${i}:${t.source_id}`}
@@ -899,7 +987,7 @@ export function HomeScreen({
       const albums = shelf.albums ?? [];
       if (albums.length === 0) return null;
       return (
-        <Shelf key={`${shelf.kind}:${idx}:${shelf.title}`} title={shelf.title} eyebrow={shelf.eyebrow} artClass={artClass}>
+        <Shelf key={`${shelf.kind}:${idx}:${shelf.title}`} title={shelf.title} eyebrow={shelf.eyebrow} artClass={artClass} {...shelfExtra}>
           {albums.map((al) => (
             <AlbumCard
               key={`${al.source}:${al.source_id}`}
@@ -920,7 +1008,7 @@ export function HomeScreen({
       const artists = shelf.artists ?? [];
       if (artists.length === 0) return null;
       return (
-        <Shelf key={`${shelf.kind}:${idx}:${shelf.title}`} title={shelf.title} eyebrow={shelf.eyebrow} artClass={artistArtClass}>
+        <Shelf key={`${shelf.kind}:${idx}:${shelf.title}`} title={shelf.title} eyebrow={shelf.eyebrow} artClass={artistArtClass} {...shelfExtra}>
           {artists.map((a) => (
             <ArtistCard
               key={`${a.source}:${a.source_id}`}
@@ -943,7 +1031,7 @@ export function HomeScreen({
       const list = (shelf.stat_tracks ?? []).map(statToTrack);
       if (list.length === 0) return null;
       return (
-        <Shelf key={`${shelf.kind}:${idx}:${shelf.title}`} title={shelf.title} eyebrow={shelf.eyebrow} artClass={artClass}>
+        <Shelf key={`${shelf.kind}:${idx}:${shelf.title}`} title={shelf.title} eyebrow={shelf.eyebrow} artClass={artClass} {...shelfExtra}>
           {list.map((t, i) => (
             <TrackCard
               key={`local:${t.source_id}`}
@@ -971,6 +1059,7 @@ export function HomeScreen({
           title={shelf.title}
           eyebrow={shelf.eyebrow}
           artClass={artClass}
+          {...shelfExtra}
         >
           {playlists.map((p) => (
             <PlaylistCard
@@ -996,6 +1085,7 @@ export function HomeScreen({
           title={shelf.title}
           eyebrow={shelf.eyebrow}
           artClass={artClass}
+          {...shelfExtra}
         >
           {tracks.map((t, i) => (
             <TrackCard
@@ -1078,7 +1168,7 @@ export function HomeScreen({
         <MixTile
           key={mix.key}
           mix={mix}
-          cadence="New every day"
+          cadence={mix.cadence ?? 'New every day'}
           desktop={isDesktop}
           onOpen={() => {
             // Show the page now; on desktop also record the history stop (the
@@ -1099,7 +1189,7 @@ export function HomeScreen({
           inline (in-flow) and REPLACES the feed, so the global top-bar Back
           reveals what's underneath. The phone keeps the feed and overlays the
           drill as a fixed modal (in the modals block below). */}
-      {!(isDesktop && (openMix || openPlaylist)) && (
+      {!(isDesktop && (openMix || openPlaylist || openShelfGrid)) && (
         <>
       <div
         // Phone only (onOpenSettings is omitted on desktop): a sticky, frosted
@@ -1163,7 +1253,7 @@ export function HomeScreen({
       {playlists === null && <QuickAccessSkeleton />}
 
       {quickAccess.length > 0 && (
-        <div className="px-4 grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-2 mb-7">
+        <div className="px-4 grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-2 mb-7 lg:mb-6">
           {quickAccess.map((p) => (
             <button
               key={p.id}
@@ -1302,13 +1392,34 @@ export function HomeScreen({
           onPickTrack={onPlayTrack}
           onPlay={onPlayTrack}
           onShowTrackSheet={onShowTrackSheet}
+          // Desktop: the per-song hover "⋯" menu (Add to playlist / Favorites /
+          // queue / Go to artist), same as the library playlist page. Phone folds
+          // it into the ⋯ bottom sheet (onShowTrackSheet) instead.
+          onShowTrackMenu={isDesktop ? showTrackMenu : undefined}
           onQueueTrack={onAlbumAddToQueue}
           onSaveTrack={onAlbumSaveToLiked}
           onGoToArtist={onOpenArtist}
           onGoToAlbum={onOpenAlbum}
+          // Now-playing awareness, same as the library playlist page: equalizer
+          // bars + row highlight on the current track, and a ⏸/▶ hero that
+          // toggles instead of restarting. The host builds `isTrackCurrent` from
+          // the REAL current track (a mix's rows are catalog tracks, so it matches
+          // on id OR isrc OR title+artist — a plain id check would never light up
+          // the playing row). NB: `nowPlayingTrack` here is the last LOGGED play
+          // (feeds Recently-played), not the current track, so it can't be used.
+          isTrackCurrent={isTrackCurrent}
+          isPlaying={!!isPlaying}
+          onTogglePlay={onTogglePlay}
           playingPreviewUrl={playingUrl}
           onTogglePreview={toggle}
         />
+      )}
+      {/* Desktop "Show all" drill: the big shelf's full grid, replacing the feed
+          (in-flow, so the top-bar Back reveals what's underneath — same as the
+          mix page). No in-page Back button: the app's global top-bar Back/Forward
+          (and Escape below) close it, matching the mix/playlist drill pages. */}
+      {isDesktop && openShelfGrid && (
+        <div className="pt-2">{renderShelf(openShelfGrid, 1, true)}</div>
       )}
       {addTrack && (
         <AddToPlaylistModal
@@ -1317,6 +1428,9 @@ export function HomeScreen({
           activeProfileId={activeProfileId}
           onClose={() => setAddTrack(null)}
         />
+      )}
+      {trackMenu && (
+        <ContextMenu state={trackMenu} onClose={() => setTrackMenu(null)} />
       )}
       {cardMenu && (
         <ActionSheet
@@ -1439,8 +1553,8 @@ function Toast({ message }: { message: string }) {
  *  tiles as children). */
 function MadeForYouRail({ children }: { children: ReactNode }) {
   return (
-    <section className="mb-7">
-      <h2 className="px-4 mb-2.5 text-lg font-bold tracking-tight">Made for you</h2>
+    <section className="mb-7 lg:mb-6">
+      <h2 className="px-4 mb-2.5 lg:mb-4 text-lg lg:text-2xl font-bold tracking-tight">Made for you</h2>
       {/* No scroll-snap here: `snap-x` + `snap-start` made the browser scroll past
           the px-4 left padding to align the first tile, so tiles sat flush at the
           edge (unlike every other shelf). Plain overflow matches the shelves.
@@ -1650,6 +1764,8 @@ function Shelf({
   eyebrow,
   artClass,
   children,
+  onShowAll,
+  forceExpand,
 }: {
   title: string;
   eyebrow?: string | null;
@@ -1657,34 +1773,40 @@ function Shelf({
    *  the taller card (art + title). */
   artClass?: string;
   children: ReactNode;
+  /** Desktop: open the full grid as its own drill page instead of expanding in
+   *  place (avoids a huge in-place unfold). When absent, "Show all" expands. */
+  onShowAll?: () => void;
+  /** Render the full wrapping grid with no toggle — used on the drill page. */
+  forceExpand?: boolean;
 }) {
   // "Show all" flips the scroll row into a wrapping grid (same pattern as
   // Discover's shelves). Only offered when there's actually more to see.
   const [expanded, setExpanded] = useState(false);
   const count = Children.count(children);
+  const showGrid = forceExpand || expanded;
   return (
-    <section className="mb-7">
-      <div className="px-4 mb-2.5 flex items-end justify-between gap-3">
+    <section className="mb-7 lg:mb-6">
+      <div className="px-4 mb-2.5 lg:mb-4 flex items-end justify-between gap-3">
         <div className="min-w-0">
           {eyebrow ? (
             <p className="text-[11px] uppercase tracking-wide text-neutral-500">
               {eyebrow}
             </p>
           ) : null}
-          <h2 className="text-lg font-bold tracking-tight truncate">{title}</h2>
+          <h2 className="text-lg lg:text-2xl font-bold tracking-tight truncate">{title}</h2>
         </div>
-        {count > 4 && (
+        {count > 4 && !forceExpand && (
           <button
             type="button"
-            onClick={() => setExpanded((v) => !v)}
+            onClick={onShowAll ?? (() => setExpanded((v) => !v))}
             className="shrink-0 pb-0.5 text-xs font-medium text-neutral-400 hover:text-neutral-100 active:text-neutral-100"
           >
-            {expanded ? 'Show less' : 'Show all'}
+            {onShowAll ? 'Show all' : expanded ? 'Show less' : 'Show all'}
           </button>
         )}
       </div>
-      {expanded ? (
-        <div className="px-4 py-4 -my-4 flex flex-wrap gap-4">{children}</div>
+      {showGrid ? (
+        <div className="px-4 py-4 -my-4 flex flex-wrap gap-4 lg:gap-6">{children}</div>
       ) : (
         // Same Apple-Music-style hover ‹ › arrows as the artist page (ShelfRow,
         // shared). Desktop-only (sm:flex); the phone still swipes. The scroller
@@ -1693,7 +1815,7 @@ function Shelf({
         // goes on THIS outer wrapper, NOT the scroller — a negative margin on
         // the scroller collapses ShelfRow's positioning box and kills the arrows.
         <div className="-my-4">
-          <ShelfRow artClass={artClass} scrollerClassName="flex gap-4 overflow-x-auto overflow-y-clip px-4 py-4 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden">
+          <ShelfRow artClass={artClass} scrollerClassName="flex gap-4 lg:gap-6 overflow-x-auto overflow-y-clip px-4 py-4 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden">
             {children}
           </ShelfRow>
         </div>

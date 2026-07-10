@@ -63,12 +63,6 @@ type Banner = { kind: 'error' | 'info'; text: string } | null;
 // bring it back.
 const SHOW_DUCKDNS = false;
 
-// The "Sound" group (Equalizer / Normalize / Mono) is hidden: its Web Audio
-// implementation was removed (unreliable on macOS WebKit — see audiofx.ts). The
-// settings store + this UI are kept intact so the planned native Rust audio
-// engine can re-back them; flip to `true` once that engine drives `engine_set_fx`.
-const SHOW_SOUND_FX = false;
-
 /**
  * Settings page — every knob that used to live in the Library header now
  * lives here. Library should be just music; configuration is a separate
@@ -179,6 +173,7 @@ const SECTIONS = {
   backup: { cat: 'library', terms: ['backup', 'restore', 'export', 'library backup', 'snapshot'] },
   remote: { cat: 'sharing', terms: ['sharing', 'remote', 'listen', 'another device', 'stream', 'streaming', 'pairing', 'ngrok', 'link', 'qr', 'phone'] },
   logs: { cat: 'advanced', terms: ['logs', 'log', 'security', 'debug', 'diagnostics'] },
+  nativeengine: { cat: 'playback', terms: ['native', 'audio engine', 'beta', 'engine', 'experimental playback'] },
   reset: { cat: 'advanced', terms: ['reset', 'defaults', 'restore', 'clear settings', 'factory'] },
 } satisfies Record<string, SectionMeta>;
 
@@ -236,6 +231,8 @@ export function SettingsPage() {
   const setOpenNowPlayingOnPlay = useAppearanceStore(
     (s) => s.setOpenNowPlayingOnPlay,
   );
+  const nativeEngine = useAppearanceStore((s) => s.nativeEngine);
+  const setNativeEngine = useAppearanceStore((s) => s.setNativeEngine);
 
   // Last.fm (free; genre-accurate Browse charts)
   const [hasLastfmKey, setHasLastfmKey] = useState(false);
@@ -1059,8 +1056,9 @@ export function SettingsPage() {
   const q = search.trim().toLowerCase();
   const searching = q.length > 0;
   const show = (s: SectionMeta) => {
-    // Hidden until the native audio engine backs it (keeps the code + UI intact).
-    if (s === SECTIONS.sound && !SHOW_SOUND_FX) return false;
+    // Sound effects (EQ / Mono) only work through the native engine, so only
+    // surface the group when that beta is on.
+    if (s === SECTIONS.sound && !nativeEngine) return false;
     return searching ? s.terms.some((t) => t.includes(q)) : tab === s.cat;
   };
   const anyVisible = Object.values(SECTIONS).some(show);
@@ -1218,6 +1216,26 @@ export function SettingsPage() {
               checked={autoplay}
               onChange={setAutoplay}
               ariaLabel="Autoplay"
+            />
+          }
+        />
+      </Group>
+      )}
+
+      {/* -- Native audio engine (beta) — powers the Sound effects --- */}
+      {show(SECTIONS.nativeengine) && (
+      <Group
+        title="Native audio engine"
+        footer="Turn this on to use the Equalizer, Normalize, and Mono sound effects. Still experimental."
+      >
+        <Row
+          label="Use the native engine (beta)"
+          secondary="Restart the current song after switching."
+          control={
+            <Toggle
+              checked={nativeEngine}
+              onChange={setNativeEngine}
+              ariaLabel="Native audio engine (beta)"
             />
           }
         />

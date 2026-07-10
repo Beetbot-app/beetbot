@@ -8,9 +8,9 @@ importers:
 
   .:
     dependencies:
-      '@fontsource/outfit':
-        specifier: ^5.2.8
-        version: 5.2.8
+      '@fontsource/fraunces':
+        specifier: ^5.2.9
+        version: 5.2.9
       '@tanstack/react-virtual':
         specifier: ^3.13.25
         version: 3.13.25(react-dom@19.2.6(react@19.2.6))(react@19.2.6)
@@ -367,8 +367,8 @@ packages:
     resolution: {integrity: sha512-43/qtrDUokr7LJqoF2c3+RInu/t4zfrpYdoSDfYyhg52rwLV6TnOvdG4fXm7IkSB3wErkcmJS9iEhjVtOSEjjA==}
     engines: {node: ^18.18.0 || ^20.9.0 || >=21.1.0}
 
-  '@fontsource/outfit@5.2.8':
-    resolution: {integrity: sha512-rXC6g0MqD7cOBjht0bMqc43qM6lRqDLML9KXsmg9uykz0wLQhy8Z/ajrMG6iyoT3NJR+MYgU+OEHp7uHoTb+Yw==}
+  '@fontsource/fraunces@5.2.9':
+    resolution: {integrity: sha512-XDzuddBtoC7BZgZdBn6b7hsFZY2+V1hgN7yca5fBTKuHjb/lOd45a0Ji8dTUgFhPoL7RdGupo+bC2BFSt6UH8Q==}
 
   '@humanfs/core@0.19.2':
     resolution: {integrity: sha512-UhXNm+CFMWcbChXywFwkmhqjs3PRCmcSa/hfBgLIb7oQ5HNb1wS0icWsGtSAUNgefHeI+eBrA8I1fxmbHsGdvA==}
@@ -1703,7 +1703,7 @@ snapshots:
       '@eslint/core': 0.17.0
       levn: 0.4.1
 
-  '@fontsource/outfit@5.2.8': {}
+  '@fontsource/fraunces@5.2.9': {}
 
   '@humanfs/core@0.19.2':
     dependencies:

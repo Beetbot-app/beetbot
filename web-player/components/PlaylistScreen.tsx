@@ -1209,7 +1209,7 @@ function OfflineToggle({
         disabled={busy}
         aria-label="Remove from offline"
         title={`Remove this ${isAlbum ? 'album' : 'playlist'} from offline cache`}
-        className="grid h-10 w-10 place-items-center rounded-full bg-white/10 text-emerald-400 active:opacity-60 disabled:opacity-50"
+        className="grid h-10 w-10 place-items-center rounded-full bg-white/10 text-[#37C871] active:opacity-60 disabled:opacity-50"
       >
         {busy ? (
           // Spin through BOTH busy states: partway through a caching run this

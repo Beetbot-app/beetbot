@@ -41,6 +41,7 @@ import {
   getArtistRelated,
   getArtistTopTracks,
   canPlayNow,
+  deletePlaylist,
   friendlyError,
   getCatalogPlaylist,
   getRecentItems,
@@ -1597,6 +1598,12 @@ export function SearchScreen({
           onSaveTrack={pageMode ? undefined : onAlbumSaveToLiked}
           onGoToArtist={onAlbumGoToArtist}
           onGoToAlbum={onAlbumGoToAlbum}
+          // Desktop now-playing: equalizer bars on the current row + a ⏸/▶ hero
+          // that toggles (matching the album + library playlist pages). Desktop
+          // only — the phone host doesn't wire these.
+          isTrackCurrent={pageMode ? isTrackCurrent : undefined}
+          isPlaying={pageMode ? isNowPlaying : undefined}
+          onTogglePlay={pageMode ? onTogglePlay : undefined}
           playingPreviewUrl={playingPreviewUrl}
           onTogglePreview={togglePreview}
         />
@@ -4933,6 +4940,7 @@ export function AlbumDetailModal({
   kindLabel,
   importLabel,
   onImport,
+  savedCopyId,
   disableFetch,
   onGoToArtist,
   onGoToAlbum,
@@ -4994,6 +5002,12 @@ export function AlbumDetailModal({
    *  merely because every track already happens to be in the library (importing
    *  still creates a new named playlist). */
   onImport?: () => Promise<void>;
+  /** Catalog-playlist mode only: the id of an EXISTING library playlist this
+   *  catalog playlist already maps to (matched by name). When set, the +/✓
+   *  control shows a static "In your library" ✓ instead of the "+" importer —
+   *  so a playlist you've already added doesn't read as "not in library" or
+   *  invite a duplicate import. Null/undefined ⇒ show the normal importer. */
+  savedCopyId?: number | null;
   /** Never fetch the catalog tracklist — the host fully owns `presetTracks`
    *  (which may be momentarily undefined while it loads → shows "Loading…"). */
   disableFetch?: boolean;
@@ -5145,6 +5159,7 @@ export function AlbumDetailModal({
   const handleImport = async () => {
     if (!tracks || tracks.length === 0) return;
     setImportState('importing');
+    setRemovedLocally(false);
     setError(null);
     try {
       // The catalog-playlist wrapper supplies its own importer (imports as a
@@ -5161,6 +5176,9 @@ export function AlbumDetailModal({
         );
       }
       setImportState('done');
+      // Refresh the app's sidebar/playlist list (the new copy should appear).
+      if (typeof window !== 'undefined')
+        window.dispatchEvent(new Event('beetbot:library-changed'));
       // Stay on the page; the action shifts to a green ✓ "in your library" in
       // place, mirroring Spotify (no auto-close).
     } catch (e) {
@@ -5179,22 +5197,73 @@ export function AlbumDetailModal({
   // read as "saved". The album is saved iff every track shares a common saved-
   // album playlist (their `in_saved_album_ids` intersect). Robust against a
   // stray track that happens to sit in some other saved album.
-  const albumSavedInLibrary =
-    !!tracks &&
-    tracks.length > 0 &&
-    tracks
-      .map((t) => new Set(t.in_saved_album_ids ?? []))
-      .reduce((acc, ids) => new Set([...acc].filter((id) => ids.has(id))))
-      .size > 0;
+  // The saved-album playlist id every track shares (saved albums are stored as
+  // source='album' playlists), or null. Exposed so the "in your library" ✓ can
+  // toggle OFF by deleting that row — same mechanism as an imported playlist.
+  const savedAlbumId =
+    tracks && tracks.length > 0
+      ? ([
+          ...tracks
+            .map((t) => new Set(t.in_saved_album_ids ?? []))
+            .reduce((acc, ids) => new Set([...acc].filter((id) => ids.has(id)))),
+        ][0] ?? null)
+      : null;
+  const albumSavedInLibrary = savedAlbumId != null;
   // A saved library album reusing this page — its +/✓ is a clickable green ✓
   // that removes (vs. a catalog album, whose ✓ is just an "added" indicator).
   const albumSaved = savedPlaylistId != null;
+  // Optimistic removal: clicking the "in your library" ✓ deletes the backing
+  // row (imported playlist OR saved album) and flips the control back to "+".
+  const [removedLocally, setRemovedLocally] = useState(false);
+  const [removing, setRemoving] = useState(false);
+  // The library row a case-2 ✓ can remove: the imported-playlist copy wins
+  // (explicit), else the shared saved-album id. Null ⇒ nothing to toggle off
+  // (e.g. a not-yet-saved catalog item), so the ✓ stays a static indicator.
+  const catalogRemoveId = savedCopyId ?? savedAlbumId;
+  const handleCatalogRemove = async () => {
+    if (catalogRemoveId == null || removing) return;
+    setRemoving(true);
+    setError(null);
+    try {
+      await deletePlaylist(catalogRemoveId, token);
+      // Flip the control back to "+" in place. A remount (navigate away/back)
+      // re-derives library state from a fresh fetch, so this stays honest.
+      setRemovedLocally(true);
+      // Reset the import state so the "+" is enabled again — otherwise removing
+      // a playlist imported THIS session leaves importState='done', which the
+      // "+" button treats as "busy" (disabled/greyed) and you can't re-add it.
+      setImportState('idle');
+      // Tell the app the library changed so the sidebar/playlist list refreshes
+      // — otherwise the removed playlist lingers there and the remove reads as a
+      // no-op even though it worked.
+      if (typeof window !== 'undefined')
+        window.dispatchEvent(new Event('beetbot:library-changed'));
+    } catch (e) {
+      setError(friendlyError(e));
+    } finally {
+      setRemoving(false);
+    }
+  };
+  // Case-2 ✓ is a clickable REMOVE toggle whenever we have a concrete library
+  // row to delete (`catalogRemoveId`): either detected on load, or — after an
+  // import this session — the id the importer just returned (the wrapper feeds
+  // it back into `savedCopyId`). Not shown once already removed this session.
+  const canRemoveFromLibrary =
+    !removedLocally &&
+    catalogRemoveId != null &&
+    (savedCopyId != null || albumSavedInLibrary);
   // Drives the +/✓ library toggle: green ✓ once it's saved / the album is
   // already in the library (or we just imported it), + to add otherwise. In
   // playlist mode (`onImport`) "already present" does NOT count — importing
   // still creates a new named playlist — so ✓ only appears after a real import.
   const albumInLibrary =
-    albumSaved || importState === 'done' || (!onImport && albumSavedInLibrary);
+    !removedLocally &&
+    (albumSaved ||
+      importState === 'done' ||
+      // A catalog playlist we've already imported (matched by name) — so its
+      // control reads "In your library" instead of offering a duplicate import.
+      savedCopyId != null ||
+      (!onImport && albumSavedInLibrary));
   // Now-playing awareness: is any track on this page the current playback? That
   // makes THIS album/playlist the active context, so the hero + sticky Play
   // button mirror the now-playing bar (⏸ while it's playing) and toggle instead
@@ -5226,12 +5295,11 @@ export function AlbumDetailModal({
   // so it reads like a real playlist rather than a single-artwork album.
   const isCatalogPlaylist = !!onImport || !!playlistStyle;
 
-  // Album rows keep a small "in a playlist" ✓ column next to Time on desktop
-  // (Spotify-style): it shows a white ✓ only for tracks already in a playlist
-  // (click to manage) and is blank otherwise — the "add" action lives in the ⋯
-  // menu. On the phone that folds into the ⋯ sheet, and catalog playlists fold
-  // it into the File column, so the standalone column is desktop-album-only.
-  const showAlbumAddColumn = !isCatalogPlaylist && !onShowTrackSheet;
+  // The "in a playlist" ✓ column now shows on desktop CATALOG PLAYLISTS too (not
+  // just albums) — a dedicated column, like the album page, indicating a song is
+  // in one of your OTHER playlists (see `renderAddToLibrary`). Phone folds it
+  // into the ⋯ sheet (onShowTrackSheet), so it's desktop-only either way.
+  const showInPlaylistColumn = !onShowTrackSheet;
 
   // Track-list grid. Albums: # · Title · File · [✓] · Time (+ a trailing ⋯ column
   // on desktop). Catalog playlists instead mirror the library playlist page
@@ -5239,8 +5307,16 @@ export function AlbumDetailModal({
   // +/✓ folded INTO the File column.
   const trackGrid = isCatalogPlaylist
     ? onShowTrackMenu
-      ? 'grid-cols-[2rem_2.25rem_1fr_2.5rem_2.75rem_2rem] sm:grid-cols-[2.5rem_3rem_minmax(0,1fr)_minmax(0,1fr)_5rem_5rem_2.5rem]'
-      : 'grid-cols-[2rem_2.25rem_1fr_2.5rem_2.75rem] sm:grid-cols-[2.5rem_3rem_minmax(0,1fr)_minmax(0,1fr)_5rem_5rem]'
+      // Desktop catalog playlist WITH ⋯ menu: # · cover · Title · Album · File · [✓] · Time · ⋯.
+      // The 2rem ✓ slot mirrors the album page's "in a playlist" column.
+      ? 'grid-cols-[2rem_2.25rem_1fr_2.5rem_2.75rem_2rem] sm:grid-cols-[2.5rem_3rem_minmax(0,1fr)_minmax(0,1fr)_5rem_2rem_5rem_2.5rem]'
+      : onShowTrackSheet
+        // Phone catalog (⋯ sheet): the ✓ folds into the sheet, so no ✓ column.
+        ? 'grid-cols-[2rem_2.25rem_1fr_2.5rem_2.75rem] sm:grid-cols-[2.5rem_3rem_minmax(0,1fr)_minmax(0,1fr)_5rem_5rem]'
+        // Desktop catalog WITHOUT a ⋯ menu (e.g. a Mix): still renders the ✓ cell
+        // (showInPlaylistColumn), so the grid needs the 2rem slot — otherwise the
+        // extra cell overflows and Time wraps to a second line.
+        : 'grid-cols-[2rem_2.25rem_1fr_2.5rem_2.75rem] sm:grid-cols-[2.5rem_3rem_minmax(0,1fr)_minmax(0,1fr)_5rem_2rem_5rem]'
     : onShowTrackSheet
       ? 'grid-cols-[2rem_1fr_2.5rem_2.75rem] sm:grid-cols-[2.5rem_1fr_5rem_5rem]'
       : onShowTrackMenu
@@ -5300,14 +5376,23 @@ export function AlbumDetailModal({
   // track that's already in ≥1 playlist — click it to manage (opens the add-to-
   // playlist picker, pre-checked). Blank otherwise; the "add" action lives in
   // the ⋯ menu, so there's no hover-revealed + cluttering every row.
-  const renderAddToLibrary = (t: SearchTrackResult) =>
-    !isInLibrary(t) ? null : (
+  //
+  // On a catalog PLAYLIST page, membership in THIS playlist's own imported copy
+  // (`savedCopyId`) doesn't count — otherwise every row would show ✓ trivially.
+  // So the ✓ means "also in one of your OTHER playlists". For albums savedCopyId
+  // is undefined, so the filter is a no-op and it stays "in ≥1 playlist".
+  const renderAddToLibrary = (t: SearchTrackResult) => {
+    const otherIds = t.in_playlist_ids.filter((id) => id !== savedCopyId);
+    return otherIds.length === 0 ? null : (
     <button
       type="button"
-      onClick={() => onPickTrack(t)}
+      onClick={(e) => {
+        e.stopPropagation();
+        onPickTrack(t);
+      }}
       aria-label="Manage playlists for this track"
-      title={`In ${t.in_playlist_ids.length} ${
-        t.in_playlist_ids.length === 1 ? 'playlist' : 'playlists'
+      title={`In ${otherIds.length} ${
+        otherIds.length === 1 ? 'playlist' : 'playlists'
       } — click to manage`}
       className="grid h-6 w-6 place-items-center rounded-full bg-white text-neutral-950 hover:bg-neutral-200 leading-none transition active:scale-95"
     >
@@ -5325,7 +5410,8 @@ export function AlbumDetailModal({
           <path d="m5 12 5 5 9-11" />
         </svg>
     </button>
-  );
+    );
+  };
 
   return (
     <>
@@ -5523,25 +5609,52 @@ export function AlbumDetailModal({
                       </svg>
                     </button>
                   ) : albumInLibrary ? (
-                    <span
-                      aria-label="In your library"
-                      title="In your library"
-                      className="grid place-items-center h-9 w-9 rounded-full bg-white text-neutral-950"
-                    >
-                      <svg
-                        width="18"
-                        height="18"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="3"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        aria-hidden
+                    canRemoveFromLibrary ? (
+                      <button
+                        type="button"
+                        onClick={handleCatalogRemove}
+                        disabled={removing}
+                        title="In your library — click to remove"
+                        aria-label="Remove from library"
+                        className="group/rm grid place-items-center h-9 w-9 rounded-full bg-white hover:bg-neutral-200 text-neutral-950 transition disabled:opacity-50"
                       >
-                        <path d="M20 6 9 17l-5-5" />
-                      </svg>
-                    </span>
+                        <svg
+                          width="18"
+                          height="18"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="3"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          aria-hidden
+                        >
+                          {/* ✓ normally; a − on hover to signal "click to remove" */}
+                          <path className="group-hover/rm:hidden" d="M20 6 9 17l-5-5" />
+                          <path className="hidden group-hover/rm:block" d="M5 12h14" />
+                        </svg>
+                      </button>
+                    ) : (
+                      <span
+                        aria-label="In your library"
+                        title="In your library"
+                        className="grid place-items-center h-9 w-9 rounded-full bg-white text-neutral-950"
+                      >
+                        <svg
+                          width="18"
+                          height="18"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="3"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          aria-hidden
+                        >
+                          <path d="M20 6 9 17l-5-5" />
+                        </svg>
+                      </span>
+                    )
                   ) : hideImport ? null : (
                     <button
                       type="button"
@@ -5723,15 +5836,30 @@ export function AlbumDetailModal({
                     </svg>
                   </button>
                 ) : albumInLibrary ? (
-                  <span
-                    aria-label="In your library"
-                    title="In your library"
-                    className="grid h-10 w-10 place-items-center rounded-full bg-white text-neutral-950"
-                  >
-                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-                      <path d="M20 6 9 17l-5-5" />
-                    </svg>
-                  </span>
+                  canRemoveFromLibrary ? (
+                    <button
+                      type="button"
+                      onClick={handleCatalogRemove}
+                      disabled={removing}
+                      aria-label="Remove from library"
+                      title="In your library — tap to remove"
+                      className="grid h-10 w-10 place-items-center rounded-full bg-white text-neutral-950 active:bg-neutral-200 disabled:opacity-50"
+                    >
+                      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                        <path d="M20 6 9 17l-5-5" />
+                      </svg>
+                    </button>
+                  ) : (
+                    <span
+                      aria-label="In your library"
+                      title="In your library"
+                      className="grid h-10 w-10 place-items-center rounded-full bg-white text-neutral-950"
+                    >
+                      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                        <path d="M20 6 9 17l-5-5" />
+                      </svg>
+                    </span>
+                  )
                 ) : hideImport ? null : (
                   <button
                     type="button"
@@ -5801,7 +5929,7 @@ export function AlbumDetailModal({
                 <span className="hidden sm:block">Album</span>
               ) : null}
               <span>File</span>
-              {showAlbumAddColumn ? <span /> : null}
+              {showInPlaylistColumn ? <span /> : null}
               <span className="text-right">Time</span>
               {onShowTrackMenu ? <span /> : null}
             </div>
@@ -5866,7 +5994,23 @@ export function AlbumDetailModal({
                         showSwipeToast('Added to Favorites');
                       }}
                     >
-                    <div className={rowInnerClass}>
+                    <div
+                      className={`${rowInnerClass}${
+                        interactive && !swipeEnabled ? ' cursor-pointer' : ''
+                      }`}
+                      // Click ANYWHERE in the row to play (Spotify-style), same
+                      // as the library playlist. The title button, the in-playlist
+                      // ✓, the ⋯ menu, and the artist/album links all
+                      // stopPropagation so they keep their own action. Desktop
+                      // only — phone rows use tap/swipe (MaybeSwipe).
+                      onClick={
+                        interactive && !swipeEnabled
+                          ? () =>
+                              playable
+                                ? onPlay(t, tracks, i)
+                                : onTogglePreview(t.preview_url as string)
+                          : undefined
+                      }>
                     {/* Track number — or, on an album row while this track's
                         preview plays, a mini depleting ring + pause glyph.
                         Playlist rows show the preview state on the cover (below)
@@ -5974,10 +6118,12 @@ export function AlbumDetailModal({
                       {...(interactive
                         ? {
                             type: 'button' as const,
-                            onClick: () =>
+                            onClick: (e: React.MouseEvent) => {
+                              e.stopPropagation();
                               playable
                                 ? onPlay(t, tracks, i)
-                                : onTogglePreview(t.preview_url as string),
+                                : onTogglePreview(t.preview_url as string);
+                            },
                             'aria-label': playable
                               ? `Play ${t.title}`
                               : previewing
@@ -6045,32 +6191,29 @@ export function AlbumDetailModal({
                         )}
                       </div>
                     ) : null}
-                    {/* FILE — the green "downloaded" seal; for a catalog playlist
-                        the add-to-library +/✓ folds in here (SAME spot, under the
-                        "File" header — no orphaned column to the right, matching
-                        the library playlist page). Desktop always renders it (a
-                        real grid column). Phone (onShowTrackSheet) only renders it
-                        when there's a seal to show — otherwise the fixed 28px box
-                        would push the ⋯ off-align from the saved-library row,
-                        which emits nothing when a track isn't downloaded. */}
+                    {/* FILE — the green "downloaded" seal. The "in a playlist" ✓
+                        is now its OWN column (below), on catalog playlists too, so
+                        this cell shows download state only. Desktop always renders
+                        the box (a real grid column); phone (onShowTrackSheet) only
+                        when there's a seal, so an undownloaded row doesn't push the
+                        ⋯ off-align from the saved-library rows. */}
                     {t.has_audio || !onShowTrackSheet ? (
                       <div className="shrink-0 grid place-items-start">
                         <span className="grid h-7 w-7 place-items-center">
-                          {t.has_audio ? (
-                            <AlbumDownloadedBadge />
-                          ) : isCatalogPlaylist && !onShowTrackSheet ? (
-                            renderAddToLibrary(t)
-                          ) : null}
+                          {t.has_audio ? <AlbumDownloadedBadge /> : null}
                         </span>
                       </div>
                     ) : null}
-                    {/* Add-to-library — albums keep it as its own column ONLY
-                        when there's no ⋯ menu/sheet to fold it into (both offer
-                        "Add to playlist"). On desktop (⋯ menu) and phone (⋯ sheet)
-                        it's dropped as redundant clutter. Catalog playlists fold
-                        it into FILE (above) to match the library playlist page. */}
-                    {showAlbumAddColumn ? (
-                      <div className="shrink-0 grid place-items-center">
+                    {/* "In a playlist" ✓ — its own column on desktop albums AND
+                        catalog playlists (phone folds it into the ⋯ sheet). On a
+                        catalog playlist it's hidden below sm since those rows are
+                        flex on phone; albums keep their existing all-width cell. */}
+                    {showInPlaylistColumn ? (
+                      <div
+                        className={`shrink-0 place-items-center ${
+                          isCatalogPlaylist ? 'hidden sm:grid' : 'grid'
+                        }`}
+                      >
                         {renderAddToLibrary(t)}
                       </div>
                     ) : null}
@@ -6337,6 +6480,9 @@ export function PlaylistDetailModal({
   onSaveTrack,
   onGoToArtist,
   onGoToAlbum,
+  isTrackCurrent,
+  isPlaying,
+  onTogglePlay,
 }: {
   token: string;
   playlist: CatalogPlaylistSummary;
@@ -6357,8 +6503,20 @@ export function PlaylistDetailModal({
   /** Clickable artist / Album names in the tracklist — forwarded to the page. */
   onGoToArtist?: (name: string) => void;
   onGoToAlbum?: (name: string, artist: string | null) => void;
+  /** Now-playing awareness (desktop): equalizer bars on the current row + a
+   *  ⏸/▶ hero that toggles playback. Forwarded straight to the shared page. */
+  isTrackCurrent?: (t: SearchTrackResult) => boolean;
+  isPlaying?: boolean;
+  onTogglePlay?: () => void;
 }) {
   const [detail, setDetail] = useState<CatalogPlaylist | null>(null);
+  // Id of an existing library playlist that already matches this catalog
+  // playlist (by name). Imports don't record the catalog source id, so name is
+  // the only link we have — and it also covers copies imported before this
+  // check existed. When set, the page shows "In your library" ✓ instead of the
+  // "+" importer, so a playlist you've already added no longer reads as missing
+  // (or invites a silent duplicate).
+  const [savedCopyId, setSavedCopyId] = useState<number | null>(null);
 
   // Pull the full tracklist for this catalog playlist. The shared page below
   // renders its hero immediately (from the summary) and shows "Loading tracks…"
@@ -6376,6 +6534,25 @@ export function PlaylistDetailModal({
       cancelled = true;
     };
   }, [playlist.source_id, token]);
+
+  // Detect an already-imported copy by name (case-insensitive, trimmed). A
+  // best-effort library read; a failure just leaves the importer showing.
+  useEffect(() => {
+    let cancelled = false;
+    const want = playlist.title.trim().toLowerCase();
+    listPlaylists(token, activeProfileId)
+      .then((rows) => {
+        if (cancelled) return;
+        const hit = rows.find((r) => r.name.trim().toLowerCase() === want);
+        setSavedCopyId(hit?.id ?? null);
+      })
+      .catch(() => {
+        /* leave savedCopyId null — importer stays available */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [playlist.title, token, activeProfileId]);
 
   const tracks = detail?.tracks ?? null;
   const cover = detail?.cover_url ?? playlist.cover_url;
@@ -6401,7 +6578,9 @@ export function PlaylistDetailModal({
 
   const handleImport = async () => {
     if (!tracks || tracks.length === 0) return;
-    await importPlaylist(playlist.title, tracks, token, activeProfileId);
+    const r = await importPlaylist(playlist.title, tracks, token, activeProfileId);
+    // Remember the new id so the just-saved ✓ is immediately removable.
+    setSavedCopyId(r.playlist_id);
   };
 
   return (
@@ -6413,6 +6592,7 @@ export function PlaylistDetailModal({
       kindLabel="Playlist"
       importLabel="Add all to library"
       onImport={handleImport}
+      savedCopyId={savedCopyId}
       onClose={onClose}
       onPickTrack={onPickTrack}
       onPlay={onPlay}
@@ -6422,6 +6602,9 @@ export function PlaylistDetailModal({
       onSaveTrack={onSaveTrack}
       onGoToArtist={onGoToArtist}
       onGoToAlbum={onGoToAlbum}
+      isTrackCurrent={isTrackCurrent}
+      isPlaying={isPlaying}
+      onTogglePlay={onTogglePlay}
       playingPreviewUrl={playingPreviewUrl}
       onTogglePreview={onTogglePreview}
       inline={inline}
@@ -6452,6 +6635,9 @@ export function MixDetailModal({
   onSaveTrack,
   onGoToArtist,
   onGoToAlbum,
+  isTrackCurrent,
+  isPlaying,
+  onTogglePlay,
 }: {
   token: string;
   mix: { title: string; eyebrow?: string | null; tracks: SearchTrackResult[] };
@@ -6468,6 +6654,12 @@ export function MixDetailModal({
   onSaveTrack?: (t: SearchTrackResult) => void;
   onGoToArtist?: (name: string) => void;
   onGoToAlbum?: (name: string, artist: string | null) => void;
+  /** Now-playing awareness (desktop), same as the library playlist page:
+   *  equalizer bars + row highlight on the current track, and a ⏸/▶ hero that
+   *  toggles playback instead of restarting. */
+  isTrackCurrent?: (t: SearchTrackResult) => boolean;
+  isPlaying?: boolean;
+  onTogglePlay?: () => void;
 }) {
   const coverUrls = mix.tracks
     .map((t) => t.album_art_url)
@@ -6483,6 +6675,35 @@ export function MixDetailModal({
     release_date: null,
     total_tracks: mix.tracks.length,
   };
+
+  // A mix can be SAVED to the library (imported as a snapshot playlist), same
+  // as a catalog playlist — the hero +/✓ then doubles as save / remove. Detect
+  // an existing copy by name so a re-open shows ✓ instead of offering a dup.
+  const [savedCopyId, setSavedCopyId] = useState<number | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    const want = mix.title.trim().toLowerCase();
+    listPlaylists(token, activeProfileId)
+      .then((rows) => {
+        if (cancelled) return;
+        setSavedCopyId(
+          rows.find((r) => r.name.trim().toLowerCase() === want)?.id ?? null,
+        );
+      })
+      .catch(() => {
+        /* leave null — importer stays available */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [mix.title, token, activeProfileId]);
+  const handleImport = async () => {
+    if (mix.tracks.length === 0) return;
+    const r = await importPlaylist(mix.title, mix.tracks, token, activeProfileId);
+    // Remember the new id so the just-saved ✓ is immediately removable.
+    setSavedCopyId(r.playlist_id);
+  };
+
   return (
     <AlbumDetailModal
       token={token}
@@ -6490,7 +6711,11 @@ export function MixDetailModal({
       presetTracks={mix.tracks}
       disableFetch
       playlistStyle
-      hideImport
+      // Save/remove the mix as a snapshot playlist — the hero +/✓ (import when
+      // new, a click-to-remove ✓ once saved), same as the catalog playlist page.
+      importLabel="Add all to library"
+      onImport={handleImport}
+      savedCopyId={savedCopyId}
       coverUrls={coverUrls}
       kindLabel="Mix"
       onClose={onClose}
@@ -6502,6 +6727,9 @@ export function MixDetailModal({
       onSaveTrack={onSaveTrack}
       onGoToArtist={onGoToArtist}
       onGoToAlbum={onGoToAlbum}
+      isTrackCurrent={isTrackCurrent}
+      isPlaying={isPlaying}
+      onTogglePlay={onTogglePlay}
       playingPreviewUrl={playingPreviewUrl}
       onTogglePreview={onTogglePreview}
       inline={inline}

@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { HomeScreen, type HomeDrillSnapshot } from '@shared/components/HomeScreen';
-import { setApiBase, type PlaylistRow } from '@shared/api';
+import { setApiBase, type PlaylistRow, type SearchTrackResult } from '@shared/api';
 import { useProfileStore } from '@/lib/profile';
 import { useNavStore } from '@/lib/nav';
 import { useSession } from '@/lib/session';
 import { ipc } from '@/lib/tauri';
-import { playOnDesktop } from '@/pages/Search';
+import { playOnDesktop, queueCatalogTrack, likeCatalogTrack } from '@/pages/Search';
 import { usePlayerStore, currentTrack } from '@/lib/store';
 
 // Point the shared api.ts at the loopback streaming server (the Tauri
@@ -48,18 +48,44 @@ export function HomePage({
   // Now-playing state for the Spotify-style card play/pause on Home.
   const isPlaying = usePlayerStore((s) => s.isPlaying);
   const nowPlayingKey = usePlayerStore((s) => s.nowPlayingKey);
-  const npTrack = usePlayerStore(currentTrack);
-  const nowPlayingTrackId = npTrack?.id ?? null;
-  // Minimal shape for the live "Recently played" prepend (HomeScreen).
-  const nowPlayingTrack = npTrack
+  const curTrack = usePlayerStore(currentTrack);
+  const nowPlayingTrackId = curTrack?.id ?? null;
+  // "Is this row the current playback track?" for the mix drill-in's highlight /
+  // equalizer / ⏸ hero. A mix's rows are CATALOG results whose `local_track_id`
+  // often differs from the resolved id we actually play, so match on id OR
+  // title+artist (mirrors the search/library matcher).
+  const isTrackCurrent = useCallback(
+    (t: SearchTrackResult) => {
+      const cur = curTrack;
+      if (!cur) return false;
+      if (t.local_track_id != null && t.local_track_id === cur.id) return true;
+      if (t.isrc && cur.isrc && t.isrc === cur.isrc) return true;
+      const norm = (s?: string | null) => (s ?? '').trim().toLowerCase();
+      return (
+        !!cur.title &&
+        norm(t.title) === norm(cur.title) &&
+        (!t.artists[0] ||
+          !cur.artists[0] ||
+          norm(t.artists[0]) === norm(cur.artists[0]))
+      );
+    },
+    [curTrack],
+  );
+  // Minimal shape for the live "Recently played" prepend. Sourced from the LAST
+  // LOGGED play (the track that crossed the ~20s "counts as a play" threshold),
+  // NOT the currently-playing track — so the optimistic shelf only shows songs
+  // the server will actually keep. A sub-20s play prepended at track-start would
+  // vanish on the next feed fetch (it was never recorded in play_events).
+  const logged = usePlayerStore((s) => s.lastLoggedTrack);
+  const nowPlayingTrack = logged
     ? {
-        id: npTrack.id,
-        title: npTrack.title,
-        artists: npTrack.artists,
-        album: npTrack.album,
-        album_art_url: npTrack.album_art_url,
-        duration_ms: npTrack.duration_ms,
-        has_audio: npTrack.local_path != null || npTrack.status === 'downloaded',
+        id: logged.id,
+        title: logged.title,
+        artists: logged.artists,
+        album: logged.album,
+        album_art_url: logged.album_art_url,
+        duration_ms: logged.duration_ms,
+        has_audio: logged.local_path != null || logged.status === 'downloaded',
       }
     : null;
   const togglePlay = usePlayerStore((s) => s.playPause);
@@ -159,6 +185,12 @@ export function HomePage({
         nowPlayingTrack={nowPlayingTrack}
         isPlaying={isPlaying}
         onTogglePlay={togglePlay}
+        isTrackCurrent={isTrackCurrent}
+        // Enable the mix ⋯ menu's "Add to Favorites" / "Add to queue" (they
+        // resolve the catalog row to a library id first), matching the catalog
+        // playlist page's menu.
+        onAlbumAddToQueue={(t) => void queueCatalogTrack(t, token)}
+        onAlbumSaveToLiked={(t) => void likeCatalogTrack(t, token, activeProfileId ?? null)}
         onPlayedFrom={setNowPlayingKey}
         onOpenPlaylist={onOpenPlaylist}
         onOpenBrowse={onOpenBrowse}

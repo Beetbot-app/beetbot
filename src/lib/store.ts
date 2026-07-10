@@ -34,6 +34,13 @@ interface PlayerState {
   /// advance keeps it, a fresh setQueue clears it (re-set by the card handler).
   nowPlayingKey: string | null;
   setNowPlayingKey: (key: string | null) => void;
+  /// The most recent track that CROSSED the "counts as a play" threshold (~20s)
+  /// and was logged to play_events. Drives Home's live "Recently played" prepend
+  /// so the optimistic shelf only ever shows what the server will actually keep —
+  /// prepending at track START would surface sub-20s plays that then vanish on
+  /// the next feed fetch. Null until the first play is logged this session.
+  lastLoggedTrack: PlaylistTrack | null;
+  markPlayLogged: (t: PlaylistTrack) => void;
   /// True while the active <audio> is buffering/stalled. Lifted out of the bar
   /// so both the mini bar and the full Now Playing view can show a spinner.
   buffering: boolean;
@@ -111,6 +118,7 @@ export const usePlayerStore = create<PlayerState>()(
   currentIndex: 0,
   isPlaying: false,
   nowPlayingKey: null,
+  lastLoggedTrack: null,
   buffering: false,
   currentTime: 0,
   duration: 0,
@@ -259,6 +267,7 @@ export const usePlayerStore = create<PlayerState>()(
 
   playPause: () => set((s) => ({ isPlaying: !s.isPlaying })),
   setNowPlayingKey: (key) => set({ nowPlayingKey: key }),
+  markPlayLogged: (t) => set({ lastLoggedTrack: t }),
   play: () => set({ isPlaying: true }),
   pause: () => set({ isPlaying: false }),
 

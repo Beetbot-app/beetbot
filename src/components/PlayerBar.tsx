@@ -2,6 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { formatDuration } from '@/lib/format';
 import { currentTrack, usePlayerStore } from '@/lib/store';
+import { useNativeEngine } from '@/lib/nativeEngine';
+import { useAppearanceStore } from '@/lib/appearance';
+import { useAudioFxStore, LOUDNESS_TARGET_LUFS } from '@/lib/audiofx';
 import { useNavStore } from '@/lib/nav';
 import { ipc, type PlaylistTrack } from '@/lib/tauri';
 import {
@@ -67,6 +70,12 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
   const currentTime = usePlayerStore((s) => s.currentTime);
   const duration = usePlayerStore((s) => s.duration);
   const volume = usePlayerStore((s) => s.volume);
+  const nativeEngine = useAppearanceStore((s) => s.nativeEngine);
+  const eqEnabled = useAudioFxStore((s) => s.eqEnabled);
+  const eqGains = useAudioFxStore((s) => s.eqGains);
+  const monoFx = useAudioFxStore((s) => s.mono);
+  const normalizeFx = useAudioFxStore((s) => s.normalize);
+  const loudnessFx = useAudioFxStore((s) => s.loudness);
   const repeat = usePlayerStore((s) => s.repeat);
   const shuffle = usePlayerStore((s) => s.shuffle);
   const queueLength = usePlayerStore((s) => s.queue.length);
@@ -326,6 +335,9 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
     } else if (currentTime >= 20 && playLoggedRef.current !== track.id) {
       playLoggedRef.current = track.id;
       void logPlay(castToken, track.id, activeProfileId);
+      // Same threshold the server uses to record a play: surface it to Home so
+      // the live "Recently played" prepend only shows tracks the feed will keep.
+      usePlayerStore.getState().markPlayLogged(track);
     }
   }, [currentTime, track?.id, castToken, activeProfileId]);
 
@@ -510,10 +522,62 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
     [volume, srcFor, finishCrossfade, audioRef, fadeRef],
   );
 
+  // Native audio engine (beta): drive downloaded/local tracks through the Rust
+  // engine instead of the <audio> element. Streamed (/live) tracks and casting
+  // stay on the webview path for now (Phase 2 extends the engine to /live).
+  // What the native engine should load: the raw local path when downloaded,
+  // else the same /stream/{id}[/live] URL (with token) the webview uses.
+  const engineSrcFor = useCallback(
+    (t: PlaylistTrack | null): string | null => {
+      if (!t) return null;
+      if (t.local_path) return t.local_path;
+      if (!castToken) return null;
+      const tok = encodeURIComponent(castToken);
+      const base = `http://127.0.0.1:47823/stream/${t.id}`;
+      const url = t.status === 'downloaded' ? base : `${base}/live`;
+      return `${url}?t=${tok}`;
+    },
+    [castToken],
+  );
+  const engineSource = useMemo(
+    () => engineSrcFor(track ?? null),
+    [engineSrcFor, track?.id, track?.local_path, track?.status],
+  );
+  const nextTrack = queue[currentIndex + 1] ?? null;
+  const nextSource = useMemo(
+    () => engineSrcFor(nextTrack),
+    [engineSrcFor, nextTrack?.id, nextTrack?.local_path, nextTrack?.status],
+  );
+  const nativeActive = nativeEngine && !castActive && !!engineSource;
+  useNativeEngine({
+    active: nativeActive,
+    track: track ?? null,
+    source: engineSource,
+    isPlaying,
+    volume,
+    currentTime,
+    crossfadeSeconds,
+    nextSource,
+    nextDurationMs: nextTrack?.duration_ms ?? 0,
+    eqEnabled,
+    eqGains,
+    mono: monoFx,
+    normalize: normalizeFx,
+    loudnessTarget: LOUDNESS_TARGET_LUFS[loudnessFx],
+    repeatOne: repeat === 'one',
+  });
+
   // Arm the crossfade once the current track is within crossfadeSeconds of the
-  // end. Off entirely when crossfadeSeconds is 0 or while casting.
+  // end. Off entirely when crossfadeSeconds is 0, while casting, or on native.
   useEffect(() => {
-    if (crossfadeSeconds <= 0 || castActive || !isPlaying || !track) return;
+    if (crossfadeSeconds <= 0 || castActive || nativeActive || !isPlaying || !track) return;
+    // A hidden/occluded WKWebView pauses requestAnimationFrame, which drives the
+    // crossfade ramp + deck flip — so a crossfade started in the background would
+    // stall (incoming stuck at volume 0, no advance) and go silent until the
+    // window is refocused. While hidden, skip the crossfade entirely and let the
+    // rAF-free onEnded handler advance at the true track end. (Re-runs on each
+    // timeupdate, so it re-arms the moment the window comes back to the front.)
+    if (document.hidden) return;
     if (cfStateRef.current !== 'idle') return;
     if (!(duration > 0)) return;
     const next = queue[currentIndex + 1];
@@ -533,6 +597,20 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
     [],
   );
 
+  // If the window is hidden/occluded while a crossfade is already fading, the
+  // rAF ramp is now frozen — the incoming track would sit at partial/zero volume
+  // and the deck would never flip (silence until refocus). Finish the crossfade
+  // immediately: promote the incoming element to full volume and advance. The
+  // outgoing tail (already fading out) is cut a beat early, but playback
+  // continues seamlessly in the background instead of going silent.
+  useEffect(() => {
+    const onVisibility = () => {
+      if (document.hidden && cfStateRef.current === 'fading') finishCrossfade();
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => document.removeEventListener('visibilitychange', onVisibility);
+  }, [finishCrossfade]);
+
   // Drive play/pause from store. We catch the autoplay-policy rejection so a
   // first user gesture is required exactly once on most macOS WKWebView
   // setups; subsequent toggles work freely.
@@ -550,6 +628,15 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
   useEffect(() => {
     const el = audioRef.current;
     if (!el) return;
+    // Native engine owns this (local) track — keep the element silent + src-less
+    // so its own metadata/timeupdate/ended events never fight the engine.
+    if (nativeActive) {
+      if (el.getAttribute('src')) {
+        el.removeAttribute('src');
+        el.load();
+      }
+      return;
+    }
     if (justFlippedRef.current) {
       justFlippedRef.current = false;
       return;
@@ -562,12 +649,12 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
       el.removeAttribute('src');
       el.load();
     }
-  }, [audioSrc, activeIsA]);
+  }, [audioSrc, activeIsA, nativeActive]);
 
   useEffect(() => {
     const el = audioRef.current;
     if (!el) return;
-    if (castActive) {
+    if (nativeActive || castActive) {
       el.pause();
       return;
     }
@@ -579,7 +666,7 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
     } else {
       el.pause();
     }
-  }, [isPlaying, audioSrc, castActive, activeIsA]);
+  }, [isPlaying, audioSrc, castActive, activeIsA, nativeActive]);
 
   // Drive volume. While a crossfade is fading the controller owns the ramp, so
   // leave the element volume alone until it returns to idle.

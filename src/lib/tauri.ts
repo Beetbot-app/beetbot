@@ -43,6 +43,8 @@ export interface PlaylistSummary {
   /** For album imports, the album artist (shown as "Album · Artist");
    *  for upstream playlists, the playlist owner. `null` for plain locals. */
   owner: string | null;
+  /** Row creation time (unix secs) — drives the library "Recently Added" sort. */
+  created_at: number | null;
 }
 
 export type PlaylistSource =
@@ -257,6 +259,27 @@ export const ipc = {
   autostartIsEnabled: () => invoke<boolean>('plugin:autostart|is_enabled'),
   autostartEnable: () => invoke<void>('plugin:autostart|enable'),
   autostartDisable: () => invoke<void>('plugin:autostart|disable'),
+
+  // ---- Native audio engine (beta) ----
+  engineLoad: (source: string, durationMs: number, startAt: number, playing: boolean) =>
+    invoke<void>('engine_load', { source, durationMs, startAt, playing }),
+  enginePlay: () => invoke<void>('engine_play'),
+  enginePause: () => invoke<void>('engine_pause'),
+  engineSeek: (secs: number) => invoke<void>('engine_seek', { secs }),
+  engineSetVolume: (volume: number) => invoke<void>('engine_set_volume', { volume }),
+  engineStop: () => invoke<void>('engine_stop'),
+  enginePosition: () => invoke<number>('engine_position'),
+  engineSetCrossfade: (secs: number) => invoke<void>('engine_set_crossfade', { secs }),
+  engineSetRepeatOne: (enabled: boolean) => invoke<void>('engine_set_repeat_one', { enabled }),
+  enginePreloadNext: (source: string, durationMs: number) =>
+    invoke<void>('engine_preload_next', { source, durationMs }),
+  engineSetFx: (
+    eqEnabled: boolean,
+    gains: number[],
+    mono: boolean,
+    normalize: boolean,
+    loudnessTarget: number,
+  ) => invoke<void>('engine_set_fx', { eqEnabled, gains, mono, normalize, loudnessTarget }),
 
   getLogDir: () => invoke<string>('get_log_dir'),
 

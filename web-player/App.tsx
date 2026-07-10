@@ -285,18 +285,22 @@ export default function App() {
   // Now-playing state for the Spotify-style card play/pause on Home.
   const homeIsPlaying = usePlayerStore((s) => s.isPlaying);
   const homeNowPlayingKey = usePlayerStore((s) => s.nowPlayingKey);
-  const homeNpTrack = usePlayerStore(currentTrack);
-  const homeNowPlayingTrackId = homeNpTrack?.id ?? null;
-  // Minimal shape for the live "Recently played" prepend (HomeScreen).
-  const homeNowPlayingTrack = homeNpTrack
+  const homeNowPlayingTrackId = usePlayerStore(currentTrack)?.id ?? null;
+  // Minimal shape for the live "Recently played" prepend. Sourced from the LAST
+  // LOGGED play (crossed the ~20s "counts as a play" threshold), NOT the
+  // currently-playing track — so the optimistic shelf only shows songs the
+  // server will actually keep. A sub-20s play prepended at track-start would
+  // vanish on the next feed fetch (it was never recorded in play_events).
+  const homeLogged = usePlayerStore((s) => s.lastLoggedTrack);
+  const homeNowPlayingTrack = homeLogged
     ? {
-        id: homeNpTrack.id,
-        title: homeNpTrack.title,
-        artists: homeNpTrack.artists,
-        album: homeNpTrack.album,
-        album_art_url: homeNpTrack.album_art_url,
-        duration_ms: homeNpTrack.duration_ms,
-        has_audio: homeNpTrack.has_audio,
+        id: homeLogged.id,
+        title: homeLogged.title,
+        artists: homeLogged.artists,
+        album: homeLogged.album,
+        album_art_url: homeLogged.album_art_url,
+        duration_ms: homeLogged.duration_ms,
+        has_audio: homeLogged.has_audio,
       }
     : null;
   const homeTogglePlay = usePlayerStore((s) => s.playPause);

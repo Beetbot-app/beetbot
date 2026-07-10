@@ -35,11 +35,15 @@ export const EQ_PRESETS: Record<Exclude<EqPreset, 'custom'>, number[]> = {
 };
 
 export type Loudness = 'loud' | 'normal' | 'quiet';
-/** Loudness targets — kept for the native engine's per-track gain. */
-export const LOUDNESS_GAIN: Record<Loudness, number> = {
-  loud: 0.95,
-  normal: 0.8,
-  quiet: 0.6,
+/**
+ * Integrated-loudness targets in LUFS for the native engine's Normalize. The
+ * per-track gain moves each measured track toward its target (louder = closer to
+ * 0), ceilinged by the track's true peak so it never clips.
+ */
+export const LOUDNESS_TARGET_LUFS: Record<Loudness, number> = {
+  loud: -11,
+  normal: -14,
+  quiet: -19,
 };
 
 interface AudioFxState {

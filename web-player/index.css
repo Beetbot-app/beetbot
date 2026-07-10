@@ -106,20 +106,20 @@ button {
 }
 
 /* The one place the beet crimson touches the UI outside the brand mark: a
-   single ~1s glow when "Play My Beetbot" ignites a station. The color is
-   reserved — it never appears in resting chrome. Auto-neutralized by the
-   reduce-motion block above. */
+   single ~1s glow when "My station" ignites. The color is the brand beet
+   (#E5175B ring, #FF3D7F pop halo) — reserved, it never appears in resting
+   chrome. Auto-neutralized by the reduce-motion block above. */
 @keyframes beet-ignite {
   0% {
     box-shadow:
-      0 0 0 1px rgba(211, 79, 110, 0.9),
-      0 0 30px 3px rgba(211, 79, 110, 0.6);
+      0 0 0 1px rgba(229, 23, 91, 0.95),
+      0 0 34px 4px rgba(255, 61, 127, 0.55);
     opacity: 1;
   }
   100% {
     box-shadow:
-      0 0 0 1px rgba(211, 79, 110, 0),
-      0 0 30px 3px rgba(211, 79, 110, 0);
+      0 0 0 1px rgba(229, 23, 91, 0),
+      0 0 34px 4px rgba(255, 61, 127, 0);
     opacity: 0;
   }
 }

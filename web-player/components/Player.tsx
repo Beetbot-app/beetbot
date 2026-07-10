@@ -480,6 +480,9 @@ export function Player({ token, profileId, bottomInset = true, flushTop = false 
     } else if (currentTime >= 20 && playLoggedRef.current !== track.id) {
       playLoggedRef.current = track.id;
       void logPlay(token, track.id, profileId);
+      // Same threshold the server uses to record a play: surface it to Home so
+      // the live "Recently played" prepend only shows tracks the feed will keep.
+      usePlayerStore.getState().markPlayLogged(track);
     }
   }, [currentTime, track?.id, token, profileId]);
 

@@ -1362,6 +1362,9 @@ export interface HomeShelf {
    *  (the mixes); 'spotlight' → render as the mid-feed full-width band. Absent on
    *  older bundled servers → the client just renders a normal row. */
   display?: 'rail' | 'spotlight';
+  /** Refresh-cadence caption for a rail tile, e.g. "New every Monday". Absent →
+   *  the client's default ("New every day"). */
+  cadence?: string;
 }
 export interface HomeFeed {
   shelves: HomeShelf[];
@@ -1399,7 +1402,7 @@ export function getHome(
   return jsonGet<HomeFeed>(qs ? `/api/home?${qs}` : '/api/home', token);
 }
 
-/** "Play My Beetbot" — a one-tap personal station (a fusion mix over your top
+/** "My station" — a one-tap personal station (a fusion mix over your top
  *  artists). Returns a seed batch; the player's autoplay keeps it going. */
 export function getStation(
   token: string,
