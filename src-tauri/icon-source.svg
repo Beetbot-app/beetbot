@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="tile" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#101a1e" />
+      <stop offset="100%" stop-color="#070b0d" />
+    </linearGradient>
+    <linearGradient id="g1" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#46b3ca"/><stop offset="100%" stop-color="#2199b5"/></linearGradient>
+    <linearGradient id="g2" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#5ec3d7"/><stop offset="100%" stop-color="#3faec4"/></linearGradient>
+    <linearGradient id="g3" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#72d3e5"/><stop offset="100%" stop-color="#4dbcd2"/></linearGradient>
+    <linearGradient id="g4" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#55c1d7"/><stop offset="100%" stop-color="#229cb7"/></linearGradient>
+    <linearGradient id="g5" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#2fa9c3"/><stop offset="100%" stop-color="#198ba5"/></linearGradient>
+    <linearGradient id="g6" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#7be0f2"/><stop offset="100%" stop-color="#4caec3"/></linearGradient>
+    <linearGradient id="g7" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#4caec3"/><stop offset="100%" stop-color="#298ca2"/></linearGradient>
+    <linearGradient id="g8" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#5ed5ed"/><stop offset="100%" stop-color="#2a9cb5"/></linearGradient>
+    <linearGradient id="g9" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#2199b5"/><stop offset="100%" stop-color="#3daec5"/></linearGradient>
+    <linearGradient id="g10" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#14829c"/><stop offset="100%" stop-color="#2a93ab"/></linearGradient>
+    <linearGradient id="g11" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#1a91ac"/><stop offset="100%" stop-color="#0b6e85"/></linearGradient>
+    <linearGradient id="g12" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#0c778f"/><stop offset="100%" stop-color="#045668"/></linearGradient>
+    <linearGradient id="g13" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#02657a"/><stop offset="100%" stop-color="#004353"/></linearGradient>
+    <linearGradient id="g14" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#0a7f99"/><stop offset="100%" stop-color="#055e73"/></linearGradient>
+    <linearGradient id="g15" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#1ca2be"/><stop offset="100%" stop-color="#0f778f"/></linearGradient>
+  </defs>
+
+  <!-- dark squircle tile, ~10% transparent margin (Apple icon grid) -->
+  <rect x="102" y="102" width="820" height="820" rx="184" ry="184" fill="url(#tile)" />
+
+  <!-- the M, centered in the tile with ~22% internal padding -->
+  <g transform="translate(245.9, 250.3) scale(0.887)">
+    <polygon points="60,330 60,560 174,500" fill="url(#g1)" />
+    <polygon points="60,330 174,500 174,250" fill="url(#g2)" />
+    <polygon points="60,120 60,330 174,250" fill="url(#g3)" />
+    <polygon points="60,120 174,250 190,30" fill="url(#g4)" />
+    <polygon points="174,250 190,30 310,270" fill="url(#g5)" />
+    <polygon points="60,120 190,30 174,250" fill="url(#g6)" opacity="0.4" />
+    <polygon points="174,250 310,270 266,430" fill="url(#g7)" />
+    <polygon points="310,270 354,430 266,430" fill="url(#g8)" />
+    <polygon points="310,270 440,250 354,430" fill="url(#g9)" />
+    <polygon points="310,270 424,30 440,250" fill="url(#g10)" />
+    <polygon points="424,30 540,120 440,250" fill="url(#g11)" />
+    <polygon points="540,120 540,330 440,250" fill="url(#g12)" />
+    <polygon points="440,250 540,330 440,500" fill="url(#g13)" />
+    <polygon points="540,330 540,560 440,500" fill="url(#g14)" />
+    <polygon points="424,30 540,120 540,330" fill="url(#g15)" opacity="0.15" />
+  </g>
+</svg>

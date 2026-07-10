@@ -1,0 +1,37 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# Claude
+.claude/
+
+# Node / build outputs (for upcoming work)
+node_modules/
+dist/
+build/
+.next/
+.turbo/
+*.tsbuildinfo
+
+# Rust / Tauri
+target/
+src-tauri/target/
+# Stray local SQLite databases (the real app DB lives in the OS app-data dir;
+# any *.db/.sqlite next to the source is a dev/test artifact).
+*.db
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+
+# Env / secrets
+.env
+.env.local
+.env.*.local
+# Build-time injected secrets (e.g. the app-wide Last.fm API key).
+src-tauri/.cargo/config.toml

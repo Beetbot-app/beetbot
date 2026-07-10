@@ -1,0 +1,125 @@
+@import 'tailwindcss';
+
+/* This build's Vite root is `web-player/`, so Tailwind v4's automatic
+   content detection only scans files under web-player/. The catalog UI
+   (artist/album pages, hero, etc.) lives in ../shared and is compiled into
+   this bundle too — without this directive, classes used *only* there
+   (h-36, h-52, blur-2xl, scale-125, the hero gradients…) are never
+   generated, so the artist/album hero square collapses and its image
+   renders at full natural size. Register the shared dir explicitly. */
+@source '../shared';
+
+/* SF system stack (Apple-style) as the default UI typeface, matching desktop.
+   `--color-accent` is the now-playing accent: white by default, overridden at
+   runtime on <html> with the current artwork's dominant color (useAccentColor),
+   so `text-accent` etc. follow the playing track. */
+@theme {
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text',
+    ui-sans-serif, system-ui, 'Segoe UI', sans-serif;
+  --color-accent: rgb(255 255 255);
+  /* One house easing on every transition — a fast-out / soft-settle curve.
+     Setting the default timing function makes every bare `transition`
+     ride it; `ease-house` is also available as an explicit utility. */
+  --ease-house: cubic-bezier(0.3, 0, 0, 1);
+  --default-transition-timing-function: var(--ease-house);
+}
+
+:root {
+  color-scheme: dark;
+  /* One curve, three speeds. Control = taps/hovers, surface = panels/sheets,
+     ambient = artwork washes. Use as duration-[var(--dur-surface)] etc. */
+  --dur-control: 150ms;
+  --dur-surface: 200ms;
+  --dur-ambient: 500ms;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: var(--font-sans);
+  /* Full-bleed: let the background reach the screen edge so the player
+     bar visually merges with the home indicator and the header sits
+     under the notch. The actual safe-area padding is applied per-region
+     inside the React tree (LibraryScreen pads its top, Player pads its
+     bottom) so each bar's background extends to the edge but its
+     interactive content stays inside the safe area. */
+}
+
+/* Disable text selection on UI chrome; tracks/titles still selectable. */
+button {
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Prevent iOS double-tap zoom on rapid interactions. */
+* {
+  touch-action: manipulation;
+}
+
+/* Keyboard focus — one visible ring on every interactive element (matches the
+   desktop app). Only shows for keyboard users (:focus-visible); touch users
+   never see it. `!important` overrides the per-component `focus:outline-none`.
+   The outline follows each element's own border-radius. */
+:where(
+  button, a[href], input, select, textarea, summary,
+  [role='button'], [role='link'], [role='slider'], [role='switch'],
+  [role='tab'], [role='menuitem'], [tabindex]:not([tabindex='-1'])
+):focus-visible {
+  outline: 2px solid rgb(255 255 255 / 0.7) !important;
+  outline-offset: 2px !important;
+}
+
+/* C3: a slow "breathing" zoom for the Now Playing artwork while playing. Very
+   low amplitude so it reads as alive, not gimmicky. Neutralized under Reduce
+   Motion by the reset below (which zeroes animation-duration). */
+@keyframes beetbot-breathe {
+  0%,
+  100% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(1.025);
+  }
+}
+
+/* Honor the OS "Reduce Motion" setting app-wide: neutralize CSS animations and
+   transitions (the search preview-ring sweep, page-enter, Tailwind transitions).
+   `!important` overrides even inline `animation`/`transition` styles. The Now
+   Playing slide/swipe is additionally gated in JS (usePrefersReducedMotion). */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* The one place the beet crimson touches the UI outside the brand mark: a
+   single ~1s glow when "Play My Beetbot" ignites a station. The color is
+   reserved — it never appears in resting chrome. Auto-neutralized by the
+   reduce-motion block above. */
+@keyframes beet-ignite {
+  0% {
+    box-shadow:
+      0 0 0 1px rgba(211, 79, 110, 0.9),
+      0 0 30px 3px rgba(211, 79, 110, 0.6);
+    opacity: 1;
+  }
+  100% {
+    box-shadow:
+      0 0 0 1px rgba(211, 79, 110, 0),
+      0 0 30px 3px rgba(211, 79, 110, 0);
+    opacity: 0;
+  }
+}

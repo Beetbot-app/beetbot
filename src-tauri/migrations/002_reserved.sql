@@ -1,0 +1,5 @@
+-- (reserved)
+--
+-- This migration version is intentionally a no-op. It previously created a
+-- table that is no longer part of the schema; the version number is kept so
+-- the applied-migration history stays contiguous on existing databases.

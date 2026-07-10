@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- macOS shows this when Beetbot first reads ~/Downloads to auto-detect a
+       playlist export downloaded from Exportify. Without it the read is
+       silently denied by TCC and the auto-import can't find the file. -->
+  <key>NSDownloadsFolderUsageDescription</key>
+  <string>Beetbot watches your Downloads folder to automatically import the playlist export you download from Exportify.</string>
+</dict>
+</plist>

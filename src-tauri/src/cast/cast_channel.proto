@@ -1,0 +1,46 @@
+// Minimal Cast V2 channel message definition.
+//
+// Lifted from Google's open-source cast_channel.proto (Chromium tree;
+// public domain). We don't need the AuthChallenge / AuthResponse
+// types because Default Media Receiver doesn't require sender auth —
+// only the plain CastMessage envelope.
+//
+// Protocol notes:
+//   - Wire format is a 4-byte big-endian length prefix followed by
+//     this message serialised as protobuf. The length-prefixing is
+//     implemented in Rust (src/cast/protocol.rs); prost handles only
+//     the protobuf encode/decode of CastMessage itself.
+//   - All control traffic is JSON inside `payload_utf8`. We treat
+//     `payload_binary` as unused for sender-side code.
+
+syntax = "proto2";
+
+package extensions.api.cast_channel;
+
+message CastMessage {
+  enum ProtocolVersion {
+    CASTV2_1_0 = 0;
+  }
+
+  enum PayloadType {
+    STRING = 0;
+    BINARY = 1;
+  }
+
+  required ProtocolVersion protocol_version = 1;
+  // Identifies the source of the message; sender chooses, receiver
+  // echoes. We use "sender-0" throughout.
+  required string source_id = 2;
+  // For control messages this is "receiver-0" (the device-level
+  // session); after LAUNCH it becomes the per-app transport_id we
+  // discovered from the RECEIVER_STATUS response.
+  required string destination_id = 3;
+  // e.g. "urn:x-cast:com.google.cast.tp.connection",
+  //      "urn:x-cast:com.google.cast.tp.heartbeat",
+  //      "urn:x-cast:com.google.cast.receiver",
+  //      "urn:x-cast:com.google.cast.media"
+  required string namespace = 4;
+  required PayloadType payload_type = 5;
+  optional string payload_utf8 = 6;
+  optional bytes payload_binary = 7;
+}

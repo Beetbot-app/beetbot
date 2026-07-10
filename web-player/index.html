@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no"
+    />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Beetbot" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="theme-color" content="#0a0a0a" />
+    <title>Beetbot</title>
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <!--
+      iOS Safari does NOT reliably honor SVG apple-touch-icon -- it falls
+      back to a generic colored placeholder when added to the home
+      screen. Ship a 180x180 PNG explicitly. The SVG icon link stays for
+      desktop browsers (favicon).
+    -->
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+  </head>
+  <body class="bg-neutral-950 text-neutral-100 antialiased">
+    <div id="root"></div>
+    <script type="module" src="./main.tsx"></script>
+  </body>
+</html>

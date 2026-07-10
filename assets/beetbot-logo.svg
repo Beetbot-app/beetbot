@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 128" width="120" height="128">
+  <title>Beetbot</title>
+  <defs>
+    <linearGradient id="beet" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FF3D7F"/>
+      <stop offset="1" stop-color="#A1123F"/>
+    </linearGradient>
+  </defs>
+  <!-- greens -->
+  <path d="M60 50 C50 24 32 26 35 42 Q51 41 58 52 Z" fill="#37C871"/>
+  <path d="M60 50 C70 22 90 26 85 44 Q69 41 60 52 Z" fill="#2AAE5E"/>
+  <path d="M60 46 L60 56" stroke="#2AAE5E" stroke-width="5" stroke-linecap="round"/>
+  <!-- root -->
+  <path d="M60 54 C85 54 92 80 77 99 C69 109 62 118 60 120 C58 118 51 109 43 99 C28 80 35 54 60 54 Z" fill="url(#beet)"/>
+  <!-- shine -->
+  <ellipse cx="49" cy="72" rx="7" ry="11" fill="#FF7DA8" opacity="0.4"/>
+</svg>
