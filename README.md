@@ -24,11 +24,33 @@ your Wi‑Fi. Cast it to AirPlay or Chromecast. Reach it from the road when you 
 
 ### [⬇ Get the latest release →](https://github.com/Beetbot-app/beetbot/releases/latest)
 
-Download the `.zip`, unzip it, and drag **Beetbot** into your **Applications** folder.
+Download `Beetbot-macos-<version>.zip`, unzip it, and drag **Beetbot** into your
+**Applications** folder — then open it once using the steps below.
 
-> **First launch:** Beetbot isn't notarized yet, so macOS will double‑check with you the
-> first time. **Right‑click Beetbot → Open → Open.** After that it's a normal double‑click.
-> *(macOS 12+, Apple Silicon.)*
+## Opening Beetbot the first time (macOS)
+
+The first time you open Beetbot, macOS asks you to confirm it — a quick, one-time step.
+After that, Beetbot opens with a normal double-click.
+
+**macOS 15 (Sequoia) or newer**
+
+1. Double-click **Beetbot**. macOS shows a prompt that it can't be opened yet — click **Done**.
+2. Open **System Settings → Privacy & Security**.
+3. Scroll down to **Security** and click **Open Anyway** next to Beetbot.
+4. Confirm with Touch ID or your password, then click **Open**.
+
+**macOS 12–14 (Monterey / Ventura / Sonoma)**
+
+- **Control-click (right-click) Beetbot → Open**, then click **Open** in the dialog.
+
+**Prefer Terminal?** One command does the same thing — then just double-click Beetbot:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/Beetbot.app
+```
+
+*Requires macOS 12+ on Apple Silicon.*
+
 
 ## What it does
 
