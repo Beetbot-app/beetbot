@@ -16,7 +16,7 @@ use souvlaki::{
     MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, MediaPosition,
     PlatformConfig,
 };
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter};
 
 pub struct MediaState(pub Arc<Mutex<MediaControls>>);
 

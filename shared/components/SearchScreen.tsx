@@ -10,12 +10,8 @@ import { createPortal } from 'react-dom';
 import {
   cn,
   POPOVER,
-  SCRIM,
-  BOTTOM_SHEET,
   navPill,
   INPUT,
-  BTN_PRIMARY,
-  BTN_SECONDARY,
   CALLOUT_WARN,
   CALLOUT_ERROR,
   EYEBROW,
@@ -24,35 +20,36 @@ import {
 import { ContextMenu, MenuGlyphs, type MenuItem, type MenuState } from './ContextMenu';
 import { CardPlayButton, Marquee } from './Marquee';
 import { HeroWash } from './HeroWash';
-import { CollageCover } from './CollageCover';
-import { SwipeRow } from './SwipeRow';
 import { audioStarted, registerAudioPauser } from '../audioCoordinator';
 import {
   addRecentAlbum,
   addRecentArtist,
+  addRecentPlaylist,
   addRecentQuery,
   addRecentTrack,
   clearRecentSearches,
+  removeRecentItem,
   coverSrc,
-  createPlaylist,
   getAlbumTracks,
   getArtistAlbums,
+  getArtistAppearsOn,
   getArtistBio,
   getArtistRelated,
   getArtistTopTracks,
   canPlayNow,
-  deletePlaylist,
   friendlyError,
   getCatalogPlaylist,
+  importAlbum,
+  deletePlaylist,
   getRecentItems,
   getStats,
-  importAlbum,
   importPlaylist,
   isHubReachable,
   isPlayable,
+  listLibrarySongs,
   listPlaylists,
   onHubReachability,
-  patchTrackPlaylists,
+  playlistArtUrl,
   searchCatalog,
   type ArtistBio,
   type CatalogOpenRequest,
@@ -64,11 +61,26 @@ import {
   type SearchArtistResult,
   type SearchResults,
   type SearchTrackResult,
+  type StreamTrack,
 } from '../api';
 import { useHubReachable } from '../useHubReachable';
+import { useLibraryChangeTick } from '../useLibraryChange';
 import { formatDuration } from '../format';
+import { isPhantomArtist } from '../artistName';
 import { CondensedHeaderBar, useCondensedHeader } from './StickyHeader';
+import { useScrollMemory } from '../useScrollMemory';
 import { EqualizerBars } from './EqualizerBars';
+import { useActiveProfile, SettingsAvatar, STICKY_FROST } from './PhoneTopBar';
+import { ModalShell } from './modals/ModalShell';
+import { AddToPlaylistModal } from './modals/AddToPlaylistModal';
+import { AlbumDetailModal } from './modals/AlbumDetailModal';
+import { PreviewRing, ExplicitBadge, AlbumDownloadedBadge, ShelfRow, AlbumGrid, playAlbumCard, albumTypeLabel, formatReleaseDate, PREVIEW_RING_KEYFRAMES, type SidebarPinController } from './searchPrimitives';
+import { notifyLibraryChanged } from '../libraryChanged';
+// Re-export the extracted primitives + modal so existing external importers
+// (BrowseScreen, HomeScreen, Playlist, TrackRow, Search, web-player, detailControllers)
+// keep importing them from this module unchanged.
+export { AlbumDetailModal } from './modals/AlbumDetailModal';
+export { PreviewRing, AlbumGrid, ShelfRow, playAlbumCard, PREVIEW_RING_KEYFRAMES, type SidebarPinController } from './searchPrimitives';
 
 /**
  * A restorable snapshot of the search overlay's "current page": the committed
@@ -80,6 +92,16 @@ import { EqualizerBars } from './EqualizerBars';
  *  a section). Apple-Music-style: a full page listing every item in that
  *  section, reached from the artist page and its own Back/Forward stop. */
 export type ShowAllSection = 'albums' | 'singles' | 'related' | 'songs';
+
+/** Data the artist page already loaded, handed to the show-all page on drill-in
+ *  so it renders instantly with no fetch/skeleton flash — it seeds from this and
+ *  skips the request. `albums` is the FULL discography (the show-all filters it
+ *  into the albums vs singles view itself). Absent fields fall back to a fetch. */
+export interface ShowAllInitial {
+  albums?: SearchAlbumResult[];
+  topTracks?: SearchTrackResult[];
+  related?: SearchArtistResult[];
+}
 
 export interface OverlaySnapshot {
   query: string;
@@ -127,6 +149,14 @@ interface Props {
     index?: number,
   ) => void;
   /**
+   * Empty-state body (no query yet). When provided it replaces the built-in
+   * static genre tiles — the phone passes the real <BrowseScreen> genre grid
+   * here so opening Search lands on "Browse all", Spotify-style. Threaded as a
+   * slot (rather than importing BrowseScreen) to avoid a circular import, since
+   * BrowseScreen imports from this file.
+   */
+  browseSlot?: ReactNode;
+  /**
    * Desktop only: render artist/album drill-ins as full inline pages
    * (with a Back button) in place of the search UI, instead of as modal
    * overlays. The phone leaves this off and keeps the bottom-sheet modals.
@@ -156,13 +186,11 @@ interface Props {
    */
   activeProfileId?: number | null;
   /**
-   * Called when the user backs out of an artist/album page that was opened via
-   * `openRequest` (i.e. from elsewhere in the app, like Home or the player bar)
-   * rather than from a search the user typed here. Lets the host return to the
-   * originating view instead of stranding the user on the bare Search screen.
-   * Desktop-only; the phone leaves it undefined (its modals just close).
+   * Phone-only: opens Settings from the account avatar in the Search header
+   * (same top-left spot as Home / Library). Omitted on desktop, which has its
+   * own top bar — so no avatar renders there.
    */
-  onExitDetail?: () => void;
+  onOpenSettings?: () => void;
   /**
    * Desktop "top bar" mode. When `barSlot` is a DOM node, the search bar +
    * dropdown render into it (a persistent top bar) via a portal instead of
@@ -195,12 +223,6 @@ interface Props {
    */
   onOverlayBack?: () => void;
   /**
-   * Reports whether the overlay is currently showing anything (a committed
-   * search, a detail page, or a pending open). Lets the host decide whether the
-   * Back arrow should unwind the overlay or pop its own view history.
-   */
-  onOverlayActiveChange?: (active: boolean) => void;
-  /**
    * Desktop-only: called when the user focuses the (idle) search input.
    * The host navigates the main view to Discover, Spotify/Apple-Music-style —
    * tapping into search surfaces browse categories until a query is typed.
@@ -214,9 +236,18 @@ interface Props {
    * even mid-search (the host's navigation clears the overlay via `restore`).
    */
   onOpenBrowse?: () => void;
+  /** Open one of the user's OWN library playlists (the "From your library"
+   *  search matches). Host navigates to the library playlist page. Omitted ⇒
+   *  library playlists aren't surfaced in results. */
+  onOpenLibraryPlaylist?: (id: number) => void;
+  /** Play one of the user's OWN library songs (a "From your library" match). */
+  onPlayLibrarySong?: (t: StreamTrack) => void;
   /** Desktop-only sidebar-pin controls, injected by the host. Omitted on the
    *  phone (no pinned sidebar) → the artist/album pages render no Pin button. */
   pin?: SidebarPinController;
+  /** Desktop-only save-to-library control for the artist page (Library ›
+   *  Artists). Omitted on the phone → no Save button. */
+  save?: SavedArtistController;
   /**
    * Desktop-only browse-album "⋯" menu handlers. When supplied (with
    * `pageMode`), each track row in an opened browse album gets a per-song
@@ -228,6 +259,10 @@ interface Props {
   onAlbumGoToArtist?: (name: string) => void;
   onAlbumAddToQueue?: (t: SearchTrackResult) => void;
   onAlbumSaveToLiked?: (t: SearchTrackResult) => void;
+  /** Desktop "Add audio file" — attach a file you own to a fileless track.
+   *  Undefined on the phone (no file dialog). Shown only for tracks with no
+   *  local file yet. */
+  onAddAudio?: (t: SearchTrackResult) => void;
   /** Open an album by name (clickable Album column on catalog-playlist rows). */
   onAlbumGoToAlbum?: (name: string, artist: string | null) => void;
   /**
@@ -248,13 +283,45 @@ interface Props {
   onTogglePlay?: () => void;
 }
 
-/** Desktop-only sidebar-pin controls. Kept primitive so this shared file needn't
- *  import the desktop pin store; the host maps these to its `usePinStore`. */
-export interface SidebarPinController {
-  isArtistPinned: (key: string) => boolean;
-  toggleArtist: (a: { key: string; name: string; art: string | null }) => void;
-  isAlbumPinned: (album: string, artist: string | null) => boolean;
-  toggleAlbum: (a: { album: string; artist: string | null; art: string | null }) => void;
+
+/** "Save to library" toggle for an artist detail-page header — populates the
+ *  Library › Artists tab (distinct from pinning to the sidebar). */
+export interface SavedArtistController {
+  isSaved: (name: string) => boolean;
+  toggle: (a: { key: string; name: string; art: string | null }) => void;
+}
+
+/** Spotify-style "Save"/"Saved" pill for an artist header. */
+function SaveArtistButton({ saved, onClick }: { saved: boolean; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={saved ? 'Remove from your library' : 'Save to your library'}
+      aria-label={saved ? 'Remove from your library' : 'Save to your library'}
+      aria-pressed={saved}
+      className={`flex items-center gap-1.5 rounded-full border px-3.5 py-1.5 text-sm font-medium transition ${
+        saved
+          ? 'border-transparent bg-accent/15 text-accent'
+          : 'border-neutral-600 text-neutral-200 hover:border-neutral-300 hover:text-white'
+      }`}
+    >
+      <svg
+        viewBox="0 0 24 24"
+        width="16"
+        height="16"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2.2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        aria-hidden
+      >
+        {saved ? <path d="M20 6 9 17l-5-5" /> : <path d="M12 5v14M5 12h14" />}
+      </svg>
+      {saved ? 'Saved' : 'Save'}
+    </button>
+  );
 }
 
 /** "Pin to sidebar" toggle for a detail-page header (artist / album). */
@@ -312,31 +379,34 @@ function MaybePortal({
  * drill into a track list for that album so individual tracks (or "Add all")
  * can be appended.
  *
- * The add operation is local-only on the host -- additions get a
- * `locally_added=1` flag so they survive future Spotify syncs.
+ * The add operation is local-only on the host.
  */
 export function SearchScreen({
   token,
   onPlayTrack,
+  browseSlot,
   pageMode,
   desktop,
   openRequest,
   onRequestHandled,
   resetSignal,
   activeProfileId,
-  onExitDetail,
+  onOpenSettings,
   barSlot,
   overlayMode,
   restore,
-  onOverlayActiveChange,
   onOverlayPush,
   onOverlayBack,
   onSearchFocus,
   onOpenBrowse,
+  onOpenLibraryPlaylist,
+  onPlayLibrarySong,
   pin,
+  save,
   onAlbumGoToArtist,
   onAlbumAddToQueue,
   onAlbumSaveToLiked,
+  onAddAudio,
   onAlbumGoToAlbum,
   onShowTrackSheet,
   isTrackCurrent,
@@ -346,6 +416,9 @@ export function SearchScreen({
   // Re-render this screen (and its inline handlers) when the hub drops/returns,
   // so canPlayNow gating in replayRecentTrack / applySuggestion stays live.
   useHubReachable();
+  // Phone header avatar (→ Settings). Resolved from the active profile id, same
+  // as Home / Library. Unused on desktop (no avatar renders there).
+  const profile = useActiveProfile(token, activeProfileId ?? null);
   const [query, setQuery] = useState('');
   const [debounced, setDebounced] = useState('');
   const [tab, setTab] = useState<Tab>('all');
@@ -379,6 +452,12 @@ export function SearchScreen({
   // Artists") shown in full as its own grid page — reached via the section's ›
   // chevron, its own Back/Forward stop. Only meaningful while `openArtist` set.
   const [openShowAll, setOpenShowAll] = useState<ShowAllSection | null>(null);
+  // Data the artist page had already loaded when its ›-chevron was clicked, so
+  // the show-all seeds instantly instead of refetching. Cleared alongside
+  // openShowAll (a fresh open with no seed just fetches).
+  const [showAllInitial, setShowAllInitial] = useState<ShowAllInitial | null>(
+    null,
+  );
   // Phone: re-tapping the Search tab (resetSignal bump) pops any open drill-in
   // back to the results. Guarded so the mount pass is a no-op.
   const firstReset = useRef(true);
@@ -396,6 +475,14 @@ export function SearchScreen({
   // entities (tracks/artists/albums) the user actually opened or played.
   // Shown as rich rows when the search bar is empty. Backed by localStorage.
   const [recents, setRecents] = useState<RecentItem[]>(() => getRecentItems());
+  // Re-read when the profile changes. `getRecentItems` is profile-scoped, but a
+  // mount-only initializer never runs again — and the desktop switches between
+  // no-PIN profiles WITHOUT unmounting (TopBar's `setActiveProfile`), leaving
+  // this component alive with the previous person's searches in state. The next
+  // person opening the search box would see them.
+  useEffect(() => {
+    setRecents(getRecentItems());
+  }, [activeProfileId]);
   // Tracks whether the desktop hub answered. When it's unreachable, catalog
   // reads transparently fall back to hitting Deezer directly (search/preview
   // still work); we show a banner and steer the user away from save actions
@@ -552,6 +639,35 @@ export function SearchScreen({
     setActiveSuggestion(-1);
     searchInputRef.current?.blur();
   }, []);
+
+  // Desktop: clicking the top bar's empty area should dismiss the search —
+  // otherwise a header click just drags the window and the search stays "stuck".
+  // That empty area is a Tauri `data-tauri-drag-region`, which intercepts
+  // MOUSEDOWN natively for window-dragging (so a JS mousedown listener never
+  // fires). The CLICK event is untouched, though, so the TopBar fires an
+  // `onClick` there that dispatches this event; we dismiss state-aware: a
+  // committed results/detail page steps back out (like the ✕); an open recents
+  // dropdown just blurs shut.
+  useEffect(() => {
+    if (!overlayMode) return;
+    const dismiss = () => {
+      if (committedQuery.trim() || openArtist || openAlbum || openPlaylist) {
+        onOverlayBack?.();
+      } else if (inputFocused) {
+        searchInputRef.current?.blur();
+      }
+    };
+    window.addEventListener('beetbot:dismiss-search', dismiss);
+    return () => window.removeEventListener('beetbot:dismiss-search', dismiss);
+  }, [
+    overlayMode,
+    committedQuery,
+    openArtist,
+    openAlbum,
+    openPlaylist,
+    inputFocused,
+    onOverlayBack,
+  ]);
   const openArtistPage = useCallback(
     (a: SearchArtistResult) => {
       setRecents(addRecentArtist(a));
@@ -590,9 +706,35 @@ export function SearchScreen({
       setOpenArtist(null);
       setOpenAlbum(null);
       setOpenPlaylist(p);
+      // Remember it as a recent, like opening a track/artist/album does — so a
+      // tap re-opens the exact playlist from the recents list.
+      setRecents(addRecentPlaylist(p));
       closeDropdown();
     },
     [stopPreview, closeDropdown],
+  );
+
+  // The trailing + on album / playlist result rows: fetch the item's tracks and
+  // import it into the library (same as the detail page's add). importAlbum
+  // lands it in the Albums tab; importPlaylist as a plain playlist. A
+  // library-changed event refreshes the sidebar / Library list.
+  const addAlbumToLibrary = useCallback(
+    async (album: SearchAlbumResult) => {
+      const tracks = await getAlbumTracks(album.source_id, token);
+      await importAlbum(album.name, tracks, token, album.artists[0] ?? null, activeProfileId);
+      if (typeof window !== 'undefined')
+        notifyLibraryChanged();
+    },
+    [token, activeProfileId],
+  );
+  const addPlaylistToLibrary = useCallback(
+    async (p: CatalogPlaylistSummary) => {
+      const detail = await getCatalogPlaylist(p.source_id, token);
+      await importPlaylist(p.title, detail.tracks, token, activeProfileId);
+      if (typeof window !== 'undefined')
+        notifyLibraryChanged();
+    },
+    [token, activeProfileId],
   );
   // Per-song "⋯" menu for an opened browse album's rows (desktop only). Mirrors
   // the library album menu, but the row is a *catalog* result that may have no
@@ -628,9 +770,16 @@ export function SearchScreen({
           disabled: !artist,
           onClick: () => onAlbumGoToArtist(artist),
         });
+      // Attach your own file — only when this track has no local file yet.
+      if (onAddAudio && !t.has_audio)
+        items.push({
+          label: 'Add audio file',
+          icon: MenuGlyphs.plus,
+          onClick: () => onAddAudio(t),
+        });
       setMenu({ x, y, items });
     },
-    [onAlbumSaveToLiked, onAlbumAddToQueue, onAlbumGoToArtist],
+    [onAlbumSaveToLiked, onAlbumAddToQueue, onAlbumGoToArtist, onAddAudio],
   );
   // Re-engage a recent track row: a downloaded file (or any track while the hub
   // is reachable) plays in full. A non-downloaded track when the hub is
@@ -743,6 +892,11 @@ export function SearchScreen({
     return () => window.clearTimeout(id);
   }, [query]);
 
+  // Re-fetch results when the library changes elsewhere so the Songs rows' "in a
+  // playlist" ✓ reflects a track just added/removed via the picker. No spinner
+  // flash: `loading` only shows the spinner when there are no results yet (see
+  // the results page below), so the current rows stay put and swap in fresh marks.
+  const libTick = useLibraryChangeTick();
   useEffect(() => {
     if (!debounced) {
       setResults(null);
@@ -760,12 +914,15 @@ export function SearchScreen({
         if (cancelled) return;
         // Clean the catalog's artist results before anything consumes them
         // (dropdown, Artists tab, federated rows): collapse duplicate profiles,
-        // drop low-quality lookalike/tribute profiles, then drop artists that
-        // only matched the query by typo distance.
+        // drop derivative "junk twins" (Tribute/Karaoke/Covers acts named
+        // around a real artist), drop low-quality lookalike profiles, then
+        // drop artists that only matched the query by typo distance.
         const cleaned = {
           ...r,
           artists: dropWeakArtistMatches(
-            dropLookalikeArtists(dedupeArtists(r.artists)),
+            dropCombinedCreditArtists(
+              dropLookalikeArtists(dropDerivativeArtists(dedupeArtists(r.artists))),
+            ),
             normalizeForMatch(debounced),
           ),
         };
@@ -782,7 +939,7 @@ export function SearchScreen({
     return () => {
       cancelled = true;
     };
-  }, [debounced, token]);
+  }, [debounced, token, libTick]);
 
   // Auto-flip to whichever tab has results when the user toggles the
   // currently-empty side. Saves a tap when search yields, say, only
@@ -826,10 +983,19 @@ export function SearchScreen({
         if (openRequest.kind === 'artist') {
           const r = await searchCatalog(openRequest.name, token, 'artist', 10);
           if (cancelled) return;
+          // Collapse Deezer's duplicate/impersonator profiles to the
+          // most-followed one BEFORE picking — the raw order can put a junk
+          // twin first (a 37-fan "Coldplay" above the real 18M-fan one), and
+          // taking it opened a ghost page: placeholder image, a handful of
+          // compilation credits as "Top Songs". Same cleanup the results
+          // pipeline runs; only the dedupe though — the lookalike/weak-match
+          // filters could drop a genuinely tiny exact-name artist entirely
+          // and misroute the click to a bigger wrong-name act.
+          const artists = dedupeArtists(r.artists);
           const want = openRequest.name.trim().toLowerCase();
           const hit =
-            r.artists.find((a) => a.name.trim().toLowerCase() === want) ??
-            r.artists[0];
+            artists.find((a) => a.name.trim().toLowerCase() === want) ??
+            artists[0];
           if (hit) {
             opened = true;
             setOpenShowAll(null);
@@ -910,6 +1076,7 @@ export function SearchScreen({
       setOpenAlbum(null);
       setOpenPlaylist(null);
       setOpenShowAll(null);
+      setShowAllInitial(null);
     } else {
       setQuery(snap.query);
       setDebounced(snap.query);
@@ -918,6 +1085,10 @@ export function SearchScreen({
       setOpenAlbum(snap.album);
       setOpenPlaylist(snap.playlist ?? null);
       setOpenShowAll(snap.showAll ?? null);
+      // A history-restored show-all has no fresh seed from a chevron click —
+      // clear any lingering one so it fetches (fast: server artist cache) for
+      // the correct artist rather than seeding stale rows.
+      setShowAllInitial(null);
       // Seed the results page from cache so a restored search shows instantly;
       // the fetch effect still revalidates in the background (no visible flash).
       const cached = resultsCache.current.get(snap.query);
@@ -972,8 +1143,17 @@ export function SearchScreen({
   // (no pageMode), and needs the same flash suppression.
   const navPending = !!openRequest && !showingPage;
 
-  // Whether the overlay surface is showing anything. Reported up so the host's
-  // Back arrow knows whether to unwind the overlay vs pop its view history.
+  // Phone (and any non-overlay host): opening an album/artist/playlist stacks a
+  // `fixed inset-0` modal (ModalShell, z-10) over the search surface — but the
+  // sticky search pill is z-20, so it paints *over* the modal, leaving the bar
+  // floating above the page you opened (looks broken). The fix is to step the
+  // bar aside while a detail is open. Desktop's overlay bar lives in the top bar
+  // and stays put (its page-takeover is handled by `showingPage`).
+  const detailOpen = !!openAlbum || !!openArtist || !!openPlaylist;
+  const hideBarForDetail = !overlayMode && detailOpen;
+
+  // Whether the overlay surface is showing anything — drives the overlayMode
+  // render branch and the idle-input focus handoff below.
   const overlayActive =
     !!committedQuery.trim() ||
     !!openArtist ||
@@ -981,9 +1161,6 @@ export function SearchScreen({
     !!openPlaylist ||
     navPending ||
     !!openRequest;
-  useEffect(() => {
-    onOverlayActiveChange?.(overlayActive);
-  }, [overlayActive, onOverlayActiveChange]);
 
   // The committed results page only renders once a search has been committed
   // *and* the loaded results belong to that exact query (so we never flash a
@@ -1064,6 +1241,62 @@ export function SearchScreen({
     };
   }, [topResult, pageResults, token]);
 
+  // "From your library" — surface the user's OWN playlists + songs in the
+  // results, matched client-side against the committed query. Fetched once
+  // (lazily, on the first committed search), only when the host wired the
+  // open/play handlers; reset when the active profile changes.
+  const [libPlaylists, setLibPlaylists] = useState<PlaylistRow[] | null>(null);
+  const [libSongs, setLibSongs] = useState<StreamTrack[] | null>(null);
+  useEffect(() => {
+    setLibPlaylists(null);
+    setLibSongs(null);
+  }, [activeProfileId]);
+  useEffect(() => {
+    if (!committedQuery.trim()) return;
+    let cancelled = false;
+    if (libPlaylists === null && onOpenLibraryPlaylist) {
+      listPlaylists(token, activeProfileId)
+        .then((rows) => !cancelled && setLibPlaylists(rows))
+        .catch(() => !cancelled && setLibPlaylists([]));
+    }
+    if (libSongs === null && onPlayLibrarySong) {
+      listLibrarySongs(token, activeProfileId)
+        .then((rows) => !cancelled && setLibSongs(rows))
+        .catch(() => !cancelled && setLibSongs([]));
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    committedQuery,
+    token,
+    activeProfileId,
+    libPlaylists,
+    libSongs,
+    onOpenLibraryPlaylist,
+    onPlayLibrarySong,
+  ]);
+  const libPlaylistMatches = useMemo(() => {
+    const nq = normalizeForMatch(committedQuery);
+    if (!nq || !libPlaylists) return [];
+    return libPlaylists
+      .filter((p) => normalizeForMatch(p.name).includes(nq))
+      .slice(0, 4);
+  }, [libPlaylists, committedQuery]);
+  const libSongMatches = useMemo(() => {
+    const nq = normalizeForMatch(committedQuery);
+    if (!nq || !libSongs) return [];
+    return libSongs
+      .filter(
+        (s) =>
+          normalizeForMatch(s.title).includes(nq) ||
+          s.artists.some((a) => normalizeForMatch(a).includes(nq)),
+      )
+      .slice(0, 4);
+  }, [libSongs, committedQuery]);
+  const hasLibMatches =
+    libPlaylistMatches.length > 0 || libSongMatches.length > 0;
+
   const relatedSection =
     relatedArtists.length > 0 ? (
       <div className="mt-6">
@@ -1078,19 +1311,47 @@ export function SearchScreen({
       </div>
     ) : null;
 
+  // Remember scroll position per drill page. Desktop overlay: ONE scroll
+  // container holds the results and every drill-in (artist/album/show-all),
+  // swapping content — so each page's position is tracked separately by its
+  // identity, and Back lands where you were instead of at the top. Null on the
+  // phone (its pages scroll in their own stacked containers) and while the
+  // overlay is idle.
+  const overlayScrollRef = useScrollMemory(
+    overlayMode && overlayActive
+      ? openAlbum
+        ? `album:${openAlbum.source_id}`
+        : openArtist && openShowAll
+          ? `artist:${openArtist.source_id}:${openShowAll}`
+          : openArtist
+            ? `artist:${openArtist.source_id}`
+            : openPlaylist
+              ? `catpl:${openPlaylist.source_id}`
+              : committedQuery.trim()
+                ? `search:${committedQuery.trim().toLowerCase()}`
+                : null
+      : null,
+  );
+
   // Overlay mode: the search surface floats over the main area and is shown
   // only when `overlayActive` (computed above). Idle ⇒ nothing, so the
   // underlying view shows through; the portaled top-bar input stays visible.
   return (
     <div
+      ref={overlayScrollRef}
       className={
         overlayMode
           ? overlayActive
-            ? showingPage
+            ? // z-40: must beat the z-30 CondensedHeaderBar of whatever page
+              // sits UNDER this overlay (e.g. a scrolled genre page's sticky
+              // title), which otherwise paints through the drill-in. Stays
+              // below the phone's sheets/scrims (z-50); the desktop top bar
+              // lives outside <main> entirely.
+              showingPage
               ? // A drill-in page (artist/album) has a full-bleed hero, so it
                 // owns its edges + top clearance — no container padding.
-                'absolute inset-0 z-20 overflow-y-auto bg-neutral-950 pb-6'
-              : 'absolute inset-0 z-20 overflow-y-auto bg-neutral-950 px-4 pt-6 pb-6'
+                'absolute inset-0 z-40 overflow-y-auto bg-neutral-950 pb-6'
+              : 'absolute inset-0 z-40 overflow-y-auto bg-neutral-950 px-4 pt-6 pb-6'
             : 'hidden'
           : 'px-4 pt-4 pb-6'
       }
@@ -1128,11 +1389,33 @@ export function SearchScreen({
           otherwise inline at the top of the page. Rendered ungated in overlay
           mode so it stays put even while a detail page is showing. */}
       <MaybePortal target={overlayMode ? barSlot ?? null : null}>
-        {!overlayMode && !showingPage && !navPending && (
-          <h1 className="text-xl font-bold tracking-tight mb-3 px-1">Search</h1>
+        {!overlayMode && !showingPage && !navPending && !hideBarForDetail && (
+          // Phone title row — the account avatar (→ Settings) in the same
+          // top-right spot as Home / Library, opposite the title. Scrolls away
+          // on scroll; the search pill below pins on its own (frosted).
+          <div className="mb-2 flex items-center justify-between gap-3">
+            <h1 className="text-xl font-bold tracking-tight">Search</h1>
+            {onOpenSettings && (
+              <SettingsAvatar
+                profile={profile}
+                token={token}
+                onOpenSettings={onOpenSettings}
+              />
+            )}
+          </div>
         )}
-        {(overlayMode || (!showingPage && !navPending)) && (
-      <div className="px-1 mb-3">
+        {(overlayMode || (!showingPage && !navPending && !hideBarForDetail)) && (
+      <div
+        className={
+          // Phone: the search pill pins to the top on scroll (frosted, breaks
+          // out to full width). Desktop (overlay) keeps its top-bar styling.
+          overlayMode
+            ? 'px-1 mb-3'
+            : // z-20 (not z-10): the genre tiles' labels are `relative z-10`,
+              // so the pinned pill must outrank them or they paint over it.
+              cn(STICKY_FROST, 'sticky top-0 z-20 -mx-4 px-4 pt-2 pb-3')
+        }
+      >
         <div className="relative">
           <input
             ref={searchInputRef}
@@ -1181,10 +1464,9 @@ export function SearchScreen({
               'w-full text-base [&::-webkit-search-cancel-button]:appearance-none',
               onOpenBrowse ? (query ? 'pr-20' : 'pr-12') : 'pr-10',
             )}
-            // Phone: search is a screen you open, so focus it. Desktop: the bar
-            // lives in the persistent top bar — don't grab focus (and pop the
-            // recents dropdown) every time the app launches.
-            autoFocus={!overlayMode}
+            // Don't auto-focus: opening the Search tab should show the Browse
+            // grid, not immediately pop the recent-searches dropdown (and the
+            // keyboard). Recents appear only once the user taps the bar.
           />
           {query ? (
             <button
@@ -1298,6 +1580,8 @@ export function SearchScreen({
                       onTrack={replayRecentTrack}
                       onArtist={openArtistPage}
                       onAlbum={openAlbumPage}
+                      onPlaylist={openPlaylistPage}
+                      onRemove={() => setRecents(removeRecentItem(it))}
                     />
                   </li>
                 ))}
@@ -1351,46 +1635,67 @@ export function SearchScreen({
         </div>
       )}
 
-      {!query.trim() && (
-        <div className="px-1 pt-2">
-          {/* Browse-by-genre tiles — a discovery launcher for the empty state,
-              Spotify's "Browse all" idea adapted to our catalog search.
-              (Recent searches live in the focus-state dropdown above the bar.) */}
-          <div className="px-1">
-            <h2 className={cn(EYEBROW, 'mb-2')}>
-              Browse
-            </h2>
-            <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-              {BROWSE_TILES.map((t) => (
-                <button
-                  key={t.label}
-                  type="button"
-                  onClick={() => commitSearch(t.query)}
-                  style={{ backgroundColor: t.color }}
-                  className="relative aspect-[2/1] rounded-lg overflow-hidden p-4 text-left text-base font-bold tracking-tight text-white shadow transition hover:brightness-110 active:scale-95"
-                >
-                  <span className="relative z-10 drop-shadow">{t.label}</span>
-                </button>
-              ))}
+      {!query.trim() &&
+        (browseSlot ? (
+          // Phone: the real "Browse all" genre grid (drills into genre pages),
+          // titled with the small "Browse" eyebrow. Recent searches still live
+          // in the focus-state dropdown above the bar.
+          <div className="pt-2">{browseSlot}</div>
+        ) : (
+          <div className="px-1 pt-2">
+            {/* Fallback (desktop): static browse-by-genre tiles that just fire a
+                text search — Spotify's "Browse all" idea adapted to catalog
+                search. (Recent searches live in the focus-state dropdown.) */}
+            <div className="px-1">
+              <h2 className={cn(EYEBROW, 'mb-2')}>Browse</h2>
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                {BROWSE_TILES.map((t) => (
+                  <button
+                    key={t.label}
+                    type="button"
+                    onClick={() => commitSearch(t.query)}
+                    style={{ backgroundColor: t.color }}
+                    className="relative aspect-[2/1] rounded-lg overflow-hidden p-4 text-left text-base font-bold tracking-tight text-white shadow transition hover:brightness-110 active:scale-95"
+                  >
+                    <span className="relative z-10 drop-shadow">{t.label}</span>
+                  </button>
+                ))}
+              </div>
             </div>
           </div>
-        </div>
-      )}
+        ))}
 
       {showResultsPage && loading && !pageResults && (
         <div className="px-2 pt-2 text-sm text-neutral-500">Searching…</div>
       )}
 
+      {pageResults && tab === 'all' && hasLibMatches && (
+        <LibrarySection
+          playlists={libPlaylistMatches}
+          songs={libSongMatches}
+          token={token}
+          onOpenPlaylist={onOpenLibraryPlaylist}
+          onPlaySong={onPlayLibrarySong}
+        />
+      )}
       {pageResults && tab === 'all' && (
         <FederatedResults
           token={token}
           query={committedQuery}
           results={pageResults}
           played={played}
+          // Cap the inline playlists in "All" so a mood/genre query (e.g.
+          // "workout" → 25 playlists) doesn't bury the exact matches under a
+          // wall of them. The dedicated Playlists tab shows the full list.
+          playlists={(pageResults.playlists ?? []).slice(0, 4)}
+          onOpenPlaylist={openPlaylistPage}
+          onAddPlaylist={addPlaylistToLibrary}
           onAdd={(t) => setPickerTrack(t)}
           onPlay={playTrack}
           onOpenArtist={openArtistPage}
           onOpenAlbum={openAlbumPage}
+          onAddAlbum={addAlbumToLibrary}
+          save={save}
           playingPreviewUrl={playingPreviewUrl}
           onTogglePreview={togglePreview}
         />
@@ -1402,6 +1707,10 @@ export function SearchScreen({
           onPlay={playTrack}
           playingPreviewUrl={playingPreviewUrl}
           onTogglePreview={togglePreview}
+          // Same component as the genre pages — wire the same now-playing
+          // state so the current track lights up here too.
+          isTrackCurrent={isTrackCurrent}
+          isNowPlaying={isNowPlaying}
         />
       )}
       {pageResults && tab === 'all' && relatedSection}
@@ -1412,6 +1721,10 @@ export function SearchScreen({
           onPlay={playAlbumResult}
         />
       )}
+      {/* NB: playlists in the "All" tab now render inline as list rows inside
+          FederatedResults (above), not as a separate bigger-art grid — so every
+          result in "All" reads the same. The dedicated Playlists tab keeps its
+          grid, matching the Albums / Artists tabs. */}
       {pageResults && tab === 'artists' && (
         <>
           <ArtistGrid
@@ -1422,21 +1735,8 @@ export function SearchScreen({
           {relatedSection}
         </>
       )}
-      {/* Playlists: a labeled shelf under the "All" results, or the full grid
-          on its own tab. Tapping one opens the shared playlist page. */}
-      {pageResults &&
-        tab === 'all' &&
-        (pageResults.playlists?.length ?? 0) > 0 && (
-          <div className="mt-2">
-            <div className={cn(EYEBROW, 'px-1 mb-2')}>
-              Playlists
-            </div>
-            <PlaylistGrid
-              playlists={pageResults.playlists ?? []}
-              onOpen={openPlaylistPage}
-            />
-          </div>
-        )}
+      {/* Dedicated Playlists tab: the full grid on its own, matching how the
+          Albums / Artists tabs render. (In "All", playlists are inline rows.) */}
       {pageResults && tab === 'playlists' && (
         <PlaylistGrid
           playlists={pageResults.playlists ?? []}
@@ -1455,6 +1755,7 @@ export function SearchScreen({
         <ArtistDetailModal
           inline={pageMode}
           pin={pin}
+          save={save}
           // Remount on drill-in (A → related artist B) so all three
           // sections reset to their loading state instead of flashing
           // the previous artist's data.
@@ -1469,28 +1770,30 @@ export function SearchScreen({
               : () => {
                   stopPreview();
                   setOpenArtist(null);
-                  // Backing out of a detail opened from elsewhere (no active
-                  // search) returns to its origin view, not the bare Search.
-                  if (!committedQuery.trim()) onExitDetail?.();
                 }
           }
           onPickAlbum={(a) => setOpenAlbum(a)}
           onPickTrack={(t) => setPickerTrack(t)}
+          onPickPlaylist={openPlaylistPage}
+          onAddAlbum={addAlbumToLibrary}
           onPlay={onPlayTrack}
           onPickArtist={(a) => {
             stopPreview();
             setOpenShowAll(null);
             setOpenArtist(a);
           }}
-          onShowAll={(section) => setOpenShowAll(section)}
+          onShowAll={(section, initial) => {
+            setShowAllInitial(initial ?? null);
+            setOpenShowAll(section);
+          }}
           // Phone: a show-all grid (or an album) can stack over this still-mounted
           // page; only the topmost layer should close on a single Escape.
           escapeActive={!openShowAll && !openAlbum}
-          // Desktop now-playing: ⏸/▶ hero + sticky Play, highlighted current
-          // Top-Songs row, persistent play on the playing album's card.
-          isTrackCurrent={pageMode ? isTrackCurrent : undefined}
-          isPlaying={pageMode ? isNowPlaying : undefined}
-          onTogglePlay={pageMode ? onTogglePlay : undefined}
+          // Now-playing: ⏸/▶ hero + sticky Play, highlighted current Top-Songs
+          // row, persistent play on the playing album's card — on the phone too.
+          isTrackCurrent={isTrackCurrent}
+          isPlaying={isNowPlaying}
+          onTogglePlay={onTogglePlay}
           playingPreviewUrl={playingPreviewUrl}
           onTogglePreview={togglePreview}
         />
@@ -1507,6 +1810,16 @@ export function SearchScreen({
           token={token}
           artist={openArtist}
           section={openShowAll}
+          // Seed from the data the artist page already had (drill-in only),
+          // guarded by artist id so a stale seed never bleeds across artists.
+          initial={
+            showAllInitial &&
+            (showAllInitial.albums?.[0] ||
+              showAllInitial.topTracks?.[0] ||
+              showAllInitial.related?.[0])
+              ? showAllInitial
+              : undefined
+          }
           onClose={
             overlayMode ? () => onOverlayBack?.() : () => setOpenShowAll(null)
           }
@@ -1520,6 +1833,9 @@ export function SearchScreen({
           onPlay={onPlayTrack}
           playingPreviewUrl={playingPreviewUrl}
           onTogglePreview={togglePreview}
+          isTrackCurrent={isTrackCurrent}
+          isPlaying={isNowPlaying}
+          onTogglePlay={onTogglePlay}
           // Phone: an album can stack over this grid; defer Escape to it.
           escapeActive={!openAlbum}
         />
@@ -1542,9 +1858,6 @@ export function SearchScreen({
               : () => {
                   stopPreview();
                   setOpenAlbum(null);
-                  // No artist page underneath + no active search → return to the
-                  // origin view; otherwise reveal the artist/results beneath.
-                  if (!openArtist && !committedQuery.trim()) onExitDetail?.();
                 }
           }
           onPickTrack={(t) => setPickerTrack(t)}
@@ -1560,11 +1873,12 @@ export function SearchScreen({
           // Clickable artist names in track rows → that artist's page.
           onGoToArtist={onAlbumGoToArtist}
           onGoToAlbum={onAlbumGoToAlbum}
-          // Desktop now-playing: highlight + equalizer on the current row, ⏸/▶
-          // hero + sticky Play button (host wires it from its player store).
-          isTrackCurrent={pageMode ? isTrackCurrent : undefined}
-          isPlaying={pageMode ? isNowPlaying : undefined}
-          onTogglePlay={pageMode ? onTogglePlay : undefined}
+          // Now-playing: highlight + equalizer on the current row, ⏸/▶ hero +
+          // sticky Play button (host wires it from its player store) — on the
+          // phone too, so a catalog album matches the library album page.
+          isTrackCurrent={isTrackCurrent}
+          isPlaying={isNowPlaying}
+          onTogglePlay={onTogglePlay}
           playingPreviewUrl={playingPreviewUrl}
           onTogglePreview={togglePreview}
         />
@@ -1577,14 +1891,13 @@ export function SearchScreen({
           token={token}
           playlist={openPlaylist}
           activeProfileId={activeProfileId}
+          pin={pin}
           onClose={
             overlayMode
               ? () => onOverlayBack?.()
               : () => {
                   stopPreview();
                   setOpenPlaylist(null);
-                  // Nothing underneath + no active search → return to origin.
-                  if (!committedQuery.trim()) onExitDetail?.();
                 }
           }
           onPickTrack={(t) => setPickerTrack(t)}
@@ -1598,12 +1911,12 @@ export function SearchScreen({
           onSaveTrack={pageMode ? undefined : onAlbumSaveToLiked}
           onGoToArtist={onAlbumGoToArtist}
           onGoToAlbum={onAlbumGoToAlbum}
-          // Desktop now-playing: equalizer bars on the current row + a ⏸/▶ hero
-          // that toggles (matching the album + library playlist pages). Desktop
-          // only — the phone host doesn't wire these.
-          isTrackCurrent={pageMode ? isTrackCurrent : undefined}
-          isPlaying={pageMode ? isNowPlaying : undefined}
-          onTogglePlay={pageMode ? onTogglePlay : undefined}
+          // Now-playing: equalizer bars on the current row + a ⏸/▶ hero that
+          // toggles (matching the album + library playlist pages) — on the phone
+          // too, not just desktop.
+          isTrackCurrent={isTrackCurrent}
+          isPlaying={isNowPlaying}
+          onTogglePlay={onTogglePlay}
           playingPreviewUrl={playingPreviewUrl}
           onTogglePreview={togglePreview}
         />
@@ -1710,77 +2023,6 @@ export function usePreviewPlayer() {
   return { playingUrl, toggle, stop };
 }
 
-// Deezer preview clips are 30 seconds; the depleting ring runs for the
-// same fixed duration. If a clip is a hair shorter, the audio `ended`
-// event clears the ring, so the two stay visually in sync.
-const PREVIEW_SECONDS = 30;
-
-// Injected once by SearchScreen. Drives the Shazam-style countdown ring:
-// stroke-dashoffset sweeps from 0 (full ring) to the circle's
-// circumference (empty), so the arc visibly depletes as the clip plays.
-// The circumference is read from a per-ring CSS custom property so one
-// rule works for any ring size.
-export const PREVIEW_RING_KEYFRAMES = `
-@keyframes beetbot-preview-ring {
-  from { stroke-dashoffset: 0; }
-  to { stroke-dashoffset: var(--bb-ring-c); }
-}
-@keyframes beetbot-page-enter {
-  from { opacity: 0; transform: translateY(10px); }
-  to { opacity: 1; transform: translateY(0); }
-}`;
-
-/**
- * Shazam-style countdown ring: a faint full circle with a brighter arc
- * on top that depletes over PREVIEW_SECONDS via the CSS keyframe above.
- * Pure CSS so it animates on the compositor — no per-frame React state,
- * even with a full page of results. Absolutely positioned to overlay
- * whatever it's dropped into (album art, a track-number badge).
- */
-export function PreviewRing({
-  size,
-  strokeWidth = 3,
-}: {
-  size: number;
-  strokeWidth?: number;
-}) {
-  const r = (size - strokeWidth) / 2;
-  const c = 2 * Math.PI * r;
-  const center = size / 2;
-  return (
-    <svg
-      width={size}
-      height={size}
-      viewBox={`0 0 ${size} ${size}`}
-      className="absolute inset-0 m-auto -rotate-90 pointer-events-none"
-      aria-hidden
-    >
-      <circle
-        cx={center}
-        cy={center}
-        r={r}
-        fill="none"
-        stroke="rgba(255,255,255,0.25)"
-        strokeWidth={strokeWidth}
-      />
-      <circle
-        cx={center}
-        cy={center}
-        r={r}
-        fill="none"
-        stroke="#34d399"
-        strokeWidth={strokeWidth}
-        strokeLinecap="round"
-        style={{
-          strokeDasharray: c,
-          // Consumed by the keyframe's `to` value.
-          ['--bb-ring-c' as string]: String(c),
-          animation: `beetbot-preview-ring ${PREVIEW_SECONDS}s linear forwards`,
-        }}
-      />
-    </svg>
-  );
-}
 
 /** Whether the primary input can hover (desktop mouse). Touch devices (the
  *  phone bundle) can't, so a hover-only affordance would be invisible there —
@@ -1803,19 +2045,30 @@ function ArtworkThumb({
   artUrl,
   playing,
   nowPlaying = false,
+  pausedCurrent = false,
   showHoverPlay = true,
+  small = false,
 }: {
   artUrl: string | null;
   /** 30s preview auditioning this row → pause glyph + depleting ring. */
   playing: boolean;
   /** This row is the actual now-playing track (audible) → equalizer bars. */
   nowPlaying?: boolean;
+  /** This row is the current track but PAUSED → a static ♪ (matches the playlist
+   *  page's paused marker, so paused reads the same on every list). */
+  pausedCurrent?: boolean;
   /** Show the ▶ hover overlay on the cover. Off when the row's # gutter carries
    *  the play/now-playing indicator instead (genre pages match the playlist). */
   showHoverPlay?: boolean;
+  /** 40px cover (h-10) instead of 44px — matches the phone playlist rows. */
+  small?: boolean;
 }) {
   return (
-    <div className="relative h-11 w-11 shrink-0 rounded-lg overflow-hidden bg-neutral-800">
+    <div
+      className={`relative ${
+        small ? 'h-10 w-10' : 'h-11 w-11'
+      } shrink-0 rounded-lg overflow-hidden bg-neutral-800`}
+    >
       {artUrl ? (
         <img
           src={artUrl}
@@ -1833,6 +2086,11 @@ function ArtworkThumb({
         // Now playing (audible): equalizer bars over the cover, always shown.
         <div className="absolute inset-0 grid place-items-center bg-black/55">
           <EqualizerBars className="text-white" />
+        </div>
+      ) : pausedCurrent && !playing ? (
+        // Current track, paused: static ♪ (matches the playlist page).
+        <div className="absolute inset-0 grid place-items-center bg-black/55">
+          <span className="text-sm text-white">♪</span>
         </div>
       ) : playing ? (
         // 30s preview auditioning: pause glyph over a darkened cover.
@@ -1864,7 +2122,7 @@ function ArtworkThumb({
           </svg>
         </div>
       ) : null}
-      {playing ? <PreviewRing size={44} strokeWidth={3} /> : null}
+      {playing ? <PreviewRing size={small ? 40 : 44} strokeWidth={3} /> : null}
     </div>
   );
 }
@@ -1877,18 +2135,6 @@ function formatCompact(n: number): string {
   return String(n);
 }
 
-/** Small grey "E" badge for explicit tracks (Spotify-style). */
-function ExplicitBadge() {
-  return (
-    <span
-      className="shrink-0 inline-grid place-items-center h-[15px] min-w-[15px] px-[3px] rounded-[3px] bg-neutral-700 text-neutral-300 text-[9px] font-bold leading-none"
-      title="Explicit"
-      aria-label="Explicit"
-    >
-      E
-    </span>
-  );
-}
 
 /** Small bordered pill naming a row's entity type ("Song" / "Artist" /
  *  "Album"). Used in the federated "All" view so each interleaved row reads
@@ -1977,6 +2223,50 @@ function dedupeArtists(artists: SearchArtistResult[]): SearchArtistResult[] {
     }
   });
   return order.map((k) => best.get(k) as SearchArtistResult);
+}
+
+/** Drop "junk twin" profiles — a name built AROUND another result's full name
+ *  ("Coldplay" → "Coldplay Tribute Band", "Karaoke - Coldplay", "Coldplay
+ *  Mindfulness") with a following orders of magnitude smaller. These clear the
+ *  fan floor below (tribute acts collect a few thousand fans) but their pages
+ *  are ghosts: no picture, no albums, no top songs. Token-subset + fan-ratio,
+ *  so real near-names survive: "Vampire Weekend" shares no token with
+ *  "The Weeknd"; "Selena" isn't a superset of "Selena Gomez" (it's the other
+ *  way round, and we only ever drop the superset side); "Bob Marley & The
+ *  Wailers" IS a superset of "Bob Marley" but passes the ratio bar (1% of the
+ *  base act's fans — a real co-credited act clears it, a tribute never does).
+ *  NOT used by the imperative name→artist resolution: someone whose library
+ *  genuinely holds a tribute act must still land on it, not the base artist. */
+function dropDerivativeArtists(
+  artists: SearchArtistResult[],
+): SearchArtistResult[] {
+  const tokens = artists.map(
+    (a) =>
+      new Set(
+        stripLeadingArticle(normalizeForMatch(a.name)).split(' ').filter(Boolean),
+      ),
+  );
+  return artists.filter((b, bi) => {
+    const bTokens = tokens[bi];
+    return !artists.some((a, ai) => {
+      if (ai === bi) return false;
+      const aTokens = tokens[ai];
+      if (aTokens.size === 0 || aTokens.size >= bTokens.size) return false;
+      if (![...aTokens].every((t) => bTokens.has(t))) return false;
+      return (b.total_fans ?? 0) < (a.total_fans ?? 0) * 0.01;
+    });
+  });
+}
+
+/** Drop Deezer's phantom combined-credit artists — a collaboration indexed as a
+ *  single "A & B" artist object (own id + page) alongside the real solo acts,
+ *  e.g. "Marshmello & Omar LinX" next to "Marshmello". `isPhantomArtist` gates
+ *  on a collab-shaped name AND a missing portrait, so genuine "A & B" bands
+ *  (which always have artwork) are kept. */
+function dropCombinedCreditArtists(
+  artists: SearchArtistResult[],
+): SearchArtistResult[] {
+  return artists.filter((a) => !isPhantomArtist(a));
 }
 
 /** Minimum follower count for an artist to count as "real" regardless of the
@@ -2376,6 +2666,11 @@ interface FederatedHandlers {
   onOpenAlbum: (a: SearchAlbumResult) => void;
   playingPreviewUrl: string | null;
   onTogglePreview: (url: string) => void;
+  /** Add a catalog album to the library (trailing + on album rows). When
+   *  omitted the row falls back to a plain navigation chevron. */
+  onAddAlbum?: (a: SearchAlbumResult) => Promise<void>;
+  /** Save-artist controller (trailing + on artist rows). Omitted ⇒ chevron. */
+  save?: SavedArtistController;
 }
 
 /**
@@ -2455,6 +2750,200 @@ function AddTrackButton({
   );
 }
 
+/** +/✓ button that adds a catalog album or playlist to the library. One-shot:
+ *  tap +, it imports (spinner), then shows ✓. Stops propagation so the row's
+ *  name area (which opens the page) doesn't also fire. */
+function LibraryAddButton({
+  onAdd,
+  label,
+}: {
+  onAdd: () => Promise<void>;
+  label: string;
+}) {
+  const [state, setState] = useState<'idle' | 'adding' | 'added'>('idle');
+  return (
+    <button
+      type="button"
+      onClick={async (e) => {
+        e.stopPropagation();
+        if (state !== 'idle') return;
+        setState('adding');
+        try {
+          await onAdd();
+          setState('added');
+        } catch {
+          setState('idle');
+        }
+      }}
+      disabled={state !== 'idle'}
+      aria-label={state === 'added' ? 'Added to your library' : label}
+      title={state === 'added' ? 'Added to your library' : label}
+      className={cn(
+        'grid h-9 w-9 place-items-center rounded-full shrink-0 leading-none transition active:scale-95',
+        state === 'added'
+          ? 'bg-neutral-100 text-neutral-950'
+          : 'text-neutral-200 hover:bg-neutral-800 active:bg-neutral-800',
+      )}
+    >
+      {state === 'adding' ? (
+        <svg width="16" height="16" viewBox="0 0 24 24" className="animate-spin" fill="none" aria-hidden>
+          <circle cx="12" cy="12" r="9" stroke="currentColor" strokeOpacity="0.25" strokeWidth="3" />
+          <path d="M12 3a9 9 0 0 1 9 9" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
+        </svg>
+      ) : state === 'added' ? (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+          <path d="m5 12 5 5 9-11" />
+        </svg>
+      ) : (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+          <path d="M12 5v14M5 12h14" />
+        </svg>
+      )}
+    </button>
+  );
+}
+
+/** +/✓ save toggle for an artist result row — mirrors the SaveArtistButton pill
+ *  in the artist header, but as the compact round row action. Optimistic local
+ *  state so the ✓ flips instantly. */
+function ArtistSaveButton({
+  artist: a,
+  save,
+}: {
+  artist: SearchArtistResult;
+  save: SavedArtistController;
+}) {
+  const [saved, setSaved] = useState(() => save.isSaved(a.name));
+  return (
+    <button
+      type="button"
+      onClick={(e) => {
+        e.stopPropagation();
+        save.toggle({ key: a.name, name: a.name, art: a.picture_url ?? null });
+        setSaved((s) => !s);
+      }}
+      aria-label={saved ? 'Remove artist from your library' : 'Save artist to your library'}
+      title={saved ? 'Remove from your library' : 'Save to your library'}
+      aria-pressed={saved}
+      className={cn(
+        'grid h-9 w-9 place-items-center rounded-full shrink-0 leading-none transition active:scale-95',
+        saved
+          ? 'bg-neutral-100 text-neutral-950'
+          : 'text-neutral-200 hover:bg-neutral-800 active:bg-neutral-800',
+      )}
+    >
+      {saved ? (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+          <path d="m5 12 5 5 9-11" />
+        </svg>
+      ) : (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+          <path d="M12 5v14M5 12h14" />
+        </svg>
+      )}
+    </button>
+  );
+}
+
+/** "From your library" search results — the user's OWN playlists + songs that
+ *  match the query, as the same 44px list rows as the catalog results so the
+ *  two read as one list. Library playlists open the library page; songs play. */
+function LibrarySection({
+  playlists,
+  songs,
+  token,
+  onOpenPlaylist,
+  onPlaySong,
+}: {
+  playlists: PlaylistRow[];
+  songs: StreamTrack[];
+  token: string;
+  onOpenPlaylist?: (id: number) => void;
+  onPlaySong?: (t: StreamTrack) => void;
+}) {
+  if (playlists.length === 0 && songs.length === 0) return null;
+  return (
+    <div className="mb-5">
+      <div className={cn(EYEBROW, 'px-1 mb-1')}>From your library</div>
+      <ul className="px-1">
+        {playlists.map((p) => (
+          <li key={`lp:${p.id}`} className="py-2.5 flex items-center gap-3 min-w-0">
+            <button
+              type="button"
+              onClick={() => onOpenPlaylist?.(p.id)}
+              aria-label={`Open ${p.name}`}
+              className="flex-1 min-w-0 flex items-center gap-3 text-left rounded-lg focus:outline-none focus-visible:ring-1 focus-visible:ring-white/60"
+            >
+              <div className="h-11 w-11 shrink-0 rounded-lg overflow-hidden bg-neutral-800 grid place-items-center">
+                <img
+                  src={playlistArtUrl(p.id, token)}
+                  alt=""
+                  className="h-full w-full object-cover"
+                  draggable={false}
+                  loading="lazy"
+                />
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="text-sm font-medium truncate">{p.name}</div>
+                <div className="text-xs text-neutral-500 truncate flex items-center gap-1.5">
+                  <RowTypeTag label="Playlist" />
+                  <span className="truncate">
+                    {p.track_count} {p.track_count === 1 ? 'song' : 'songs'}
+                  </span>
+                </div>
+              </div>
+            </button>
+            <RowChevron />
+          </li>
+        ))}
+        {songs.map((t) => {
+          // canPlayNow, not raw has_audio: on the full build a matched-but-not-
+          // downloaded library song live-streams — dimming it here contradicted
+          // every other list (same bug class as the artist-page preview gate).
+          const playable = canPlayNow(t);
+          return (
+            <li
+              key={`ls:${t.id}`}
+              className={`py-2.5 flex items-center gap-3 min-w-0 ${
+                playable ? '' : 'opacity-60'
+              }`}
+            >
+              <button
+                type="button"
+                disabled={!playable}
+                onClick={() => playable && onPlaySong?.(t)}
+                aria-label={`Play ${t.title}`}
+                className="flex-1 min-w-0 flex items-center gap-3 text-left rounded-lg focus:outline-none focus-visible:ring-1 focus-visible:ring-white/60"
+              >
+                <div className="h-11 w-11 shrink-0 rounded-lg overflow-hidden bg-neutral-800 grid place-items-center">
+                  {t.album_art_url ? (
+                    <img
+                      src={t.album_art_url}
+                      alt=""
+                      className="h-full w-full object-cover"
+                      draggable={false}
+                      loading="lazy"
+                    />
+                  ) : (
+                    <span className="text-neutral-600">♪</span>
+                  )}
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div className="text-sm font-medium truncate">{t.title}</div>
+                  <div className="text-xs text-neutral-500 truncate flex items-center gap-1.5">
+                    <RowTypeTag label="Song" />
+                    <span className="truncate">{t.artists.join(', ')}</span>
+                  </div>
+                </div>
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+
 /** Genre/mood tiles shown in the empty-search state — tapping runs a catalog
  *  search for that term, so the empty state is a discovery launcher rather
  *  than a dead end (Spotify's "Browse all" idea, adapted to our search). */
@@ -2486,6 +2975,8 @@ function recentItemKey(it: RecentItem): string {
       return `a:${it.artist.source_id}`;
     case 'album':
       return `al:${it.album.source_id}`;
+    case 'playlist':
+      return `pl:${it.playlist.source_id}`;
   }
 }
 
@@ -2498,6 +2989,8 @@ function RecentRow({
   onTrack,
   onArtist,
   onAlbum,
+  onPlaylist,
+  onRemove,
 }: {
   item: RecentItem;
   playingPreviewUrl: string | null;
@@ -2505,12 +2998,21 @@ function RecentRow({
   onTrack: (t: SearchTrackResult) => void;
   onArtist: (a: SearchArtistResult) => void;
   onAlbum: (a: SearchAlbumResult) => void;
+  onPlaylist: (p: CatalogPlaylistSummary) => void;
+  /** Drop just this entry (the trailing ✕), leaving the rest of the list. */
+  onRemove: () => void;
 }) {
-  const rowCls =
-    'w-full flex items-center gap-3 px-2 py-2 rounded-lg hover:bg-neutral-800 active:bg-neutral-800 text-left';
+  // The tap area takes all the width; a trailing ✕ removes just this entry.
+  const tapCls =
+    'min-w-0 flex-1 flex items-center gap-3 px-2 py-2 rounded-l-lg text-left';
+  let onClick: () => void;
+  let removeLabel: string;
+  let inner: React.ReactNode;
   if (item.kind === 'query') {
-    return (
-      <button type="button" onClick={() => onQuery(item.text)} className={rowCls}>
+    onClick = () => onQuery(item.text);
+    removeLabel = `Remove “${item.text}” from recent searches`;
+    inner = (
+      <>
         {/* Clock (recent/history). Inline SVG avoids the ↩ char iOS shows as
             a blue emoji. */}
         <svg
@@ -2527,14 +3029,15 @@ function RecentRow({
           <path d="M12 7v5l3 2" />
         </svg>
         <span className="text-sm text-neutral-200 truncate">{item.text}</span>
-      </button>
+      </>
     );
-  }
-  if (item.kind === 'track') {
+  } else if (item.kind === 'track') {
     const t = item.track;
     const previewing = !!t.preview_url && playingPreviewUrl === t.preview_url;
-    return (
-      <button type="button" onClick={() => onTrack(t)} className={rowCls}>
+    onClick = () => onTrack(t);
+    removeLabel = `Remove ${t.title} from recent searches`;
+    inner = (
+      <>
         <div className="relative h-11 w-11 shrink-0 rounded-lg overflow-hidden bg-neutral-800 grid place-items-center">
           {t.album_art_url ? (
             <img
@@ -2556,13 +3059,14 @@ function RecentRow({
             <span className="truncate">{t.artists.join(', ')}</span>
           </div>
         </div>
-      </button>
+      </>
     );
-  }
-  if (item.kind === 'artist') {
+  } else if (item.kind === 'artist') {
     const a = item.artist;
-    return (
-      <button type="button" onClick={() => onArtist(a)} className={rowCls}>
+    onClick = () => onArtist(a);
+    removeLabel = `Remove ${a.name} from recent searches`;
+    inner = (
+      <>
         <div className="h-11 w-11 shrink-0 rounded-full overflow-hidden bg-neutral-800 grid place-items-center">
           {a.picture_url ? (
             <img
@@ -2581,32 +3085,88 @@ function RecentRow({
             <RowTypeTag label="Artist" />
           </div>
         </div>
-      </button>
+      </>
+    );
+  } else if (item.kind === 'album') {
+    const a = item.album;
+    onClick = () => onAlbum(a);
+    removeLabel = `Remove ${a.name} from recent searches`;
+    inner = (
+      <>
+        <div className="h-11 w-11 shrink-0 rounded-lg overflow-hidden bg-neutral-800 grid place-items-center">
+          {a.cover_url ? (
+            <img
+              src={a.cover_url}
+              alt=""
+              className="h-full w-full object-cover"
+              draggable={false}
+            />
+          ) : (
+            <span className="text-neutral-600">♪</span>
+          )}
+        </div>
+        <div className="min-w-0">
+          <div className="text-sm text-neutral-100 truncate">{a.name}</div>
+          <div className="text-xs text-neutral-500 truncate flex items-center gap-1.5">
+            <RowTypeTag label={albumTypeLabel(a.album_type) || 'Album'} />
+            <span className="truncate">{a.artists.join(', ')}</span>
+          </div>
+        </div>
+      </>
+    );
+  } else {
+    const p = item.playlist;
+    onClick = () => onPlaylist(p);
+    removeLabel = `Remove ${p.title} from recent searches`;
+    inner = (
+      <>
+        <div className="h-11 w-11 shrink-0 rounded-lg overflow-hidden bg-neutral-800 grid place-items-center">
+          {p.cover_url ? (
+            <img
+              src={coverSrc(p.cover_url)}
+              alt=""
+              className="h-full w-full object-cover"
+              draggable={false}
+            />
+          ) : (
+            <span className="text-neutral-600">♪</span>
+          )}
+        </div>
+        <div className="min-w-0">
+          <div className="text-sm text-neutral-100 truncate">{p.title}</div>
+          <div className="text-xs text-neutral-500 truncate flex items-center gap-1.5">
+            <RowTypeTag label="Playlist" />
+            <span className="truncate">{p.creator || 'Playlist'}</span>
+          </div>
+        </div>
+      </>
     );
   }
-  const a = item.album;
   return (
-    <button type="button" onClick={() => onAlbum(a)} className={rowCls}>
-      <div className="h-11 w-11 shrink-0 rounded-lg overflow-hidden bg-neutral-800 grid place-items-center">
-        {a.cover_url ? (
-          <img
-            src={a.cover_url}
-            alt=""
-            className="h-full w-full object-cover"
-            draggable={false}
-          />
-        ) : (
-          <span className="text-neutral-600">♪</span>
-        )}
-      </div>
-      <div className="min-w-0">
-        <div className="text-sm text-neutral-100 truncate">{a.name}</div>
-        <div className="text-xs text-neutral-500 truncate flex items-center gap-1.5">
-          <RowTypeTag label={albumTypeLabel(a.album_type) || 'Album'} />
-          <span className="truncate">{a.artists.join(', ')}</span>
-        </div>
-      </div>
-    </button>
+    <div className="flex items-center rounded-lg hover:bg-neutral-800 active:bg-neutral-800">
+      <button type="button" onClick={onClick} className={tapCls}>
+        {inner}
+      </button>
+      <button
+        type="button"
+        onClick={onRemove}
+        aria-label={removeLabel}
+        className="mr-1 grid h-8 w-8 shrink-0 place-items-center rounded-full text-neutral-500 transition hover:bg-neutral-700 hover:text-neutral-200 active:scale-95"
+      >
+        <svg
+          width="14"
+          height="14"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          aria-hidden
+        >
+          <path d="M6 6l12 12M18 6 6 18" />
+        </svg>
+      </button>
+    </div>
   );
 }
 
@@ -2862,6 +3422,8 @@ function FederatedRow({
   onPlay,
   onOpenArtist,
   onOpenAlbum,
+  onAddAlbum,
+  save,
   playingPreviewUrl,
   onTogglePreview,
 }: { item: FederatedItem } & FederatedHandlers) {
@@ -2949,7 +3511,7 @@ function FederatedRow({
             </div>
           </div>
         </button>
-        <RowChevron />
+        {save ? <ArtistSaveButton artist={a} save={save} /> : <RowChevron />}
       </li>
     );
   }
@@ -2988,7 +3550,14 @@ function FederatedRow({
           </div>
         </div>
       </button>
-      <RowChevron />
+      {onAddAlbum ? (
+        <LibraryAddButton
+          onAdd={() => onAddAlbum(a)}
+          label={`Add ${a.name} to your library`}
+        />
+      ) : (
+        <RowChevron />
+      )}
     </li>
   );
 }
@@ -3000,37 +3569,114 @@ export function FederatedResults({
   query,
   results,
   played = EMPTY_PLAYED,
+  playlists = [],
+  onOpenPlaylist,
+  onAddPlaylist,
   ...handlers
 }: {
   token: string;
   query: string;
   results: SearchResults;
   played?: ReadonlyMap<string, number>;
+  /** Catalog playlists that matched. Rendered as list rows in the SAME
+   *  "Results" list as songs / artists / albums — same 11×11 art, same row
+   *  height, same trailing +/chevron — so nothing reads as a separate shelf. */
+  playlists?: CatalogPlaylistSummary[];
+  onOpenPlaylist?: (p: CatalogPlaylistSummary) => void;
+  /** Add a matched catalog playlist to the library (its trailing +). */
+  onAddPlaylist?: (p: CatalogPlaylistSummary) => Promise<void>;
 } & FederatedHandlers) {
   const queryNorm = normalizeForMatch(query);
   const { top, rest } = useMemo(
     () => buildFederated(results, queryNorm, played),
     [results, queryNorm, played],
   );
-  if (!top) {
+  const hasPlaylistRows = playlists.length > 0 && !!onOpenPlaylist;
+  if (!top && !hasPlaylistRows) {
     return <div className="px-2 pt-3 text-sm text-neutral-500">No results.</div>;
   }
   return (
     <div className="flex flex-col gap-5">
-      <TopResultCard token={token} item={top} {...handlers} />
-      {rest.length > 0 && (
+      {top && <TopResultCard token={token} item={top} {...handlers} />}
+      {(rest.length > 0 || hasPlaylistRows) && (
         <div>
           <div className={cn(EYEBROW, 'px-1 mb-1')}>
             Results
           </div>
-          <ul className="px-1 divide-y divide-white/5">
+          <ul className="px-1">
             {rest.map((it) => (
               <FederatedRow key={federatedKey(it)} item={it} {...handlers} />
             ))}
+            {/* Playlists trail the relevance-ranked track/artist/album rows, but
+                in the same list — an exact song/artist/album match is a stronger
+                hit than a playlist that merely mentions the query. */}
+            {hasPlaylistRows &&
+              playlists.map((p) => (
+                <PlaylistRow
+                  key={`pl:${p.source}:${p.source_id}`}
+                  playlist={p}
+                  onOpen={onOpenPlaylist as (p: CatalogPlaylistSummary) => void}
+                  onAdd={onAddPlaylist}
+                />
+              ))}
           </ul>
         </div>
       )}
     </div>
+  );
+}
+
+/** One catalog-playlist row for the federated results list — mirrors the album
+ *  arm of FederatedRow exactly (11×11 rounded cover, title, "Playlist" tag +
+ *  creator, chevron) so playlists sit inline with the rest of the results. */
+function PlaylistRow({
+  playlist: p,
+  onOpen,
+  onAdd,
+}: {
+  playlist: CatalogPlaylistSummary;
+  onOpen: (p: CatalogPlaylistSummary) => void;
+  /** Add this catalog playlist to the library (trailing +). Omitted ⇒ chevron. */
+  onAdd?: (p: CatalogPlaylistSummary) => Promise<void>;
+}) {
+  return (
+    <li className="py-2.5 flex items-center gap-3 min-w-0">
+      <button
+        type="button"
+        onClick={() => onOpen(p)}
+        aria-label={`Open ${p.title}`}
+        className="flex-1 min-w-0 flex items-center gap-3 text-left rounded-lg focus:outline-none focus-visible:ring-1 focus-visible:ring-white/60"
+      >
+        <div className="h-11 w-11 shrink-0 rounded-lg overflow-hidden bg-neutral-800 grid place-items-center">
+          {p.cover_url ? (
+            <img
+              src={coverSrc(p.cover_url)}
+              alt=""
+              className="h-full w-full object-cover"
+              draggable={false}
+              loading="lazy"
+            />
+          ) : (
+            <span className="text-neutral-600">♪</span>
+          )}
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="text-sm font-medium truncate">{p.title}</div>
+          <div className="text-xs text-neutral-500 truncate flex items-center gap-1.5">
+            <RowTypeTag label="Playlist" />
+            <span className="truncate">{p.creator || 'Playlist'}</span>
+          </div>
+        </div>
+      </button>
+      {onAdd ? (
+        <LibraryAddButton
+          onAdd={() => onAdd(p)}
+          label={`Add ${p.title} to your library`}
+        />
+      ) : (
+        <RowChevron />
+      )}
+    </li>
   );
 }
 
@@ -3267,6 +3913,7 @@ export function TrackList({
   isTrackCurrent,
   isNowPlaying,
   onShowMenu,
+  onShowTrackSheet,
 }: {
   tracks: SearchTrackResult[];
   onAdd: (t: SearchTrackResult) => void;
@@ -3275,8 +3922,8 @@ export function TrackList({
   onPlay: (t: SearchTrackResult, list?: SearchTrackResult[], index?: number) => void;
   playingPreviewUrl: string | null;
   onTogglePreview: (url: string) => void;
-  /** Now-playing (desktop): the current row highlights + shows equalizer bars
-   *  over its cover, matching the playlist/album track rows. */
+  /** Now-playing: the current row highlights + shows equalizer bars over its
+   *  cover, matching the playlist/album track rows. */
   isTrackCurrent?: (t: SearchTrackResult) => boolean;
   isNowPlaying?: boolean;
   /** Desktop: open the per-song "⋯" overflow menu at a screen point. When set,
@@ -3284,6 +3931,10 @@ export function TrackList({
    *  + button, plus a small "in a playlist" ✓ next to Time — matching the album
    *  page. When absent, the row keeps the simple hover +. */
   onShowMenu?: (t: SearchTrackResult, x: number, y: number) => void;
+  /** Phone: open the per-song "⋯" action sheet (same bottom sheet the library /
+   *  playlist rows use). When set, each row's trailing control is a ⋯ instead of
+   *  the + button — matching the playlist page. */
+  onShowTrackSheet?: (t: SearchTrackResult) => void;
 }) {
   // Re-render when hub reachability changes so canPlayNow gating stays live.
   useHubReachable();
@@ -3299,7 +3950,9 @@ export function TrackList({
     );
   }
   return (
-    <div className="px-1">
+    // Phone sheet mode (genre): break out of the parent's px-4 so the rows run
+    // edge-to-edge with px-4 content — same width + dividers as the playlist.
+    <div className={onShowTrackSheet ? '-mx-4 md:mx-0 md:px-1' : 'px-1'}>
       {/* Column headers frame the desktop "table" (md+); the phone keeps the
           compact list below, so this header stays hidden there. */}
       <div
@@ -3313,7 +3966,7 @@ export function TrackList({
         <div className="text-right">Time</div>
         <div />
       </div>
-      <ul className="divide-y divide-white/5 md:divide-y-0">
+      <ul>
       {tracks.map((t, i) => {
         const previewing =
           !!t.preview_url && playingPreviewUrl === t.preview_url;
@@ -3338,9 +3991,11 @@ export function TrackList({
                   }
                 : undefined
             }
-            className={`group flex items-center gap-3 min-w-0 px-2 py-2.5 md:grid ${cols} md:items-center md:gap-3 md:py-1.5 md:rounded-lg transition-colors ${
-              current ? 'bg-neutral-800/40' : ''
-            } ${interactive ? 'md:hover:bg-neutral-800/40' : 'opacity-60'}`}
+            className={`group flex items-center gap-3 min-w-0 ${
+              onShowTrackSheet ? 'px-4' : 'px-2'
+            } py-2.5 md:grid ${cols} md:items-center md:gap-3 md:py-1.5 md:px-2 md:rounded-lg transition-colors ${
+              interactive ? 'md:hover:bg-neutral-800/40' : 'opacity-60'
+            }`}
           >
             {/* Track number — desktop table only. In menu mode (genre pages)
                 the # gutter carries the now-playing indicator like the playlist:
@@ -3391,16 +4046,21 @@ export function TrackList({
               <ArtworkThumb
                 artUrl={t.album_art_url}
                 playing={previewing}
-                // Menu mode (genre): the # gutter shows the now-playing / hover
-                // indicator, so the cover stays plain art — matching the playlist.
+                // Now-playing marker on the cover: equalizer bars when this row
+                // is the current track. On desktop menu mode the # gutter carries
+                // it; on the phone sheet mode (genre) the cover does — matching
+                // the playlist. Keep the cover plain otherwise (no ▶ scrim) so it
+                // reads like the playlist rows, not the search results.
                 nowPlaying={!hasMenu && current && !!isNowPlaying}
-                showHoverPlay={!hasMenu}
+                pausedCurrent={!hasMenu && current && !isNowPlaying}
+                showHoverPlay={!hasMenu && !onShowTrackSheet}
+                small={!!onShowTrackSheet}
               />
               <div className="flex-1 min-w-0">
                 <div
                   className={`text-sm ${
                     hasMenu ? 'md:text-base' : ''
-                  } font-medium truncate ${current ? 'text-white' : ''}`}
+                  } font-medium truncate ${current ? 'text-accent' : 'text-neutral-300'}`}
                 >
                   {t.title}
                 </div>
@@ -3461,7 +4121,9 @@ export function TrackList({
             <div
               className={`text-[11px] ${
                 hasMenu ? 'md:text-sm md:text-neutral-500' : ''
-              } text-neutral-600 tabular-nums w-10 md:w-auto text-right shrink-0`}
+              } text-neutral-600 tabular-nums w-10 md:w-auto text-right shrink-0 ${
+                onShowTrackSheet ? 'hidden md:block' : ''
+              }`}
             >
               {formatDuration(t.duration_ms)}
             </div>
@@ -3484,6 +4146,23 @@ export function TrackList({
                   </svg>
                 </button>
               </div>
+            ) : onShowTrackSheet ? (
+              // Phone: ⋯ opens the track action sheet, matching the playlist rows.
+              <button
+                type="button"
+                aria-label={`More options for ${t.title}`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onShowTrackSheet(t);
+                }}
+                className="h-11 w-9 -my-2 -mr-2 grid place-items-center text-neutral-500 active:text-neutral-200 shrink-0"
+              >
+                <svg width="19" height="19" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                  <circle cx="5" cy="12" r="1.7" />
+                  <circle cx="12" cy="12" r="1.7" />
+                  <circle cx="19" cy="12" r="1.7" />
+                </svg>
+              </button>
             ) : (
               <AddTrackButton track={t} onAdd={onAdd} />
             )}
@@ -3495,66 +4174,6 @@ export function TrackList({
   );
 }
 
-/** "55 min" / "1 hr 30 min" from a total milliseconds. */
-function albumDurationLabel(ms: number): string {
-  const totalMin = Math.round(ms / 60000);
-  if (totalMin < 60) return `${totalMin} min`;
-  const h = Math.floor(totalMin / 60);
-  const m = totalMin % 60;
-  return `${h} hr ${m} min`;
-}
-
-/** Format a Deezer release_date ("YYYY-MM-DD", sometimes just a year) as a
- *  human "Month D, YYYY" — Spotify shows this under the album tracklist.
- *  Parses the parts directly to avoid a UTC-midnight timezone shift. */
-function formatReleaseDate(iso: string | null): string {
-  if (!iso) return '';
-  const m = /^(\d{4})(?:-(\d{2})-(\d{2}))?/.exec(iso.trim());
-  if (!m) return '';
-  const [, y, mo, d] = m;
-  if (!mo || !d) return y; // year-only
-  const MONTHS = [
-    'January', 'February', 'March', 'April', 'May', 'June',
-    'July', 'August', 'September', 'October', 'November', 'December',
-  ];
-  const month = MONTHS[Number(mo) - 1];
-  if (!month) return y;
-  return `${month} ${Number(d)}, ${y}`;
-}
-
-/** Pretty label for a Deezer `record_type`. */
-function albumTypeLabel(t: string | null): string {
-  switch ((t ?? '').toLowerCase()) {
-    case 'album':
-      return 'Album';
-    case 'single':
-      return 'Single';
-    case 'ep':
-      return 'EP';
-    case 'compile':
-      return 'Compilation';
-    default:
-      return t ? t.charAt(0).toUpperCase() + t.slice(1) : '';
-  }
-}
-
-/** Card play buttons: fetch a collection's tracks and start playback from the
- *  first one, so a hovered album/artist card plays without opening its page.
- *  Shared by the search results, the "fans also like" shelf, and the artist /
- *  album detail surfaces. Declared at module scope so callers can pass a bound
- *  `onPlay` inline; failures leave the card untouched. */
-export async function playAlbumCard(
-  album: SearchAlbumResult,
-  token: string,
-  onPlay: (t: SearchTrackResult, list?: SearchTrackResult[], index?: number) => void,
-) {
-  try {
-    const list = await getAlbumTracks(album.source_id, token);
-    if (list.length) onPlay(list[0], list, 0);
-  } catch {
-    /* leave the card as-is on failure */
-  }
-}
 export async function playArtistCard(
   artist: SearchArtistResult,
   token: string,
@@ -3568,150 +4187,6 @@ export async function playArtistCard(
   }
 }
 
-export function AlbumGrid({
-  albums,
-  onOpen,
-  onPlay,
-  subtitleMode = 'default',
-  layout = 'grid',
-  activeAlbumName,
-  isPlaying,
-  onToggle,
-}: {
-  albums: SearchAlbumResult[];
-  onOpen: (a: SearchAlbumResult) => void;
-  /** When set, a white play button lifts in on the cover and plays the album
-   *  (the card click still opens it) — the Home-card affordance. */
-  onPlay?: (a: SearchAlbumResult) => void;
-  /**
-   * 'default'      → "Artist · 2016" (search / browse, where the artist
-   *                  is useful context).
-   * 'discography'  → "2016 • Album" (an artist's own page, where the
-   *                  artist is redundant — Spotify-style).
-   */
-  subtitleMode?: 'default' | 'discography';
-  /** 'grid' = wrapping grid (search/browse); 'row' = a single horizontal
-   *  scroller (Apple-Music artist-page carousels). */
-  layout?: 'grid' | 'row';
-  /** Now-playing (desktop): the card whose album name matches shows a
-   *  persistent play/pause button (Spotify-style), like the Home cards. */
-  activeAlbumName?: string | null;
-  isPlaying?: boolean;
-  onToggle?: () => void;
-}) {
-  if (albums.length === 0) {
-    return (
-      <div className="px-2 pt-3 text-sm text-neutral-500">No albums matched.</div>
-    );
-  }
-  const normName = (s: string) => s.trim().toLowerCase();
-  const cards = albums.map((a) => {
-        const year = a.release_date ? a.release_date.slice(0, 4) : '';
-        const typeLabel =
-          subtitleMode === 'discography' ? albumTypeLabel(a.album_type) : '';
-        // This card is the active playback source → persistent play/pause.
-        const albumActive =
-          !!activeAlbumName && normName(a.name) === normName(activeAlbumName);
-        return (
-          <div
-            key={`${a.source}:${a.source_id}`}
-            role="button"
-            tabIndex={0}
-            onClick={() => onOpen(a)}
-            onKeyDown={(e) => {
-              // Only the card root answers keys — a bubbled Enter/Space from the
-              // nested play button must NOT also open the page.
-              if (
-                e.target === e.currentTarget &&
-                (e.key === 'Enter' || e.key === ' ')
-              ) {
-                e.preventDefault();
-                onOpen(a);
-              }
-            }}
-            className={`group relative cursor-pointer text-left transition active:scale-[0.98] ${
-              layout === 'row' ? 'w-36 sm:w-40 shrink-0' : ''
-            }`}
-          >
-            {/* Hover halo — the row carousels match the Home shelves exactly
-                (generous -inset-3 rounded-2xl so the whole card lights up); the
-                wrapping grid stays horizontal-only so stacked rows don't overlap
-                their halos vertically. */}
-            <span
-              aria-hidden
-              className={`pointer-events-none absolute transition-colors duration-200 group-hover:bg-white/[0.06] ${
-                layout === 'row'
-                  ? '-inset-3 rounded-2xl'
-                  : '-inset-x-2 inset-y-0 rounded-xl'
-              }`}
-            />
-            <div className="relative">
-              <div className="relative">
-                <div className="grid aspect-square w-full place-items-center overflow-hidden rounded-lg bg-neutral-800 ring-1 ring-white/5 transition-shadow duration-200 group-hover:shadow-2xl group-hover:shadow-black/50">
-                  {a.cover_url ? (
-                    <img
-                      src={a.cover_url}
-                      alt=""
-                      className="h-full w-full object-cover"
-                      draggable={false}
-                      loading="lazy"
-                    />
-                  ) : (
-                    <span className="text-4xl text-neutral-600">♪</span>
-                  )}
-                </div>
-                {onPlay ? (
-                  <CardPlayButton
-                    label={`Play ${a.name}`}
-                    onPlay={albumActive && onToggle ? onToggle : () => onPlay(a)}
-                    persistent={albumActive}
-                    playing={albumActive && !!isPlaying}
-                  />
-                ) : null}
-              </div>
-              <Marquee text={a.name} className="mt-2 text-sm font-medium" />
-              <div className="truncate text-xs text-neutral-500">
-                {subtitleMode === 'discography' ? (
-                  <>
-                    {year}
-                    {year && typeLabel ? ' • ' : ''}
-                    {typeLabel}
-                  </>
-                ) : (
-                  <>
-                    {a.artists.join(', ')}
-                    {year ? <> · {year}</> : null}
-                  </>
-                )}
-              </div>
-            </div>
-          </div>
-        );
-      });
-  if (layout === 'row') {
-    // Mirror the Home shelves EXACTLY so the cards' -inset-3 hover halo has
-    // vertical room instead of being clipped: the scroller keeps py-4 +
-    // overflow-y-clip (clips without becoming a scroll container → arrows still
-    // work, no stray vertical scroll), and the -my-4 sits on THIS outer wrapper,
-    // never the scroller (a negative margin there collapses ShelfRow's arrow
-    // box). The arrows' artClass gains mt-4 to re-center on the padded cover.
-    return (
-      <div className="-my-4">
-        <ShelfRow
-          artClass="mt-4 h-36 sm:h-40"
-          scrollerClassName="flex gap-3 overflow-x-auto overflow-y-clip overscroll-x-contain py-4 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden"
-        >
-          {cards}
-        </ShelfRow>
-      </div>
-    );
-  }
-  return (
-    <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
-      {cards}
-    </div>
-  );
-}
 
 /** A single artist card — circular avatar + name + "Artist · N albums".
  *  Shared by the wrapping `ArtistGrid` and the horizontal artist shelf on the
@@ -3846,6 +4321,7 @@ function ArtistTopSongs({
   layout = 'carousel',
   isTrackCurrent,
   isPlaying,
+  onShowTrackSheet,
 }: {
   tracks: SearchTrackResult[];
   onAdd: (t: SearchTrackResult) => void;
@@ -3857,11 +4333,16 @@ function ArtistTopSongs({
   playingPreviewUrl: string | null;
   onTogglePreview: (url: string) => void;
   /** 'carousel' = columns-of-3 horizontal shelf (artist page); 'list' = a
-   *  single vertical list of every track (the Top Songs show-all page). */
-  layout?: 'carousel' | 'list';
-  /** Now-playing (desktop): the current row highlights + shows equalizer bars. */
+   *  single vertical list of every track (the phone's Top Songs show-all);
+   *  'table' = the numbered # · Title · Album · Time table matching the
+   *  playlist/album pages (the desktop Top Songs show-all). */
+  layout?: 'carousel' | 'list' | 'table';
+  /** Now-playing: the current row highlights + shows equalizer bars / ♪. */
   isTrackCurrent?: (t: SearchTrackResult) => boolean;
   isPlaying?: boolean;
+  /** Phone: open the per-song ⋯ action sheet (same as every other music list).
+   *  When set, the trailing control is a ⋯ instead of the +/✓. */
+  onShowTrackSheet?: (t: SearchTrackResult) => void;
 }) {
   // Re-render when hub reachability changes so canPlayNow gating stays live.
   useHubReachable();
@@ -3878,9 +4359,9 @@ function ArtistTopSongs({
     return (
       <div
         key={`${t.source}:${t.source_id}:${idx}`}
-        className={`group flex items-center gap-3 rounded-lg px-2 -mx-2 py-1.5 border-b border-white/5 transition-colors ${
-          current ? 'bg-white/[0.06]' : ''
-        } ${interactive ? '' : 'opacity-60'}`}
+        className={`group flex items-center gap-3 rounded-lg px-2 -mx-2 py-2 transition-colors ${
+          interactive ? '' : 'opacity-60'
+        }`}
       >
         <button
           type="button"
@@ -3900,9 +4381,14 @@ function ArtistTopSongs({
             <span className="text-neutral-600">♪</span>
           )}
           {current && isPlaying && !previewing ? (
-            // Now playing (audible): equalizer bars over the cover, always shown.
-            <span className="absolute inset-0 grid place-items-center bg-black/45">
+            // Now playing (audible): equalizer bars over the cover.
+            <span className="absolute inset-0 grid place-items-center bg-black/55">
               <EqualizerBars className="text-white" />
+            </span>
+          ) : current && !previewing ? (
+            // Current track, paused: static ♪ (matches the playlist page).
+            <span className="absolute inset-0 grid place-items-center bg-black/55">
+              <span className="text-sm text-white">♪</span>
             </span>
           ) : interactive ? (
             <span
@@ -3934,7 +4420,7 @@ function ArtistTopSongs({
           className="min-w-0 flex-1 text-left disabled:cursor-default"
         >
           <div className="flex items-center gap-1.5 min-w-0">
-            <span className={`truncate text-sm font-medium ${current ? 'text-white' : 'text-neutral-100'}`}>
+            <span className={`truncate text-sm font-medium ${current ? 'text-accent' : 'text-neutral-300'}`}>
               {t.title}
             </span>
             {t.explicit ? <ExplicitBadge /> : null}
@@ -3943,44 +4429,61 @@ function ArtistTopSongs({
             <div className="truncate text-xs text-neutral-500">{t.album}</div>
           ) : null}
         </button>
-        {/* In a playlist → a persistent white ✓ (Spotify-style) that opens the
-            add-to-playlist picker to manage; otherwise a hover-revealed +. */}
-        <button
-          type="button"
-          onClick={() => onAdd(t)}
-          aria-label={
-            isInLibrary(t) ? 'Manage playlists for this track' : 'Add to playlist'
-          }
-          title={
-            isInLibrary(t)
-              ? `In ${t.in_playlist_ids.length} ${
-                  t.in_playlist_ids.length === 1 ? 'playlist' : 'playlists'
-                } — click to manage`
-              : 'Add to playlist'
-          }
-          className={cn(
-            'shrink-0 w-7 h-7 grid place-items-center rounded-full transition active:scale-95',
-            isInLibrary(t)
-              ? 'bg-white text-neutral-950 hover:bg-neutral-200'
-              : cn(
-                  'text-neutral-400 hover:text-neutral-100 hover:bg-neutral-800 active:bg-neutral-800',
-                  CAN_HOVER
-                    ? 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100'
-                    : 'opacity-100',
-                ),
-          )}
-        >
-          {isInLibrary(t) ? (
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-              <path d="m5 12 5 5 9-11" />
+        {onShowTrackSheet ? (
+          // Phone: the shared ⋯ action sheet (Favorite / Add / Go to Artist /
+          // Album) — same trailing control as every other music list.
+          <button
+            type="button"
+            aria-label={`More options for ${t.title}`}
+            onClick={() => onShowTrackSheet(t)}
+            className="h-11 w-9 -my-2 -mr-2 grid place-items-center text-neutral-500 active:text-neutral-200 shrink-0"
+          >
+            <svg width="19" height="19" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+              <circle cx="5" cy="12" r="1.7" />
+              <circle cx="12" cy="12" r="1.7" />
+              <circle cx="19" cy="12" r="1.7" />
             </svg>
-          ) : (
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-              <path d="M12 5v14" />
-              <path d="M5 12h14" />
-            </svg>
-          )}
-        </button>
+          </button>
+        ) : (
+          /* Desktop / show-all: in a playlist → a persistent white ✓ that opens
+             the add-to-playlist picker; otherwise a hover-revealed +. */
+          <button
+            type="button"
+            onClick={() => onAdd(t)}
+            aria-label={
+              isInLibrary(t) ? 'Manage playlists for this track' : 'Add to playlist'
+            }
+            title={
+              isInLibrary(t)
+                ? `In ${t.in_playlist_ids.length} ${
+                    t.in_playlist_ids.length === 1 ? 'playlist' : 'playlists'
+                  } — click to manage`
+                : 'Add to playlist'
+            }
+            className={cn(
+              'shrink-0 w-7 h-7 grid place-items-center rounded-full transition active:scale-95',
+              isInLibrary(t)
+                ? 'bg-white text-neutral-950 hover:bg-neutral-200'
+                : cn(
+                    'text-neutral-400 hover:text-neutral-100 hover:bg-neutral-800 active:bg-neutral-800',
+                    CAN_HOVER
+                      ? 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100'
+                      : 'opacity-100',
+                  ),
+            )}
+          >
+            {isInLibrary(t) ? (
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                <path d="m5 12 5 5 9-11" />
+              </svg>
+            ) : (
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                <path d="M12 5v14" />
+                <path d="M5 12h14" />
+              </svg>
+            )}
+          </button>
+        )}
       </div>
     );
   };
@@ -3990,9 +4493,166 @@ function ArtistTopSongs({
     return <div className="flex flex-col">{tracks.map((t, idx) => renderRow(t, idx))}</div>;
   }
 
-  // Artist page: columns of three on a horizontal shelf (with hover arrows).
+  // Desktop show-all: the numbered table every other track surface uses
+  // (playlist / album pages) — # · cover · Title · Album · Time · add, with a
+  // sticky column header. The # cell swaps to ▶ on hover and to equalizer
+  // bars / ♪ for the current row, matching the album page's convention.
+  if (layout === 'table') {
+    const grid =
+      'grid grid-cols-[2.5rem_3rem_minmax(0,1fr)_minmax(0,1fr)_5rem_2.5rem] gap-3 items-center';
+    return (
+      <div>
+        <div
+          className={`${grid} sticky top-14 z-20 px-2 py-2 text-xs uppercase tracking-wide text-neutral-500 border-b border-white/5 bg-neutral-950/60 backdrop-blur-xl`}
+        >
+          <span className="text-center">#</span>
+          <span></span>
+          <span>Title</span>
+          <span>Album</span>
+          <span className="text-right">Time</span>
+          <span></span>
+        </div>
+        {tracks.map((t, idx) => {
+          const previewing =
+            !!t.preview_url && playingPreviewUrl === t.preview_url;
+          const playable = canPlayNow(t);
+          const canPreview = !isPlayable(t) && !!t.preview_url;
+          const interactive = playable || canPreview;
+          const current = !!isTrackCurrent && isTrackCurrent(t);
+          const activate = () => {
+            if (playable) onPlay(t, tracks, idx);
+            else if (canPreview) onTogglePreview(t.preview_url as string);
+          };
+          return (
+            <div
+              key={`${t.source}:${t.source_id}:${idx}`}
+              onClick={interactive ? activate : undefined}
+              className={`group ${grid} px-2 py-1.5 rounded-lg transition-colors ${
+                interactive ? 'cursor-pointer hover:bg-white/5' : 'opacity-60'
+              }`}
+            >
+              <span className="relative grid place-items-center text-sm tabular-nums text-neutral-500">
+                {current && isPlaying && !previewing ? (
+                  <EqualizerBars className="text-accent" />
+                ) : current && !previewing ? (
+                  <span className="text-accent">♪</span>
+                ) : (
+                  <>
+                    <span
+                      className={
+                        interactive && CAN_HOVER ? 'group-hover:opacity-0' : ''
+                      }
+                    >
+                      {idx + 1}
+                    </span>
+                    {interactive && CAN_HOVER ? (
+                      <span className="absolute inset-0 grid place-items-center opacity-0 group-hover:opacity-100">
+                        {previewing ? (
+                          <svg className="h-3.5 w-3.5 text-white" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                            <rect x="6" y="5" width="4" height="14" rx="1" />
+                            <rect x="14" y="5" width="4" height="14" rx="1" />
+                          </svg>
+                        ) : (
+                          <svg className="h-4 w-4 text-white translate-x-[1px]" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                            <path d="M8 5v14l11-7z" />
+                          </svg>
+                        )}
+                      </span>
+                    ) : null}
+                  </>
+                )}
+              </span>
+              <span className="h-10 w-10 rounded overflow-hidden bg-neutral-800 grid place-items-center">
+                {t.album_art_url ? (
+                  <img
+                    src={t.album_art_url}
+                    alt=""
+                    loading="lazy"
+                    className="h-full w-full object-cover"
+                  />
+                ) : (
+                  <span className="text-neutral-600">♪</span>
+                )}
+              </span>
+              <span className="min-w-0">
+                <span className="flex items-center gap-1.5 min-w-0">
+                  <span
+                    className={`truncate text-sm font-medium ${
+                      current ? 'text-accent' : 'text-neutral-200'
+                    }`}
+                  >
+                    {t.title}
+                  </span>
+                  {t.explicit ? <ExplicitBadge /> : null}
+                </span>
+                {t.artists.length > 0 ? (
+                  <span className="block truncate text-xs text-neutral-500">
+                    {t.artists.join(', ')}
+                  </span>
+                ) : null}
+              </span>
+              <span className="truncate text-sm text-neutral-400">
+                {t.album ?? ''}
+              </span>
+              <span className="text-right text-sm tabular-nums text-neutral-400">
+                {t.duration_ms ? formatDuration(t.duration_ms) : ''}
+              </span>
+              <span
+                onClick={(e) => e.stopPropagation()}
+                className="grid place-items-center"
+              >
+                <button
+                  type="button"
+                  onClick={() => onAdd(t)}
+                  aria-label={
+                    isInLibrary(t)
+                      ? 'Manage playlists for this track'
+                      : 'Add to playlist'
+                  }
+                  title={
+                    isInLibrary(t)
+                      ? `In ${t.in_playlist_ids.length} ${
+                          t.in_playlist_ids.length === 1
+                            ? 'playlist'
+                            : 'playlists'
+                        } — click to manage`
+                      : 'Add to playlist'
+                  }
+                  className={cn(
+                    'w-7 h-7 grid place-items-center rounded-full transition active:scale-95',
+                    isInLibrary(t)
+                      ? 'bg-white text-neutral-950 hover:bg-neutral-200'
+                      : cn(
+                          'text-neutral-400 hover:text-neutral-100 hover:bg-neutral-800',
+                          CAN_HOVER
+                            ? 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100'
+                            : 'opacity-100',
+                        ),
+                  )}
+                >
+                  {isInLibrary(t) ? (
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                      <path d="m5 12 5 5 9-11" />
+                    </svg>
+                  ) : (
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                      <path d="M12 5v14" />
+                      <path d="M5 12h14" />
+                    </svg>
+                  )}
+                </button>
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    );
+  }
+
+  // Artist page: Apple-style paged columns of FOUR on a horizontal shelf —
+  // the next column peeks in from the right edge and pages with snap.
   const columns: SearchTrackResult[][] = [];
-  for (let i = 0; i < tracks.length; i += 3) columns.push(tracks.slice(i, i + 3));
+  for (let i = 0; i < tracks.length; i += 4) columns.push(tracks.slice(i, i + 4));
   return (
     <ShelfRow scrollerClassName="flex gap-x-6 overflow-x-auto overscroll-x-contain pb-1 snap-x [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
       {columns.map((col, ci) => (
@@ -4000,7 +4660,7 @@ function ArtistTopSongs({
           key={ci}
           className="flex flex-col shrink-0 w-[86%] lg:w-[calc(50%-0.75rem)] snap-start"
         >
-          {col.map((t, ri) => renderRow(t, ci * 3 + ri))}
+          {col.map((t, ri) => renderRow(t, ci * 4 + ri))}
         </div>
       ))}
     </ShelfRow>
@@ -4044,103 +4704,6 @@ function SectionHeader({
   );
 }
 
-const SHELF_SCROLLER =
-  'flex gap-3 overflow-x-auto overscroll-x-contain pb-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden';
-
-/** Apple-Music-style horizontal shelf: one scrollable row with a rounded
- *  ‹ › button on each side that fades in on hover and only appears when that
- *  direction can still scroll. `artClass` is the artwork's height (e.g.
- *  "h-36 sm:h-40" for albums) so the buttons center on the artwork, not the
- *  taller card; omit it to center on the full row height. `scrollerClassName`
- *  overrides the row's flex/gap. Hidden below `sm` — touch screens swipe.
- *  Exported so the Home shelves share the exact same arrow affordance. */
-export function ShelfRow({
-  artClass,
-  scrollerClassName = SHELF_SCROLLER,
-  children,
-}: {
-  artClass?: string;
-  scrollerClassName?: string;
-  children: React.ReactNode;
-}) {
-  const ref = useRef<HTMLDivElement>(null);
-  const [edges, setEdges] = useState({ left: false, right: false });
-
-  const update = useCallback(() => {
-    const el = ref.current;
-    if (!el) return;
-    setEdges({
-      left: el.scrollLeft > 8,
-      right: Math.ceil(el.scrollLeft + el.clientWidth) < el.scrollWidth - 8,
-    });
-  }, []);
-
-  useEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    update();
-    el.addEventListener('scroll', update, { passive: true });
-    const ro = new ResizeObserver(update);
-    ro.observe(el);
-    return () => {
-      el.removeEventListener('scroll', update);
-      ro.disconnect();
-    };
-  }, [update]);
-
-  const page = (dir: 1 | -1) => {
-    const el = ref.current;
-    if (!el) return;
-    el.scrollBy({ left: dir * el.clientWidth * 0.85, behavior: 'smooth' });
-  };
-
-  const arrow = (dir: 1 | -1, show: boolean) => (
-    <div
-      className={`pointer-events-none absolute z-10 hidden items-center sm:flex ${
-        artClass ? `top-0 ${artClass}` : 'inset-y-0'
-      } ${dir < 0 ? 'left-0 justify-start pl-1' : 'right-0 justify-end pr-1'}`}
-    >
-      <button
-        type="button"
-        aria-label={dir < 0 ? 'Scroll left' : 'Scroll right'}
-        tabIndex={-1}
-        onClick={() => page(dir)}
-        className={`grid h-16 w-10 place-items-center rounded-2xl bg-neutral-700/80 text-white shadow-xl ring-1 ring-white/10 backdrop-blur-md transition-opacity duration-200 ease-out hover:bg-neutral-600/90 ${
-          show
-            ? 'pointer-events-auto opacity-0 group-hover/shelf:opacity-100'
-            : 'pointer-events-none opacity-0'
-        }`}
-      >
-        <svg
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth={2.75}
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          className="h-6 w-6"
-          aria-hidden
-        >
-          <path d={dir < 0 ? 'M15 18l-6-6 6-6' : 'M9 18l6-6-6-6'} />
-        </svg>
-      </button>
-    </div>
-  );
-
-  return (
-    // Named group ("shelf") so the arrows' group-hover/shelf doesn't collide
-    // with the unnamed group-hover the song rows use for their own per-row hover
-    // (an unnamed group-hover matches ANY ancestor .group, which would light up
-    // every row at once when hovering anywhere in the shelf).
-    <div className="group/shelf relative">
-      <div ref={ref} className={scrollerClassName}>
-        {children}
-      </div>
-      {arrow(-1, edges.left)}
-      {arrow(1, edges.right)}
-    </div>
-  );
-}
 
 /**
  * Full-grid "show all" page for one artist-page section, reached via that
@@ -4163,6 +4726,10 @@ function ArtistShowAll({
   onTogglePreview,
   inline,
   escapeActive = true,
+  isTrackCurrent,
+  isPlaying,
+  onTogglePlay,
+  initial,
 }: {
   token: string;
   artist: SearchArtistResult;
@@ -4173,10 +4740,21 @@ function ArtistShowAll({
   /** Song handlers — only used by the 'songs' (Top Songs) show-all. */
   onPickTrack?: (t: SearchTrackResult) => void;
   onPlay?: (t: SearchTrackResult, list?: SearchTrackResult[], index?: number) => void;
+  /** Data the artist page already loaded (drill-in only) — seeds the grid so
+   *  it paints instantly with no fetch/skeleton flash. Section-matched: only
+   *  the field this section needs is read; anything else falls back to a fetch. */
+  initial?: ShowAllInitial;
   playingPreviewUrl?: string | null;
   onTogglePreview?: (url: string) => void;
   /** Desktop: render as a full inline page instead of a modal overlay. */
   inline?: boolean;
+  /** Now-playing awareness for the songs table (desktop): the current row
+   *  highlights + shows equalizer bars, like the playlist/album pages. */
+  isTrackCurrent?: (t: SearchTrackResult) => boolean;
+  isPlaying?: boolean;
+  /** Pause/resume the current playback — the hero/sticky Play toggles instead
+   *  of restarting when this section is already the active context. */
+  onTogglePlay?: () => void;
   /** Whether this is the topmost surface and should answer Escape. On the phone
    *  this page can stack OVER the still-mounted artist page (and an album can
    *  stack over it); only the top layer should close on a single Escape, else
@@ -4185,12 +4763,26 @@ function ArtistShowAll({
 }) {
   const wantAlbums = section === 'albums' || section === 'singles';
   const wantSongs = section === 'songs';
-  const [albums, setAlbums] = useState<SearchAlbumResult[] | null>(null);
-  const [related, setRelated] = useState<SearchArtistResult[] | null>(null);
-  const [topTracks, setTopTracks] = useState<SearchTrackResult[] | null>(null);
+  // Seed from the artist page's already-loaded data (drill-in): a non-null
+  // start means the fetch effect below sees data present and skips the request.
+  // Keyed remount per section, so these lazy initializers run fresh each open.
+  // `related` from the artist page is already rank-sorted, so don't re-rank.
+  const [albums, setAlbums] = useState<SearchAlbumResult[] | null>(
+    () => initial?.albums ?? null,
+  );
+  const [related, setRelated] = useState<SearchArtistResult[] | null>(
+    () => initial?.related ?? null,
+  );
+  const [topTracks, setTopTracks] = useState<SearchTrackResult[] | null>(
+    () => initial?.topTracks ?? null,
+  );
+  // Spotify-style condensed header: once the hero title scrolls under the top
+  // bar the compact sticky Play bar fades in (desktop) — the same trigger the
+  // artist / album / playlist pages use.
+  const [condensed, heroSentinelRef] = useCondensedHeader();
 
   useEffect(() => {
-    if (!wantAlbums) return;
+    if (!wantAlbums || albums !== null) return; // seeded or already fetched
     let cancelled = false;
     getArtistAlbums(artist.source_id, token)
       .then((rows) => {
@@ -4210,10 +4802,10 @@ function ArtistShowAll({
     return () => {
       cancelled = true;
     };
-  }, [wantAlbums, artist.source_id, artist.name, token]);
+  }, [wantAlbums, albums, artist.source_id, artist.name, token]);
 
   useEffect(() => {
-    if (section !== 'related') return;
+    if (section !== 'related' || related !== null) return;
     let cancelled = false;
     getArtistRelated(artist.source_id, token)
       .then((rows) => {
@@ -4225,10 +4817,10 @@ function ArtistShowAll({
     return () => {
       cancelled = true;
     };
-  }, [section, artist.source_id, token]);
+  }, [section, related, artist.source_id, token]);
 
   useEffect(() => {
-    if (!wantSongs) return;
+    if (!wantSongs || topTracks !== null) return;
     let cancelled = false;
     getArtistTopTracks(artist.source_id, token)
       .then((rows) => {
@@ -4240,7 +4832,7 @@ function ArtistShowAll({
     return () => {
       cancelled = true;
     };
-  }, [wantSongs, artist.source_id, token]);
+  }, [wantSongs, topTracks, artist.source_id, token]);
 
   useEffect(() => {
     if (!escapeActive) return;
@@ -4281,6 +4873,75 @@ function ArtistShowAll({
       ? topTracks === null
       : related === null;
 
+  // Hero / sticky Play: ONLY the songs page gets one — it plays its own list
+  // (toggling pause when those tracks are already the active context, like
+  // the artist/album/playlist pages). The Albums / Singles & EPs / Similar
+  // grids get no Play at all: what "play an albums grid" means is ambiguous,
+  // so the button read as noise there.
+  const contextActive =
+    !!isTrackCurrent && !!topTracks && topTracks.some((t) => isTrackCurrent(t));
+  const contextPlaying = contextActive && !!isPlaying;
+  const headerPlay = wantSongs
+    ? () => {
+        if (contextActive && onTogglePlay) onTogglePlay();
+        else if (topTracks && topTracks.length > 0)
+          onPlay?.(topTracks[0], topTracks, 0);
+      }
+    : undefined;
+
+  // Desktop hero: artist round art · artist-name eyebrow · big section title ·
+  // round Play — the same header language as the artist/album pages (the
+  // default ModalShell title block read as unstyled next to them). The phone
+  // keeps the shell's own compact header.
+  const hero = inline ? (
+    <div className="px-4 pt-6 pb-2">
+      <div className="flex items-end gap-5">
+        {artist.picture_url ? (
+          <img
+            src={artist.picture_url}
+            alt=""
+            className="h-28 w-28 shrink-0 rounded-full object-cover shadow-lg"
+            draggable={false}
+          />
+        ) : null}
+        <div className="min-w-0 flex-1 pb-1">
+          <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-neutral-400">
+            {artist.name}
+          </div>
+          {/* Condensed-header trigger ABOVE the title (not below, like the
+              taller artist/album heroes): the bar takes over as soon as the
+              title starts sliding under the top bar. Below-the-title, a short
+              page (10 top songs) can't scroll far enough to ever trip it. */}
+          <div ref={heroSentinelRef} aria-hidden className="h-px w-px" />
+          <h1 className="mt-1 text-3xl sm:text-5xl font-extrabold tracking-tight leading-[1.05] break-words">
+            {title}
+          </h1>
+        </div>
+        {/* Play rides the title's baseline at the row's end — a lone button
+            stranded on its own line below read as misplaced. Songs only. */}
+        {headerPlay ? (
+          <button
+            type="button"
+            onClick={headerPlay}
+            aria-label={contextPlaying ? 'Pause' : `Play ${title}`}
+            title={contextPlaying ? 'Pause' : `Play ${title}`}
+            className="mb-1 grid h-12 w-12 shrink-0 place-items-center rounded-full bg-neutral-100 text-neutral-950 shadow-lg transition hover:bg-white hover:scale-105 active:scale-95"
+          >
+            {contextPlaying ? (
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                <path d="M7 5h3.5v14H7zM13.5 5H17v14h-3.5z" />
+              </svg>
+            ) : (
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                <path d="M8 5.14v13.72a1 1 0 0 0 1.5.86l11-6.86a1 1 0 0 0 0-1.72l-11-6.86A1 1 0 0 0 8 5.14z" />
+              </svg>
+            )}
+          </button>
+        ) : null}
+      </div>
+    </div>
+  ) : undefined;
+
   return (
     <ModalShell
       title={title}
@@ -4288,6 +4949,17 @@ function ArtistShowAll({
       onClose={onClose}
       wide
       inline={inline}
+      hero={hero}
+      stickyBar={
+        inline ? (
+          <CondensedHeaderBar
+            condensed={condensed}
+            title={`${artist.name} · ${title}`}
+            onPlay={headerPlay}
+            playing={headerPlay ? contextPlaying : undefined}
+          />
+        ) : undefined
+      }
     >
       <div className="px-4 pt-4 pb-4">
         {loading ? (
@@ -4311,11 +4983,15 @@ function ArtistShowAll({
         ) : wantSongs ? (
           <ArtistTopSongs
             tracks={topTracks ?? []}
-            layout="list"
+            // Desktop: the numbered table every other track surface uses;
+            // phone keeps the compact art+title rows (its playlist look).
+            layout={inline ? 'table' : 'list'}
             onAdd={(t) => onPickTrack?.(t)}
             onPlay={(t, list, index) => onPlay?.(t, list, index)}
             playingPreviewUrl={playingPreviewUrl ?? null}
             onTogglePreview={(url) => onTogglePreview?.(url)}
+            isTrackCurrent={isTrackCurrent}
+            isPlaying={isPlaying}
           />
         ) : (
           <ArtistGrid
@@ -4328,6 +5004,18 @@ function ArtistShowAll({
       </div>
     </ModalShell>
   );
+}
+
+/** The saved-album playlist id shared by EVERY track of an album (⇒ the album
+ *  is saved to the library), or null. Profile-scoped: the tracks come from a
+ *  profile-scoped fetch, so `in_saved_album_ids` already reflects the caller's
+ *  profile. Intersecting across tracks is what the album page does too. */
+function sharedSavedAlbumId(tracks: SearchTrackResult[]): number | null {
+  if (!tracks.length) return null;
+  const shared = tracks
+    .map((t) => new Set(t.in_saved_album_ids ?? []))
+    .reduce((acc, ids) => new Set([...acc].filter((id) => ids.has(id))));
+  return [...shared][0] ?? null;
 }
 
 /**
@@ -4350,9 +5038,13 @@ export function ArtistDetailModal({
   inline,
   escapeActive = true,
   pin,
+  save,
   isTrackCurrent,
   isPlaying,
   onTogglePlay,
+  onShowTrackSheet,
+  onPickPlaylist,
+  onAddAlbum,
 }: {
   token: string;
   artist: SearchArtistResult;
@@ -4362,7 +5054,7 @@ export function ArtistDetailModal({
   onPlay: (t: SearchTrackResult, list?: SearchTrackResult[], index?: number) => void;
   onPickArtist: (a: SearchArtistResult) => void;
   /** Open one section's full grid (the › chevron). Omitted ⇒ no chevrons. */
-  onShowAll?: (section: ShowAllSection) => void;
+  onShowAll?: (section: ShowAllSection, initial?: ShowAllInitial) => void;
   playingPreviewUrl: string | null;
   onTogglePreview: (url: string) => void;
   /** Desktop: render as a full page instead of a modal overlay. */
@@ -4373,6 +5065,8 @@ export function ArtistDetailModal({
    *  collapses the whole stack. Defaults true. */
   escapeActive?: boolean;
   pin?: SidebarPinController;
+  /** Save-to-library control (Library › Artists). Desktop only for now. */
+  save?: SavedArtistController;
   /** Now-playing awareness (desktop), so the artist page mirrors the album /
    *  playlist pages: a ⏸/▶ hero + sticky Play button, the current Top-Songs row
    *  highlights + shows equalizer bars, and the album card of the playing album
@@ -4380,12 +5074,39 @@ export function ArtistDetailModal({
   isTrackCurrent?: (t: SearchTrackResult) => boolean;
   isPlaying?: boolean;
   onTogglePlay?: () => void;
+  /** Phone: open the per-song ⋯ action sheet on the Top-Songs rows. */
+  onShowTrackSheet?: (t: SearchTrackResult) => void;
+  /** Open a catalog playlist (the Artist Playlists rail). Omitted ⇒ rail hidden. */
+  onPickPlaylist?: (p: CatalogPlaylistSummary) => void;
+  /** Import an album into the library (the Latest Release + button).
+   *  Omitted ⇒ no + button. */
+  onAddAlbum?: (a: SearchAlbumResult) => Promise<void> | void;
 }) {
   const [albums, setAlbums] = useState<SearchAlbumResult[] | null>(null);
   const [topTracks, setTopTracks] = useState<SearchTrackResult[] | null>(null);
   const [related, setRelated] = useState<SearchArtistResult[] | null>(null);
   const [bio, setBio] = useState<ArtistBio | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Apple-style About: the bio clamps to a few lines with a MORE toggle.
+  // (No reset needed — the modal remounts per artist via key=source_id.)
+  const [bioExpanded, setBioExpanded] = useState(false);
+  // Apple-style rails, both best-effort (empty just hides the section):
+  // albums by OTHERS featuring this artist, and catalog playlists about them.
+  const [appearsOn, setAppearsOn] = useState<SearchAlbumResult[]>([]);
+  const [artistPlaylists, setArtistPlaylists] = useState<
+    CatalogPlaylistSummary[]
+  >([]);
+  // Latest Release +/✓ button. Reflects whether the album is ACTUALLY in the
+  // library (derived below from the featured album's tracks), so the ✓ persists
+  // across revisits and the button toggles rather than being a one-shot "added"
+  // that disables itself. `featuredSavedId` is the saved-album playlist id we
+  // delete to un-save. The toggle updates it optimistically (no re-fetch that
+  // would flash the button through its other glyph — see the onClick below).
+  const [featuredSavedId, setFeaturedSavedId] = useState<number | null>(null);
+  const [latestBusy, setLatestBusy] = useState(false);
+  // Phone hero ⋯ menu (Apple-Music-style): Save / Pin / Shuffle live here
+  // instead of as hero buttons, so the hero carries a single Play action.
+  const [heroMenu, setHeroMenu] = useState<MenuState | null>(null);
   // Track count for the Featured Album. The artist-albums endpoint elides
   // nb_tracks, so when it's missing we fetch the album's tracks once and count
   // them — Apple-style "N songs" instead of a redundant "Album" label.
@@ -4404,25 +5125,58 @@ export function ArtistDetailModal({
     )[0];
   }, [albums]);
 
+  // "Essential Albums" — Apple curates theirs editorially; we have no editorial
+  // signal, so the Top Songs ARE the signal: rank full albums by how many top
+  // songs they carry and keep the ones with at least two. Popularity-derived,
+  // honest, and zero extra requests.
+  const essentials = useMemo(() => {
+    if (!albums || !topTracks || topTracks.length === 0) return [];
+    const counts = new Map<string, number>();
+    for (const t of topTracks) {
+      if (t.album) counts.set(t.album, (counts.get(t.album) ?? 0) + 1);
+    }
+    return albums
+      .filter((a) => {
+        const ty = (a.album_type ?? '').toLowerCase();
+        return ty !== 'single' && ty !== 'ep';
+      })
+      .map((a) => ({ a, n: counts.get(a.name) ?? 0 }))
+      .filter((x) => x.n >= 2)
+      .sort((x, y) => y.n - x.n)
+      .slice(0, 3)
+      .map((x) => x.a);
+  }, [albums, topTracks]);
+
+  // Re-fetch this artist page's fetched membership/saved indicators when the
+  // library changes elsewhere (a Top Song added to a playlist via its ⋯ picker,
+  // or the Latest Release saved from its own album page) — the modal floats over
+  // the results, so without this the ✓ marks stay as captured when it opened.
+  const libTick = useLibraryChangeTick();
+
   useEffect(() => {
     setFeaturedCount(null);
+    setFeaturedSavedId(null);
     if (!featured) return;
-    if (featured.total_tracks != null) {
-      setFeaturedCount(featured.total_tracks);
-      return;
-    }
+    // Always fetch the tracks (not just when the count is missing): they're
+    // profile-scoped, so their `in_saved_album_ids` tell us whether the album
+    // is saved. Same signal the album page uses — the album is saved iff every
+    // track shares one saved-album playlist id, which is what we delete to
+    // un-save.
     let cancelled = false;
     getAlbumTracks(featured.source_id, token)
       .then((tracks) => {
-        if (!cancelled) setFeaturedCount(tracks.length);
+        if (cancelled) return;
+        setFeaturedCount(featured.total_tracks ?? tracks.length);
+        setFeaturedSavedId(sharedSavedAlbumId(tracks));
       })
       .catch(() => {
-        /* leave null → falls back to the album-type label */
+        // Leave count on the album's own total (or null → album-type label).
+        if (!cancelled) setFeaturedCount(featured.total_tracks ?? null);
       });
     return () => {
       cancelled = true;
     };
-  }, [featured, token]);
+  }, [featured, token, libTick]);
 
   // Albums are the primary section; a failure here surfaces the banner.
   useEffect(() => {
@@ -4465,7 +5219,7 @@ export function ArtistDetailModal({
     return () => {
       cancelled = true;
     };
-  }, [artist.source_id, token]);
+  }, [artist.source_id, token, libTick]);
 
   useEffect(() => {
     let cancelled = false;
@@ -4487,6 +5241,33 @@ export function ArtistDetailModal({
     getArtistBio(artist.name, token)
       .then((b) => {
         if (!cancelled) setBio(b);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [artist.name, token]);
+
+  // "Appears On" — features on other artists' records (server heuristic).
+  useEffect(() => {
+    let cancelled = false;
+    getArtistAppearsOn(artist.name, token)
+      .then((rows) => {
+        if (!cancelled) setAppearsOn(rows);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [artist.name, token]);
+
+  // "Artist Playlists" — catalog playlists surfacing this artist (Apple's rail,
+  // minus the editorial branding). Plain name search; relevance is decent.
+  useEffect(() => {
+    let cancelled = false;
+    searchCatalog(artist.name, token, 'playlist', 12)
+      .then((r) => {
+        if (!cancelled) setArtistPlaylists((r.playlists ?? []).slice(0, 8));
       })
       .catch(() => {});
     return () => {
@@ -4530,6 +5311,109 @@ export function ArtistDetailModal({
       inline={inline}
       condensed={condensed}
       onHeaderPlay={headerPlay}
+      headerPlaying={contextPlaying}
+      headerExtra={
+        // Phone: a one-tap Save (+ → ✓, the album-save convention) next to a
+        // ⋯ menu at the bar's right edge, Apple-Music-style — the hero itself
+        // carries only Play. Desktop keeps its explicit button row instead.
+        !inline ? (
+          <>
+          <button
+            type="button"
+            aria-label={`More options for ${artist.name}`}
+            onClick={(e) => {
+              const items: MenuItem[] = [];
+              if (topTracks && topTracks.length > 0) {
+                items.push({
+                  label: 'Shuffle play',
+                  icon: MenuGlyphs.play,
+                  onClick: () => {
+                    const shuffled = [...topTracks];
+                    for (let i = shuffled.length - 1; i > 0; i--) {
+                      const j = Math.floor(Math.random() * (i + 1));
+                      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+                    }
+                    onPlay(shuffled[0], shuffled, 0);
+                  },
+                });
+              }
+              if (save) {
+                items.push({
+                  label: save.isSaved(artist.name)
+                    ? 'Remove from Library'
+                    : 'Save to Library',
+                  icon: MenuGlyphs.star,
+                  onClick: () =>
+                    save.toggle({
+                      key: artist.name,
+                      name: artist.name,
+                      art: artist.picture_url ?? null,
+                    }),
+                });
+              }
+              if (pin) {
+                items.push({
+                  label: pin.isArtistPinned(artist.name)
+                    ? 'Unpin from Sidebar'
+                    : 'Pin to Sidebar',
+                  icon: MenuGlyphs.pin,
+                  onClick: () =>
+                    pin.toggleArtist({
+                      key: artist.name,
+                      name: artist.name,
+                      art: artist.picture_url ?? null,
+                    }),
+                });
+              }
+              if (items.length > 0) {
+                setHeroMenu({ x: e.clientX, y: e.clientY, items });
+              }
+            }}
+            className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-black/30 text-neutral-100 backdrop-blur-md active:bg-white/15"
+          >
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+              <circle cx="5" cy="12" r="1.7" />
+              <circle cx="12" cy="12" r="1.7" />
+              <circle cx="19" cy="12" r="1.7" />
+            </svg>
+          </button>
+          {save ? (
+            <button
+              type="button"
+              aria-label={
+                save.isSaved(artist.name)
+                  ? `Remove ${artist.name} from library`
+                  : `Save ${artist.name} to library`
+              }
+              onClick={() =>
+                save.toggle({
+                  key: artist.name,
+                  name: artist.name,
+                  art: artist.picture_url ?? null,
+                })
+              }
+              className={cn(
+                'grid h-8 w-8 shrink-0 place-items-center rounded-full backdrop-blur-md transition active:scale-95',
+                save.isSaved(artist.name)
+                  ? 'bg-white text-neutral-950'
+                  : 'bg-black/30 text-neutral-100 active:bg-white/15',
+              )}
+            >
+              {save.isSaved(artist.name) ? (
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                  <path d="m5 12 5 5 9-11" />
+                </svg>
+              ) : (
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                  <path d="M12 5v14" />
+                  <path d="M5 12h14" />
+                </svg>
+              )}
+            </button>
+          ) : null}
+          </>
+        ) : undefined
+      }
       stickyBar={
         <CondensedHeaderBar
           condensed={condensed}
@@ -4539,15 +5423,73 @@ export function ArtistDetailModal({
         />
       }
       hero={
-        // Spotify playlist-header style: a full, uncropped square of the
-        // artist photo on the left with the name + listener count written
+        !inline ? (
+          // Phone: Apple-Music hero — the PHOTO is the header. Full-bleed
+          // square running up behind the translucent top bar, the name overlaid
+          // on a legibility scrim, and a single accent Play on the photo. The
+          // secondary actions (Save / Pin / Shuffle) live in the bar's ⋯ menu.
+          <div className="relative overflow-hidden">
+            <div className="relative w-full aspect-square max-h-[58vh] bg-neutral-800">
+              {artist.picture_url ? (
+                <img
+                  src={artist.picture_url}
+                  alt=""
+                  className="h-full w-full object-cover"
+                  draggable={false}
+                />
+              ) : (
+                <div className="grid h-full w-full place-items-center text-6xl text-neutral-600">
+                  ♪
+                </div>
+              )}
+              <div
+                aria-hidden
+                className="absolute inset-x-0 bottom-0 h-44 bg-gradient-to-t from-black/75 via-black/30 to-transparent"
+              />
+              <h2 className="absolute bottom-4 left-4 right-20 text-4xl font-extrabold tracking-tight leading-[1.02] drop-shadow break-words">
+                {artist.name}
+              </h2>
+              {topTracks && topTracks.length > 0 ? (
+                <button
+                  type="button"
+                  onClick={headerPlay}
+                  aria-label={contextPlaying ? 'Pause' : `Play ${artist.name}`}
+                  className="absolute bottom-4 right-4 grid h-12 w-12 place-items-center rounded-full bg-white text-neutral-950 shadow-lg transition active:scale-95"
+                >
+                  {contextPlaying ? (
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                      <path d="M7 5h3.5v14H7zM13.5 5H17v14h-3.5z" />
+                    </svg>
+                  ) : (
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                      <path d="M8 5.14v13.72a1 1 0 0 0 1.5.86l11-6.86a1 1 0 0 0 0-1.72l-11-6.86A1 1 0 0 0 8 5.14z" />
+                    </svg>
+                  )}
+                </button>
+              ) : null}
+            </div>
+            {/* Condensed-header trigger: the bar's title/play fade in once the
+                photo (and the name on it) scrolls past. */}
+            <div ref={heroSentinelRef} aria-hidden className="h-px w-px" />
+            {/* Listener/album fallback when there's no bio to carry it. */}
+            {!bio && artist.total_fans ? (
+              <div className="px-4 pt-3 text-sm font-medium text-neutral-200">
+                {formatCompact(artist.total_fans)} listeners
+              </div>
+            ) : !bio && artist.total_albums ? (
+              <div className="px-4 pt-3 text-xs text-neutral-300">
+                {artist.total_albums} albums on Deezer
+              </div>
+            ) : null}
+          </div>
+        ) : (
+        // Desktop: Spotify playlist-header style — a full, uncropped square of
+        // the artist photo on the left with the name + listener count written
         // out beside it, over a colour wash pulled from a blurred copy of
         // the same photo (so we don't need a colour-extraction step).
         <div className="relative overflow-hidden">
           <HeroWash coverUrl={artist.picture_url} />
-          {/* Desktop card sits below the header (pt-6); the phone modal still
-              bleeds up behind its bar via -mt-14, so it keeps pt-20. */}
-          <div className={`relative flex items-end gap-4 sm:gap-5 px-5 sm:px-6 pb-5 sm:pb-6 ${inline ? 'pt-6' : 'pt-20'}`}>
+          <div className="relative flex items-end gap-4 sm:gap-5 px-5 sm:px-6 pb-5 sm:pb-6 pt-6">
             <div className="h-36 w-36 sm:h-52 sm:w-52 shrink-0 rounded-xl overflow-hidden bg-neutral-800 grid place-items-center shadow-2xl">
               {artist.picture_url ? (
                 <img
@@ -4570,7 +5512,7 @@ export function ArtistDetailModal({
               {/* Condensed-header trigger: once this scrolls under the top bar,
                   the compact sticky bar fades in (desktop). */}
               <div ref={heroSentinelRef} aria-hidden className="h-px w-px" />
-              {/* Listeners live in the About section's stat column when there's
+              {/* Listeners live under the About section's heading when there's
                   a bio; show them here only as a fallback so the banner isn't
                   redundant with About. */}
               {!bio && artist.total_fans ? (
@@ -4605,7 +5547,13 @@ export function ArtistDetailModal({
                     <button
                       type="button"
                       onClick={() => {
-                        const shuffled = [...topTracks].sort(() => Math.random() - 0.5);
+                        // Fisher-Yates — sort(() => Math.random() - 0.5) is a
+                        // biased shuffle (comparators must be consistent).
+                        const shuffled = [...topTracks];
+                        for (let i = shuffled.length - 1; i > 0; i--) {
+                          const j = Math.floor(Math.random() * (i + 1));
+                          [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+                        }
                         onPlay(shuffled[0], shuffled, 0);
                       }}
                       aria-label="Shuffle play"
@@ -4617,6 +5565,18 @@ export function ArtistDetailModal({
                       </svg>
                     </button>
                   </>
+                ) : null}
+                {save ? (
+                  <SaveArtistButton
+                    saved={save.isSaved(artist.name)}
+                    onClick={() =>
+                      save.toggle({
+                        key: artist.name,
+                        name: artist.name,
+                        art: artist.picture_url ?? null,
+                      })
+                    }
+                  />
                 ) : null}
                 {pin ? (
                   <PinButton
@@ -4634,6 +5594,7 @@ export function ArtistDetailModal({
             </div>
           </div>
         </div>
+        )
       }
     >
       <div className="flex flex-col gap-6 px-4 pt-4 pb-4">
@@ -4655,17 +5616,19 @@ export function ArtistDetailModal({
               {featured ? (
                 <div className="min-w-0">
                   <div className="text-lg font-bold tracking-tight px-1 mb-2">
-                    Featured Album
+                    Latest Release
                   </div>
-                  {/* Cover + metadata side by side (Apple-Music style): the
-                      cover is sized to roughly the 3-song Top Songs column and
-                      the date / name / track count sit to its right. */}
-                  <button
-                    type="button"
-                    onClick={() => onPickAlbum(featured)}
-                    className="group flex items-center gap-4 text-left w-full"
-                  >
-                    <div className="aspect-square w-44 shrink-0 rounded-lg overflow-hidden bg-neutral-800 grid place-items-center shadow-lg">
+                  {/* Cover + metadata side by side, Apple-Music style: tiny
+                      uppercase DATE eyebrow, title, track count, and a circular
+                      + that imports the album. The + is a sibling (not nested in
+                      the open-album button) — nested buttons are invalid HTML. */}
+                  <div className="group flex items-center gap-4 w-full">
+                    <button
+                      type="button"
+                      onClick={() => onPickAlbum(featured)}
+                      aria-label={`Open ${featured.name}`}
+                      className="aspect-square w-44 shrink-0 rounded-lg overflow-hidden bg-neutral-800 grid place-items-center shadow-lg"
+                    >
                       {featured.cover_url ? (
                         <img
                           src={featured.cover_url}
@@ -4676,23 +5639,91 @@ export function ArtistDetailModal({
                       ) : (
                         <span className="text-3xl text-neutral-600">♪</span>
                       )}
-                    </div>
+                    </button>
                     <div className="min-w-0">
                       {featured.release_date && (
-                        <div className="text-xs text-neutral-400">
+                        <div className="text-[11px] uppercase tracking-wide text-neutral-400">
                           {formatReleaseDate(featured.release_date)}
                         </div>
                       )}
-                      <div className="font-semibold line-clamp-2 group-hover:underline mt-1">
+                      <button
+                        type="button"
+                        onClick={() => onPickAlbum(featured)}
+                        className="block text-left font-semibold line-clamp-2 hover:underline mt-1"
+                      >
                         {featured.name}
-                      </div>
+                      </button>
                       <div className="text-sm text-neutral-400 mt-1">
                         {featuredCount != null
                           ? `${featuredCount} ${featuredCount === 1 ? 'song' : 'songs'}`
                           : albumTypeLabel(featured.album_type)}
                       </div>
+                      {onAddAlbum ? (
+                        <button
+                          type="button"
+                          aria-label={
+                            featuredSavedId != null
+                              ? `Remove ${featured.name} from library`
+                              : `Add ${featured.name} to library`
+                          }
+                          disabled={latestBusy}
+                          onClick={async () => {
+                            if (latestBusy) return;
+                            setLatestBusy(true);
+                            try {
+                              if (featuredSavedId != null) {
+                                await deletePlaylist(featuredSavedId, token);
+                                if (typeof window !== 'undefined')
+                                  notifyLibraryChanged();
+                                // Un-saved: null is authoritative (we just
+                                // deleted it). Set it in the same tick the
+                                // spinner clears → ✓ → +, no stale re-fetch that
+                                // could flash the ✓ back.
+                                setFeaturedSavedId(null);
+                              } else {
+                                await onAddAlbum(featured);
+                                // Re-derive the new saved-album id INLINE, while
+                                // the spinner still shows, so the button goes
+                                // loading → ✓ directly (no flash back through +)
+                                // and the ✓ can remove on the next click.
+                                const tracks = await getAlbumTracks(
+                                  featured.source_id,
+                                  token,
+                                );
+                                setFeaturedSavedId(sharedSavedAlbumId(tracks));
+                              }
+                            } catch {
+                              /* leave the control as-is on failure */
+                            } finally {
+                              setLatestBusy(false);
+                            }
+                          }}
+                          className={cn(
+                            'mt-3 h-8 w-8 grid place-items-center rounded-full transition active:scale-95',
+                            featuredSavedId != null
+                              ? 'bg-white text-neutral-950 hover:bg-neutral-200'
+                              : 'bg-white/10 text-neutral-100 hover:bg-white/20',
+                          )}
+                        >
+                          {latestBusy ? (
+                            <span
+                              aria-hidden
+                              className="h-4 w-4 rounded-full border-2 border-neutral-400 border-t-transparent animate-spin"
+                            />
+                          ) : featuredSavedId != null ? (
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                              <path d="m5 12 5 5 9-11" />
+                            </svg>
+                          ) : (
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                              <path d="M12 5v14" />
+                              <path d="M5 12h14" />
+                            </svg>
+                          )}
+                        </button>
+                      ) : null}
                     </div>
-                  </button>
+                  </div>
                 </div>
               ) : (
                 <div className="hidden lg:block" />
@@ -4702,7 +5733,7 @@ export function ArtistDetailModal({
                   label="Top Songs"
                   onShowAll={
                     onShowAll && topTracks && topTracks.length > 6
-                      ? () => onShowAll('songs')
+                      ? () => onShowAll('songs', { topTracks })
                       : undefined
                   }
                 />
@@ -4719,12 +5750,53 @@ export function ArtistDetailModal({
                     onTogglePreview={onTogglePreview}
                     isTrackCurrent={isTrackCurrent}
                     isPlaying={isPlaying}
+                    onShowTrackSheet={onShowTrackSheet}
                   />
                 ) : null}
               </div>
             </div>
           );
         })()}
+
+        {/* Essential Albums — Apple curates theirs; ours are the albums that
+            carry the most Top Songs (see `essentials`). Giant one-card-per-page
+            snap carousel, matching Apple's oversized treatment. */}
+        {essentials.length > 0 ? (
+          <div>
+            <SectionHeader label="Essential Albums" />
+            <div className="flex gap-4 overflow-x-auto overscroll-x-contain snap-x pb-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+              {essentials.map((a) => (
+                <button
+                  key={`${a.source}:${a.source_id}`}
+                  type="button"
+                  onClick={() => onPickAlbum(a)}
+                  className="group w-[85%] sm:w-[22rem] shrink-0 snap-start text-left"
+                >
+                  <div className="aspect-square w-full rounded-xl overflow-hidden bg-neutral-800 grid place-items-center shadow-lg">
+                    {a.cover_url ? (
+                      <img
+                        src={a.cover_url}
+                        alt=""
+                        loading="lazy"
+                        className="h-full w-full object-cover"
+                      />
+                    ) : (
+                      <span className="text-4xl text-neutral-600">♪</span>
+                    )}
+                  </div>
+                  <div className="mt-2 font-semibold group-hover:underline truncate">
+                    {a.name}
+                  </div>
+                  {a.release_date ? (
+                    <div className="text-sm text-neutral-400">
+                      {a.release_date.slice(0, 4)}
+                    </div>
+                  ) : null}
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : null}
 
         {/* Albums + Singles & EPs — separate sections like Apple Music, each
             newest-first and collapsed to a preview with a "Show all" toggle so
@@ -4766,7 +5838,9 @@ export function ArtistDetailModal({
                     label={label}
                     onShowAll={
                       onShowAll && items.length > 4
-                        ? () => onShowAll(key)
+                        ? // Seed with the FULL discography (the show-all
+                          // re-splits it into albums vs singles), not `items`.
+                          () => onShowAll(key, albums ? { albums } : undefined)
                         : undefined
                     }
                   />
@@ -4792,1524 +5866,160 @@ export function ArtistDetailModal({
           })()
         )}
 
-        {/* About — Apple-style: "About <Name>" heading, the bio in a readable,
-            constrained column, and a small stat column (listeners) on the right.
-            A clean bordered card gives it clear separation. */}
-        {bio ? (
+        {/* Artist Playlists — catalog playlists surfacing this artist (Apple's
+            rail, minus the editorial branding). */}
+        {onPickPlaylist && artistPlaylists.length > 0 ? (
           <div>
-            <h2 className="text-lg font-bold tracking-tight px-1 mb-3">
-              About {artist.name}
-            </h2>
-            <div className="rounded-xl bg-neutral-900/50 border border-white/5 px-6 py-5 flex flex-col md:flex-row gap-6 md:gap-12">
-              <div className="flex-1 min-w-0">
-                <p className="max-w-2xl text-[15px] leading-relaxed text-neutral-300 whitespace-pre-line">
-                  {bio.extract}
-                </p>
-                {bio.url ? (
-                  <a
-                    href={bio.url}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="inline-block mt-4 text-sm font-medium text-neutral-200 hover:text-white underline underline-offset-2"
-                  >
-                    Read more on Wikipedia →
-                  </a>
-                ) : null}
-              </div>
-              {artist.total_fans ? (
-                <div className="shrink-0 md:w-40">
-                  <div className="text-[11px] uppercase tracking-wide text-neutral-500">
-                    Listeners
-                  </div>
-                  <div className="text-base text-neutral-100 mt-1">
-                    {formatCompact(artist.total_fans)}
-                  </div>
-                </div>
-              ) : null}
-            </div>
-          </div>
-        ) : null}
-
-        {/* Similar Artists — related artists in a horizontal carousel (Apple
-            Music's last section); tapping drills into one. */}
-        {related && related.length > 0 ? (
-          <div>
-            <SectionHeader
-              label="Similar Artists"
-              onShowAll={
-                onShowAll && related.length > 5
-                  ? () => onShowAll('related')
-                  : undefined
-              }
-            />
-            <ArtistGrid
-              artists={related}
-              onOpen={onPickArtist}
-              onPlay={(a) => playArtistCard(a, token, onPlay)}
+            <SectionHeader label="Artist Playlists" />
+            <PlaylistGrid
+              playlists={artistPlaylists}
+              onOpen={onPickPlaylist}
               layout="row"
             />
           </div>
         ) : null}
-      </div>
-    </ModalShell>
-  );
-}
 
-/**
- * "Downloaded" indicator — a verified-style seal with a check, shown only for
- * catalog/album tracks whose audio is already on the device (`has_audio`). Its
- * absence means "not downloaded". Mirrors the desktop `TrackRow` badge, which
- * lives in a desktop-only module that can't be imported into this shared file,
- * so it's reimplemented inline here.
- */
-function AlbumDownloadedBadge() {
-  // Spotify-style "downloaded / available offline" mark — a green DOWN-ARROW
-  // (not a check), so it reads distinctly from the green ✓ that means "in a
-  // playlist": ↓ = on this device, ✓ = saved to a playlist.
-  return (
-    <svg
-      viewBox="0 0 24 24"
-      className="h-[17px] w-[17px] text-neutral-500"
-      fill="currentColor"
-      role="img"
-      aria-label="Downloaded"
-    >
-      <title>Downloaded</title>
-      <path d="M13 3a1 1 0 1 0-2 0v9.6l-3.3-3.3a1 1 0 0 0-1.4 1.4l5 5a1 1 0 0 0 1.4 0l5-5a1 1 0 0 0-1.4-1.4L13 12.6V3Z" />
-      <path d="M5 19.5a1 1 0 1 0 0 2h14a1 1 0 1 0 0-2H5Z" />
-    </svg>
-  );
-}
-
-/**
- * Wraps a track row in the swipe-to-action gesture on phone (→ Queue, ← Save),
- * or renders it untouched everywhere else. Kept tiny so the row's children stay
- * in place (no duplication) regardless of which branch renders. The Queue/Save
- * labels + colors mirror the library playlist page so the gesture reads the
- * same across library and catalog.
- */
-function MaybeSwipe({
-  enabled,
-  onQueue,
-  onSave,
-  children,
-}: {
-  enabled: boolean;
-  onQueue: () => void;
-  onSave: () => void;
-  children: ReactNode;
-}) {
-  if (!enabled) return <>{children}</>;
-  return (
-    <SwipeRow
-      onSwipeRight={onQueue}
-      onSwipeLeft={onSave}
-      rightAction={{ label: 'Queue', bg: 'bg-neutral-800' }}
-      leftAction={{ label: 'Save', bg: 'bg-neutral-100 text-neutral-950' }}
-    >
-      {children}
-    </SwipeRow>
-  );
-}
-
-/**
- * Modal that loads a search-result album's tracks. Two add modes:
- *   - Per-track "+" → opens the playlist picker for that single track.
- *   - "Add album to library" button at the top → one tap creates a new
- *     local playlist named after the album and adds every track.
- */
-export function AlbumDetailModal({
-  token,
-  album,
-  onClose,
-  onPickTrack,
-  onPlay,
-  onPickAlbum,
-  playingPreviewUrl,
-  onTogglePreview,
-  inline,
-  activeProfileId,
-  pin,
-  presetTracks,
-  savedPlaylistId,
-  onRemoveFromLibrary,
-  onShowTrackMenu,
-  onShowTrackSheet,
-  onQueueTrack,
-  onSaveTrack,
-  kindLabel,
-  importLabel,
-  onImport,
-  savedCopyId,
-  disableFetch,
-  onGoToArtist,
-  onGoToAlbum,
-  coverUrls,
-  playlistStyle,
-  hideImport,
-  isTrackCurrent,
-  isPlaying,
-  onTogglePlay,
-}: {
-  token: string;
-  album: SearchAlbumResult;
-  pin?: SidebarPinController;
-  onClose: () => void;
-  onPickTrack: (t: SearchTrackResult) => void;
-  onPlay: (t: SearchTrackResult, list?: SearchTrackResult[], index?: number) => void;
-  /** Open another album from the "More by {artist}" shelf. */
-  onPickAlbum?: (a: SearchAlbumResult) => void;
-  playingPreviewUrl: string | null;
-  onTogglePreview: (url: string) => void;
-  /** Desktop: render as a full page instead of a modal overlay. */
-  inline?: boolean;
-  /** Active profile the imported album should belong to. */
-  activeProfileId?: number | null;
-  /** Render an already-loaded tracklist instead of fetching from the catalog.
-   *  Used when the library album page reuses this component for a saved album
-   *  (so browse and library albums are the SAME page). */
-  presetTracks?: SearchTrackResult[];
-  /** Set when this is a saved library album: the +/✓ shows a clickable green
-   *  ✓ that calls `onRemoveFromLibrary` (Spotify-style) instead of "add". */
-  savedPlaylistId?: number;
-  onRemoveFromLibrary?: () => void;
-  /** Desktop: open the per-song "⋯" overflow menu at a screen point (also
-   *  right-click). The host owns the menu; when absent, no ⋯ is shown. */
-  onShowTrackMenu?: (t: SearchTrackResult, x: number, y: number) => void;
-  /** Phone: open the per-song "⋯" bottom sheet (Favorite · Add · Go to artist),
-   *  matching the library album/playlist page. The host (web-player) owns the
-   *  sheet; when set, each row shows a touch-visible ⋯ and folds the per-track
-   *  add control into it. Absent on desktop (uses `onShowTrackMenu` instead). */
-  onShowTrackSheet?: (t: SearchTrackResult) => void;
-  /** Phone: swipe a track row → right adds it to the queue. Mirrors the library
-   *  playlist page's swipe-to-queue. The host owns the enqueue (resolving the
-   *  catalog row to a playable id first); swipe is only wired when this AND
-   *  `onShowTrackSheet` are set, so desktop never swipes. */
-  onQueueTrack?: (t: SearchTrackResult) => void;
-  /** Phone: swipe a track row → left saves it to Favorites. Host-owned
-   *  (resolves the catalog row, then likes). Pairs with `onQueueTrack`. */
-  onSaveTrack?: (t: SearchTrackResult) => void;
-  /** Override the hero's kind label (e.g. "Playlist"). Defaults to the album
-   *  type ("Album"/"Single"/…). Lets the catalog-playlist wrapper reuse this
-   *  same page while reading as a playlist. */
-  kindLabel?: string;
-  /** Override the add-to-library button's aria/title (e.g. "Add all to
-   *  library"). Defaults to "Add album to library". */
-  importLabel?: string;
-  /** Replace the album-import action with a custom importer (the catalog
-   *  playlist wrapper imports as a *playlist*). Its presence also switches the
-   *  +/✓ to one-shot semantics: ✓ shows only after a successful import, not
-   *  merely because every track already happens to be in the library (importing
-   *  still creates a new named playlist). */
-  onImport?: () => Promise<void>;
-  /** Catalog-playlist mode only: the id of an EXISTING library playlist this
-   *  catalog playlist already maps to (matched by name). When set, the +/✓
-   *  control shows a static "In your library" ✓ instead of the "+" importer —
-   *  so a playlist you've already added doesn't read as "not in library" or
-   *  invite a duplicate import. Null/undefined ⇒ show the normal importer. */
-  savedCopyId?: number | null;
-  /** Never fetch the catalog tracklist — the host fully owns `presetTracks`
-   *  (which may be momentarily undefined while it loads → shows "Loading…"). */
-  disableFetch?: boolean;
-  /** Make a track row's artist name(s) clickable → navigate to the artist page
-   *  (by name; the host resolves it). When absent, artist names are plain text. */
-  onGoToArtist?: (name: string) => void;
-  /** Make a playlist row's Album name clickable → open that album. When absent,
-   *  the album name is plain text. */
-  onGoToAlbum?: (name: string, artist: string | null) => void;
-  /** Render a 2×2 collage hero cover from these artworks instead of the single
-   *  `album.cover_url` — used by the mix page, whose tracks span many albums. */
-  coverUrls?: string[];
-  /** Force the playlist-style tracklist (per-track cover + Album column) without
-   *  wiring an importer — right for a multi-album mix. Folds into the same
-   *  `isCatalogPlaylist` path as a catalog playlist. */
-  playlistStyle?: boolean;
-  /** Suppress the +/✓ add-to-library control entirely — a mix has no album
-   *  identity to add or remove. */
-  hideImport?: boolean;
-  /** Now-playing awareness (Spotify-style), so the album/playlist page mirrors
-   *  the library playlist page: the host tells us which row is the current
-   *  playback track, whether audio is running, and how to toggle pause/resume.
-   *  When `isTrackCurrent` is absent the page is play-state-agnostic (the old
-   *  behavior) — every host that doesn't wire it in is unaffected. */
-  isTrackCurrent?: (t: SearchTrackResult) => boolean;
-  /** True when audio is actually running (vs. current-but-paused) — drives the
-   *  bouncing equalizer bars and the ⏸/▶ state on the hero + sticky bar. */
-  isPlaying?: boolean;
-  /** Pause/resume the current playback context. Used by the hero + sticky Play
-   *  button when this album/playlist IS the active context (else it starts it). */
-  onTogglePlay?: () => void;
-}) {
-  // Re-render when hub reachability changes so canPlayNow gating stays live;
-  // the flag also gates the hub-write "Add album to library" button below.
-  const hubUp = useHubReachable();
-
-  // Phone swipe feedback — a transient toast, mirroring the library playlist
-  // page ("Added to queue" / "Added to Favorites" / "Not available yet"), so
-  // a swipe on a catalog row confirms itself the same way a library row does.
-  const [swipeToast, setSwipeToast] = useState<string | null>(null);
-  const swipeToastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const showSwipeToast = useCallback((msg: string) => {
-    setSwipeToast(msg);
-    if (swipeToastTimer.current) clearTimeout(swipeToastTimer.current);
-    swipeToastTimer.current = setTimeout(() => setSwipeToast(null), 1600);
-  }, []);
-  // Swipe is phone-only: `onShowTrackSheet` is the established phone signal
-  // (desktop passes `onShowTrackMenu` instead), and both action handlers must
-  // be wired. Gating on all three keeps desktop rows (and any host that opts
-  // out) free of pointer-drag actions.
-  const swipeEnabled = !!onShowTrackSheet && !!onQueueTrack && !!onSaveTrack;
-  const [tracks, setTracks] = useState<SearchTrackResult[] | null>(
-    presetTracks ?? null,
-  );
-  const [error, setError] = useState<string | null>(null);
-  // Spotify-style condensed header: a 1px sentinel under the hero title flips
-  // `condensed` true as the title scrolls past the top bar.
-  const [condensed, heroSentinelRef] = useCondensedHeader();
-  // "More by {artist}" — the album's primary artist's other releases.
-  const [moreBy, setMoreBy] = useState<SearchAlbumResult[] | null>(null);
-  // 'idle' = button visible; 'importing' = spinner; 'done' = green
-  // success state so the user sees what happened before the modal
-  // auto-closes a moment later.
-  const [importState, setImportState] = useState<'idle' | 'importing' | 'done'>(
-    'idle',
-  );
-
-  useEffect(() => {
-    // Host fully owns the tracklist (catalog-playlist wrapper): never fetch.
-    // `presetTracks` may be momentarily undefined while it loads → null shows
-    // the "Loading tracks…" state; the array swaps in when ready.
-    if (disableFetch) {
-      setTracks(presetTracks ?? null);
-      return;
-    }
-    // Saved-album reuse: the host already handed us the tracklist — show it
-    // and skip the catalog fetch entirely.
-    if (presetTracks) {
-      setTracks(presetTracks);
-      return;
-    }
-    let cancelled = false;
-    getAlbumTracks(album.source_id, token)
-      .then((rows) => {
-        if (cancelled) return;
-        // Backfill album metadata onto each row so when the user adds one,
-        // the track row gets the same cover art we showed on the album card.
-        setTracks(
-          rows.map((r) => ({
-            ...r,
-            album: album.name,
-            album_art_url: album.cover_url,
-          })),
-        );
-      })
-      .catch((e) => {
-        if (!cancelled) setError(friendlyError(e));
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [album.source_id, album.name, album.cover_url, token, presetTracks, disableFetch]);
-
-  // "More by {artist}" — resolve the primary artist by name (the album only
-  // carries artist names, not ids), then fetch their other releases. Best-
-  // effort: any failure just hides the shelf. Skipped if we can't open albums.
-  useEffect(() => {
-    if (!onPickAlbum) return;
-    const artistName = album.artists[0]?.trim();
-    if (!artistName) return;
-    let cancelled = false;
-    setMoreBy(null);
-    (async () => {
-      try {
-        const res = await searchCatalog(artistName, token, 'artist', 5);
-        // Prefer an exact name match over the raw top hit, so a common name
-        // doesn't pull a tribute act's discography.
-        const want = artistName.toLowerCase();
-        const artist =
-          res.artists.find((a) => a.name.trim().toLowerCase() === want) ??
-          res.artists[0];
-        if (!artist || cancelled) return;
-        const albums = await getArtistAlbums(artist.source_id, token);
-        if (cancelled) return;
-        const others = albums
-          .filter((a) => a.source_id !== album.source_id)
-          .slice(0, 8);
-        setMoreBy(others);
-      } catch {
-        /* best-effort; leave the shelf hidden */
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-    // Depend on the primitive artist name (not the array reference, which a
-    // re-deserialized album prop would change) to avoid spurious refetches.
-  }, [album.artists[0], album.source_id, token, onPickAlbum]);
-
-  // Escape to dismiss.
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [onClose]);
-
-  const handleImport = async () => {
-    if (!tracks || tracks.length === 0) return;
-    setImportState('importing');
-    setRemovedLocally(false);
-    setError(null);
-    try {
-      // The catalog-playlist wrapper supplies its own importer (imports as a
-      // playlist); everything else imports as an album.
-      if (onImport) {
-        await onImport();
-      } else {
-        await importAlbum(
-          album.name,
-          tracks,
-          token,
-          album.artists.join(', ') || null,
-          activeProfileId,
-        );
-      }
-      setImportState('done');
-      // Refresh the app's sidebar/playlist list (the new copy should appear).
-      if (typeof window !== 'undefined')
-        window.dispatchEvent(new Event('beetbot:library-changed'));
-      // Stay on the page; the action shifts to a green ✓ "in your library" in
-      // place, mirroring Spotify (no auto-close).
-    } catch (e) {
-      setError(friendlyError(e));
-      setImportState('idle');
-    }
-  };
-
-  const albumSongCount = tracks?.length ?? album.total_tracks ?? null;
-  const albumTotalMs = tracks
-    ? tracks.reduce((s, t) => s + t.duration_ms, 0)
-    : 0;
-  // Is this whole album already saved to the library? Answered by the tracks'
-  // saved-album membership, NOT `local_track_id` — the latter is set merely by
-  // playing/streaming a track, so an album you'd only *listened* to used to
-  // read as "saved". The album is saved iff every track shares a common saved-
-  // album playlist (their `in_saved_album_ids` intersect). Robust against a
-  // stray track that happens to sit in some other saved album.
-  // The saved-album playlist id every track shares (saved albums are stored as
-  // source='album' playlists), or null. Exposed so the "in your library" ✓ can
-  // toggle OFF by deleting that row — same mechanism as an imported playlist.
-  const savedAlbumId =
-    tracks && tracks.length > 0
-      ? ([
-          ...tracks
-            .map((t) => new Set(t.in_saved_album_ids ?? []))
-            .reduce((acc, ids) => new Set([...acc].filter((id) => ids.has(id)))),
-        ][0] ?? null)
-      : null;
-  const albumSavedInLibrary = savedAlbumId != null;
-  // A saved library album reusing this page — its +/✓ is a clickable green ✓
-  // that removes (vs. a catalog album, whose ✓ is just an "added" indicator).
-  const albumSaved = savedPlaylistId != null;
-  // Optimistic removal: clicking the "in your library" ✓ deletes the backing
-  // row (imported playlist OR saved album) and flips the control back to "+".
-  const [removedLocally, setRemovedLocally] = useState(false);
-  const [removing, setRemoving] = useState(false);
-  // The library row a case-2 ✓ can remove: the imported-playlist copy wins
-  // (explicit), else the shared saved-album id. Null ⇒ nothing to toggle off
-  // (e.g. a not-yet-saved catalog item), so the ✓ stays a static indicator.
-  const catalogRemoveId = savedCopyId ?? savedAlbumId;
-  const handleCatalogRemove = async () => {
-    if (catalogRemoveId == null || removing) return;
-    setRemoving(true);
-    setError(null);
-    try {
-      await deletePlaylist(catalogRemoveId, token);
-      // Flip the control back to "+" in place. A remount (navigate away/back)
-      // re-derives library state from a fresh fetch, so this stays honest.
-      setRemovedLocally(true);
-      // Reset the import state so the "+" is enabled again — otherwise removing
-      // a playlist imported THIS session leaves importState='done', which the
-      // "+" button treats as "busy" (disabled/greyed) and you can't re-add it.
-      setImportState('idle');
-      // Tell the app the library changed so the sidebar/playlist list refreshes
-      // — otherwise the removed playlist lingers there and the remove reads as a
-      // no-op even though it worked.
-      if (typeof window !== 'undefined')
-        window.dispatchEvent(new Event('beetbot:library-changed'));
-    } catch (e) {
-      setError(friendlyError(e));
-    } finally {
-      setRemoving(false);
-    }
-  };
-  // Case-2 ✓ is a clickable REMOVE toggle whenever we have a concrete library
-  // row to delete (`catalogRemoveId`): either detected on load, or — after an
-  // import this session — the id the importer just returned (the wrapper feeds
-  // it back into `savedCopyId`). Not shown once already removed this session.
-  const canRemoveFromLibrary =
-    !removedLocally &&
-    catalogRemoveId != null &&
-    (savedCopyId != null || albumSavedInLibrary);
-  // Drives the +/✓ library toggle: green ✓ once it's saved / the album is
-  // already in the library (or we just imported it), + to add otherwise. In
-  // playlist mode (`onImport`) "already present" does NOT count — importing
-  // still creates a new named playlist — so ✓ only appears after a real import.
-  const albumInLibrary =
-    !removedLocally &&
-    (albumSaved ||
-      importState === 'done' ||
-      // A catalog playlist we've already imported (matched by name) — so its
-      // control reads "In your library" instead of offering a duplicate import.
-      savedCopyId != null ||
-      (!onImport && albumSavedInLibrary));
-  // Now-playing awareness: is any track on this page the current playback? That
-  // makes THIS album/playlist the active context, so the hero + sticky Play
-  // button mirror the now-playing bar (⏸ while it's playing) and toggle instead
-  // of restarting. Absent `isTrackCurrent` → agnostic (old always-play behavior).
-  const contextActive =
-    !!isTrackCurrent && !!tracks && tracks.some((t) => isTrackCurrent(t));
-  const contextPlaying = contextActive && !!isPlaying;
-  // The hero / sticky / phone-header Play action: resume-or-pause when this page
-  // is the active context; otherwise start it from the top.
-  const headerPlay = () => {
-    if (contextActive && onTogglePlay) onTogglePlay();
-    else if (tracks && tracks.length > 0) onPlay(tracks[0], tracks, 0);
-  };
-
-  // Shuffle the album: play a shuffled copy from the top.
-  const playShuffled = () => {
-    if (!tracks || tracks.length === 0) return;
-    const arr = tracks.slice();
-    for (let i = arr.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [arr[i], arr[j]] = [arr[j], arr[i]];
-    }
-    onPlay(arr[0], arr, 0);
-  };
-
-  // A catalog (Deezer) playlist reusing this page (the wrapper passes its own
-  // importer), OR a multi-album mix (playlistStyle). Drives the Deezer-wordmark
-  // cover badge + the playlist-style track grid (per-track cover + Album column),
-  // so it reads like a real playlist rather than a single-artwork album.
-  const isCatalogPlaylist = !!onImport || !!playlistStyle;
-
-  // The "in a playlist" ✓ column now shows on desktop CATALOG PLAYLISTS too (not
-  // just albums) — a dedicated column, like the album page, indicating a song is
-  // in one of your OTHER playlists (see `renderAddToLibrary`). Phone folds it
-  // into the ⋯ sheet (onShowTrackSheet), so it's desktop-only either way.
-  const showInPlaylistColumn = !onShowTrackSheet;
-
-  // Track-list grid. Albums: # · Title · File · [✓] · Time (+ a trailing ⋯ column
-  // on desktop). Catalog playlists instead mirror the library playlist page
-  // EXACTLY: # · cover · Title · Album · File · Time, with the add-to-library
-  // +/✓ folded INTO the File column.
-  const trackGrid = isCatalogPlaylist
-    ? onShowTrackMenu
-      // Desktop catalog playlist WITH ⋯ menu: # · cover · Title · Album · File · [✓] · Time · ⋯.
-      // The 2rem ✓ slot mirrors the album page's "in a playlist" column.
-      ? 'grid-cols-[2rem_2.25rem_1fr_2.5rem_2.75rem_2rem] sm:grid-cols-[2.5rem_3rem_minmax(0,1fr)_minmax(0,1fr)_5rem_2rem_5rem_2.5rem]'
-      : onShowTrackSheet
-        // Phone catalog (⋯ sheet): the ✓ folds into the sheet, so no ✓ column.
-        ? 'grid-cols-[2rem_2.25rem_1fr_2.5rem_2.75rem] sm:grid-cols-[2.5rem_3rem_minmax(0,1fr)_minmax(0,1fr)_5rem_5rem]'
-        // Desktop catalog WITHOUT a ⋯ menu (e.g. a Mix): still renders the ✓ cell
-        // (showInPlaylistColumn), so the grid needs the 2rem slot — otherwise the
-        // extra cell overflows and Time wraps to a second line.
-        : 'grid-cols-[2rem_2.25rem_1fr_2.5rem_2.75rem] sm:grid-cols-[2.5rem_3rem_minmax(0,1fr)_minmax(0,1fr)_5rem_2rem_5rem]'
-    : onShowTrackSheet
-      ? 'grid-cols-[2rem_1fr_2.5rem_2.75rem] sm:grid-cols-[2.5rem_1fr_5rem_5rem]'
-      : onShowTrackMenu
-        ? 'grid-cols-[2rem_1fr_2.5rem_2rem_2.75rem_2rem] sm:grid-cols-[2.5rem_1fr_5rem_2.5rem_5rem_2.5rem]'
-        : 'grid-cols-[2rem_1fr_2.5rem_2rem_2.75rem] sm:grid-cols-[2.5rem_1fr_5rem_2.5rem_5rem]';
-
-  // Desktop full page (album OR catalog playlist): pad the tracklist to px-4 so
-  // its columns line up with the library playlist page (PlaylistPage uses px-4).
-  // The phone modal keeps the tighter px-1.
-  const listPadX = inline ? 'px-4' : 'px-1';
-  // Desktop catalog-playlist page: also adopt the library playlist row metrics
-  // (roomier h-14 rows, text-base title, text-sm artist/album/time) so it reads
-  // as the same page. Albums and the phone modal keep their compact rows.
-  const catalogInline = isCatalogPlaylist && inline;
-  // Desktop full page adopts the roomier library-playlist row metrics on ALBUMS
-  // too (bigger title/artist/time, taller rows) so the album page matches the
-  // playlist page the user prefers. Phone (inline false) stays compact.
-  const roomy = inline;
-
-  // Artist name(s) for a track row. When the host wires `onGoToArtist`, each
-  // name becomes a clickable link (hover-highlight → navigate to that artist's
-  // page); `stopPropagation` so it doesn't also trigger the row's play/preview.
-  // A plain string otherwise (phone / no nav host).
-  const renderArtists = (names: string[]): ReactNode => {
-    if (!onGoToArtist) return names.join(', ');
-    return names.map((name, idx) => (
-      <span key={idx}>
-        {idx > 0 ? ', ' : ''}
-        <span
-          role="link"
-          tabIndex={0}
-          onClick={(e) => {
-            e.stopPropagation();
-            e.preventDefault();
-            const n = name.trim();
-            if (n) onGoToArtist(n);
-          }}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' || e.key === ' ') {
-              e.stopPropagation();
-              e.preventDefault();
-              const n = name.trim();
-              if (n) onGoToArtist(n);
-            }
-          }}
-          className="cursor-pointer hover:text-neutral-100 hover:underline"
-        >
-          {name}
-        </span>
-      </span>
-    ));
-  };
-
-  // Add-to-library control (the +/✓). Catalog playlists fold this into the File
-  // column; albums keep it as a separate Add column. Identical button either way.
-  // Spotify-style "in a playlist" indicator: a small white ✓ shown ONLY for a
-  // track that's already in ≥1 playlist — click it to manage (opens the add-to-
-  // playlist picker, pre-checked). Blank otherwise; the "add" action lives in
-  // the ⋯ menu, so there's no hover-revealed + cluttering every row.
-  //
-  // On a catalog PLAYLIST page, membership in THIS playlist's own imported copy
-  // (`savedCopyId`) doesn't count — otherwise every row would show ✓ trivially.
-  // So the ✓ means "also in one of your OTHER playlists". For albums savedCopyId
-  // is undefined, so the filter is a no-op and it stays "in ≥1 playlist".
-  const renderAddToLibrary = (t: SearchTrackResult) => {
-    const otherIds = t.in_playlist_ids.filter((id) => id !== savedCopyId);
-    return otherIds.length === 0 ? null : (
-    <button
-      type="button"
-      onClick={(e) => {
-        e.stopPropagation();
-        onPickTrack(t);
-      }}
-      aria-label="Manage playlists for this track"
-      title={`In ${otherIds.length} ${
-        otherIds.length === 1 ? 'playlist' : 'playlists'
-      } — click to manage`}
-      className="grid h-6 w-6 place-items-center rounded-full bg-white text-neutral-950 hover:bg-neutral-200 leading-none transition active:scale-95"
-    >
-        <svg
-          width="14"
-          height="14"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="3"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          aria-hidden
-        >
-          <path d="m5 12 5 5 9-11" />
-        </svg>
-    </button>
-    );
-  };
-
-  return (
-    <>
-    <ModalShell
-      title={album.name}
-      subtitle={album.artists.join(', ')}
-      onClose={onClose}
-      inline={inline}
-      wide
-      // Desktop uses the inline CondensedHeaderBar; the phone uses ModalShell's
-      // own unified bar (condensed + onHeaderPlay), so both platforms condense
-      // but the phone matches the library playlist page.
-      condensed={condensed}
-      onHeaderPlay={headerPlay}
-      stickyBar={
-        <CondensedHeaderBar
-          condensed={condensed}
-          title={album.name}
-          playing={contextPlaying}
-          onPlay={headerPlay}
-        />
-      }
-      hero={
-        inline ? (
-        // DESKTOP: the library-album header — side-by-side cover + text column,
-        // "Album" label, title, "Artist · N songs · duration", and the
-        // Play · Shuffle · Pin · +/✓ action row. (Phone uses the centered
-        // Apple/Spotify hero in the else branch, matching the library playlist.)
-        <div className="relative overflow-hidden">
-          <HeroWash coverUrl={coverUrls?.[0] ?? coverSrc(album.cover_url)} />
-          {/* Card sits below the header now → normal top inset (was pt-20 to
-              clear the old overlapping header). */}
-          <div className="relative px-8 pt-6 pb-4">
-            <div className="flex gap-6 items-end">
-              <div className="relative h-44 w-44 shrink-0 rounded-xl overflow-hidden bg-neutral-800 grid place-items-center shadow-lg">
-                {coverUrls && coverUrls.length >= 2 ? (
-                  <CollageCover urls={coverUrls} className="h-full w-full" />
-                ) : album.cover_url ? (
-                  <img
-                    src={coverSrc(album.cover_url)}
-                    alt=""
-                    className="h-full w-full object-cover"
-                    draggable={false}
-                  />
-                ) : (
-                  <span className="text-5xl text-neutral-600">♪</span>
-                )}
-              </div>
-              <div className="min-w-0">
-                <p className={cn(EYEBROW_ON_ART, 'mb-1')}>
-                  {kindLabel ?? (albumTypeLabel(album.album_type) || 'Album')}
-                </p>
-                <h1 className="text-4xl font-bold tracking-tight mb-2">
-                  {album.name}
-                </h1>
-                {/* Condensed-header trigger: once this scrolls under the top
-                    bar, the compact sticky bar fades in. */}
-                <div ref={heroSentinelRef} aria-hidden className="h-px w-px" />
-                <p className="text-sm text-neutral-500">
-                  {album.artists.length > 0 && (
-                    <span>
-                      {/* Album artist → their page (hover-highlight). For a
-                          catalog playlist the "artist" is the creator, not a
-                          real artist, so it stays plain text. */}
-                      {isCatalogPlaylist
-                        ? album.artists.join(', ')
-                        : renderArtists(album.artists)}{' '}
-                      ·{' '}
-                    </span>
-                  )}
-                  {albumSongCount != null
-                    ? `${albumSongCount} ${albumSongCount === 1 ? 'song' : 'songs'}`
-                    : ''}
-                  {tracks && tracks.length > 0
-                    ? ` · ${albumDurationLabel(albumTotalMs)}`
-                    : ''}
-                </p>
-                <div className="mt-3 flex items-center gap-3">
-                  <button
-                    type="button"
-                    onClick={headerPlay}
-                    disabled={!tracks || tracks.length === 0}
-                    aria-label={contextPlaying ? 'Pause' : 'Play album'}
-                    className="grid h-14 w-14 place-items-center rounded-full bg-neutral-100 text-neutral-950 shadow-lg transition hover:bg-white hover:scale-105 active:scale-95 disabled:bg-neutral-700 disabled:text-neutral-400 disabled:hover:scale-100"
-                    title={contextPlaying ? 'Pause' : 'Play album'}
-                  >
-                    {contextPlaying ? (
-                      <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-                        <path d="M7 5h3.5v14H7zM13.5 5H17v14h-3.5z" />
-                      </svg>
-                    ) : (
-                      <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-                        <path d="M8 5.14v13.72a1 1 0 0 0 1.5.86l11-6.86a1 1 0 0 0 0-1.72l-11-6.86A1 1 0 0 0 8 5.14z" />
-                      </svg>
-                    )}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={playShuffled}
-                    disabled={!tracks || tracks.length === 0}
-                    aria-label="Shuffle play"
-                    title="Shuffle play"
-                    className="rounded-lg px-3 py-2 text-neutral-300 hover:text-neutral-100 hover:bg-neutral-900 disabled:text-neutral-600 disabled:hover:bg-transparent transition"
-                  >
-                    <svg
-                      width="20"
-                      height="20"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="1.8"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      aria-hidden
-                    >
-                      <path d="M16 3h5v5" />
-                      <path d="M4 20 21 3" />
-                      <path d="M21 16v5h-5" />
-                      <path d="m15 15 6 6" />
-                      <path d="M4 4l5 5" />
-                    </svg>
-                  </button>
-                  {pin ? (
-                    <button
-                      type="button"
-                      onClick={() =>
-                        pin.toggleAlbum({
-                          album: album.name,
-                          artist: album.artists[0] ?? null,
-                          art: album.cover_url ?? null,
-                        })
-                      }
-                      title={
-                        pin.isAlbumPinned(album.name, album.artists[0] ?? null)
-                          ? 'Unpin from sidebar'
-                          : 'Pin to sidebar'
-                      }
-                      aria-label={
-                        pin.isAlbumPinned(album.name, album.artists[0] ?? null)
-                          ? 'Unpin from sidebar'
-                          : 'Pin to sidebar'
-                      }
-                      aria-pressed={pin.isAlbumPinned(
-                        album.name,
-                        album.artists[0] ?? null,
-                      )}
-                      className={`rounded-lg px-3 py-2 transition hover:bg-neutral-900 ${
-                        pin.isAlbumPinned(album.name, album.artists[0] ?? null)
-                          ? 'text-white'
-                          : 'text-neutral-400 hover:text-neutral-100'
-                      }`}
-                    >
-                      {/* Pin icon — filled when pinned (matches the library
-                          album page exactly). */}
-                      <svg
-                        width="18"
-                        height="18"
-                        viewBox="0 0 24 24"
-                        fill={
-                          pin.isAlbumPinned(album.name, album.artists[0] ?? null)
-                            ? 'currentColor'
-                            : 'none'
-                        }
-                        stroke="currentColor"
-                        strokeWidth="1.8"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        aria-hidden
-                      >
-                        <line x1="12" y1="17" x2="12" y2="22" />
-                        <path d="M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24Z" />
-                      </svg>
-                    </button>
-                  ) : null}
-                  {albumSaved ? (
-                    <button
-                      type="button"
-                      onClick={onRemoveFromLibrary}
-                      title="In your library — click to remove"
-                      aria-label="Remove album from library"
-                      className="grid place-items-center h-9 w-9 rounded-full bg-white hover:bg-neutral-200 text-neutral-950 transition"
-                    >
-                      <svg
-                        width="18"
-                        height="18"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="3"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        aria-hidden
-                      >
-                        <path d="M20 6 9 17l-5-5" />
-                      </svg>
-                    </button>
-                  ) : albumInLibrary ? (
-                    canRemoveFromLibrary ? (
-                      <button
-                        type="button"
-                        onClick={handleCatalogRemove}
-                        disabled={removing}
-                        title="In your library — click to remove"
-                        aria-label="Remove from library"
-                        className="group/rm grid place-items-center h-9 w-9 rounded-full bg-white hover:bg-neutral-200 text-neutral-950 transition disabled:opacity-50"
-                      >
-                        <svg
-                          width="18"
-                          height="18"
-                          viewBox="0 0 24 24"
-                          fill="none"
-                          stroke="currentColor"
-                          strokeWidth="3"
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                          aria-hidden
-                        >
-                          {/* ✓ normally; a − on hover to signal "click to remove" */}
-                          <path className="group-hover/rm:hidden" d="M20 6 9 17l-5-5" />
-                          <path className="hidden group-hover/rm:block" d="M5 12h14" />
-                        </svg>
-                      </button>
-                    ) : (
-                      <span
-                        aria-label="In your library"
-                        title="In your library"
-                        className="grid place-items-center h-9 w-9 rounded-full bg-white text-neutral-950"
-                      >
-                        <svg
-                          width="18"
-                          height="18"
-                          viewBox="0 0 24 24"
-                          fill="none"
-                          stroke="currentColor"
-                          strokeWidth="3"
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                          aria-hidden
-                        >
-                          <path d="M20 6 9 17l-5-5" />
-                        </svg>
-                      </span>
-                    )
-                  ) : hideImport ? null : (
-                    <button
-                      type="button"
-                      onClick={handleImport}
-                      disabled={
-                        !tracks ||
-                        tracks.length === 0 ||
-                        importState !== 'idle' ||
-                        !hubUp
-                      }
-                      aria-label={importLabel ?? 'Add album to library'}
-                      title={
-                        hubUp
-                          ? (importLabel ?? 'Add album to library')
-                          : 'Needs your computer'
-                      }
-                      className="grid place-items-center h-9 w-9 rounded-full border-2 border-neutral-400 text-neutral-200 hover:border-white hover:text-white disabled:opacity-40 transition"
-                    >
-                      {importState === 'importing' ? (
-                        <svg
-                          className="animate-spin"
-                          width="18"
-                          height="18"
-                          viewBox="0 0 24 24"
-                          fill="none"
-                          stroke="currentColor"
-                          strokeWidth="2.5"
-                          aria-hidden
-                        >
-                          <path
-                            d="M21 12a9 9 0 1 1-6.219-8.56"
-                            strokeLinecap="round"
-                          />
-                        </svg>
-                      ) : (
-                        <svg
-                          width="18"
-                          height="18"
-                          viewBox="0 0 24 24"
-                          fill="none"
-                          stroke="currentColor"
-                          strokeWidth="2.5"
-                          strokeLinecap="round"
-                          aria-hidden
-                        >
-                          <path d="M12 5v14M5 12h14" />
-                        </svg>
-                      )}
-                    </button>
-                  )}
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-        ) : (
-        // PHONE: Apple-Music/Spotify-style — large centered cover on the wash,
-        // centered label/title/meta, actions as a centered row of frosted
-        // circles (shuffle · play · pin? · add/import). Mirrors the library
-        // playlist hero so library + catalog read as one system.
-        <div className="relative overflow-hidden">
-          <HeroWash coverUrl={coverUrls?.[0] ?? coverSrc(album.cover_url)} />
-          <div className="relative px-4 pt-20 pb-5 flex flex-col items-center text-center">
-            <div className="relative h-52 w-52 rounded-2xl overflow-hidden bg-neutral-800 shadow-2xl shadow-black/60 ring-1 ring-white/10 grid place-items-center">
-              {coverUrls && coverUrls.length >= 2 ? (
-                <CollageCover urls={coverUrls} className="h-full w-full" />
-              ) : album.cover_url ? (
-                <img src={coverSrc(album.cover_url)} alt="" className="h-full w-full object-cover" draggable={false} />
-              ) : (
-                <span className="text-5xl text-neutral-600">♪</span>
-              )}
-            </div>
-            <div className="mt-4 w-full min-w-0 flex flex-col items-center">
-              <p className={cn(EYEBROW_ON_ART, 'mb-1')}>
-                {kindLabel ?? (albumTypeLabel(album.album_type) || 'Album')}
-              </p>
-              <h1 className="text-2xl font-bold tracking-tight mb-1 min-w-0 max-w-full">
-                <span className="block max-w-full truncate">{album.name}</span>
-              </h1>
-              <div ref={heroSentinelRef} aria-hidden className="h-px w-px" />
-              <p className="mt-1 text-xs text-neutral-400">
-                {album.artists.length > 0 && (
-                  <span>
-                    {isCatalogPlaylist
-                      ? album.artists.join(', ')
-                      : renderArtists(album.artists)}{' '}
-                    ·{' '}
-                  </span>
-                )}
-                {albumSongCount != null
-                  ? `${albumSongCount} ${albumSongCount === 1 ? 'song' : 'songs'}`
-                  : ''}
-                {tracks && tracks.length > 0
-                  ? ` · ${albumDurationLabel(albumTotalMs)}`
-                  : ''}
-              </p>
-              <div className="mt-4 flex items-center justify-center gap-4">
-                <button
-                  type="button"
-                  onClick={playShuffled}
-                  disabled={!tracks || tracks.length === 0}
-                  aria-label="Shuffle play"
-                  title="Shuffle play"
-                  className="grid h-10 w-10 place-items-center rounded-full bg-white/10 text-neutral-200 active:bg-white/20 disabled:opacity-40 disabled:text-neutral-600"
-                >
-                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-                    <path d="M16 3h5v5" />
-                    <path d="M4 20 21 3" />
-                    <path d="M21 16v5h-5" />
-                    <path d="m15 15 6 6" />
-                    <path d="M4 4l5 5" />
-                  </svg>
-                </button>
-                <button
-                  type="button"
-                  onClick={headerPlay}
-                  disabled={!tracks || tracks.length === 0}
-                  aria-label={contextPlaying ? 'Pause' : 'Play album'}
-                  className="grid h-14 w-14 place-items-center rounded-full bg-neutral-100 text-neutral-950 shadow-lg transition active:scale-95 disabled:bg-neutral-800 disabled:text-neutral-500"
-                >
-                  {contextPlaying ? (
-                    <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-                      <path d="M7 5h3.5v14H7zM13.5 5H17v14h-3.5z" />
-                    </svg>
-                  ) : (
-                    <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-                      <path d="M8 5.14v13.72a1 1 0 0 0 1.5.86l11-6.86a1 1 0 0 0 0-1.72l-11-6.86A1 1 0 0 0 8 5.14z" />
-                    </svg>
-                  )}
-                </button>
-                {pin ? (
-                  <button
-                    type="button"
-                    onClick={() =>
-                      pin.toggleAlbum({
-                        album: album.name,
-                        artist: album.artists[0] ?? null,
-                        art: album.cover_url ?? null,
-                      })
-                    }
-                    aria-label={
-                      pin.isAlbumPinned(album.name, album.artists[0] ?? null)
-                        ? 'Unpin from sidebar'
-                        : 'Pin to sidebar'
-                    }
-                    aria-pressed={pin.isAlbumPinned(album.name, album.artists[0] ?? null)}
-                    className={`grid h-10 w-10 place-items-center rounded-full bg-white/10 active:bg-white/20 ${
-                      pin.isAlbumPinned(album.name, album.artists[0] ?? null)
-                        ? 'text-white'
-                        : 'text-neutral-300'
-                    }`}
-                  >
-                    <svg
-                      width="18"
-                      height="18"
-                      viewBox="0 0 24 24"
-                      fill={pin.isAlbumPinned(album.name, album.artists[0] ?? null) ? 'currentColor' : 'none'}
-                      stroke="currentColor"
-                      strokeWidth="1.8"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      aria-hidden
-                    >
-                      <line x1="12" y1="17" x2="12" y2="22" />
-                      <path d="M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24Z" />
-                    </svg>
-                  </button>
-                ) : null}
-                {albumSaved ? (
-                  <button
-                    type="button"
-                    onClick={onRemoveFromLibrary}
-                    aria-label="Remove album from library"
-                    title="In your library — tap to remove"
-                    className="grid h-10 w-10 place-items-center rounded-full bg-white text-neutral-950 active:opacity-80"
-                  >
-                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-                      <path d="M20 6 9 17l-5-5" />
-                    </svg>
-                  </button>
-                ) : albumInLibrary ? (
-                  canRemoveFromLibrary ? (
-                    <button
-                      type="button"
-                      onClick={handleCatalogRemove}
-                      disabled={removing}
-                      aria-label="Remove from library"
-                      title="In your library — tap to remove"
-                      className="grid h-10 w-10 place-items-center rounded-full bg-white text-neutral-950 active:bg-neutral-200 disabled:opacity-50"
-                    >
-                      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-                        <path d="M20 6 9 17l-5-5" />
-                      </svg>
-                    </button>
-                  ) : (
-                    <span
-                      aria-label="In your library"
-                      title="In your library"
-                      className="grid h-10 w-10 place-items-center rounded-full bg-white text-neutral-950"
-                    >
-                      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-                        <path d="M20 6 9 17l-5-5" />
-                      </svg>
-                    </span>
-                  )
-                ) : hideImport ? null : (
-                  <button
-                    type="button"
-                    onClick={handleImport}
-                    disabled={!tracks || tracks.length === 0 || importState !== 'idle' || !hubUp}
-                    aria-label={importLabel ?? 'Add album to library'}
-                    title={hubUp ? (importLabel ?? 'Add album to library') : 'Needs your computer'}
-                    className="grid h-10 w-10 place-items-center rounded-full bg-white/10 text-neutral-200 active:bg-white/20 disabled:opacity-40"
-                  >
-                    {importState === 'importing' ? (
-                      <svg className="animate-spin" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" aria-hidden>
-                        <path d="M21 12a9 9 0 1 1-6.219-8.56" strokeLinecap="round" />
-                      </svg>
-                    ) : (
-                      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" aria-hidden>
-                        <path d="M12 5v14M5 12h14" />
-                      </svg>
-                    )}
-                  </button>
-                )}
-              </div>
-            </div>
-          </div>
-        </div>
-        )
-      }
-    >
-      <div className="flex flex-col gap-3 px-4 pt-4 pb-4">
-        {error && (
-          <div className={cn(CALLOUT_ERROR, 'text-xs')}>
-            {error}
-          </div>
-        )}
-        {!tracks && !error && (
-          <div className={`text-sm text-neutral-500 ${listPadX}`}>Loading tracks…</div>
-        )}
-        {tracks && tracks.length === 0 && (
-          <div className={`text-sm text-neutral-500 ${listPadX}`}>
-            {isCatalogPlaylist ? 'No songs in this playlist.' : 'No songs on this album.'}
-          </div>
-        )}
-        {tracks && tracks.length > 0 && (
+        {/* Appears On — albums by other artists featuring this one. */}
+        {appearsOn.length > 0 ? (
           <div>
-            {/* Column header — mirrors the library album page
-                (#  TITLE … FILE  TIME), with a trailing slot for the
-                hover-revealed add-to-playlist button. */}
-            <div
-              className={`${
-                // Desktop inline page: card sits below the header, so the column
-                // header pins right under the condensed bar (top-14, not top-28).
-                inline ? 'sticky top-14 z-20 ' : ''
-              }${
-                // Phone swipe rows are flex (no grid), like the library page —
-                // so drop the desktop column header entirely there (it would
-                // otherwise reappear + misalign on a ≥sm landscape phone).
-                swipeEnabled ? 'hidden' : 'hidden sm:grid'
-              } ${trackGrid} gap-3 items-center ${listPadX} py-2 text-xs uppercase tracking-wide text-neutral-500 border-b border-white/5 ${
-                // Match the library playlist page's translucent, blurred sticky
-                // header on desktop; the phone (non-sticky) keeps a solid bg.
-                inline ? 'bg-neutral-950/60 backdrop-blur-xl' : 'bg-neutral-950'
-              }`}
-            >
-              <span>#</span>
-              {isCatalogPlaylist ? <span /> : null}
-              <span>Title</span>
-              {isCatalogPlaylist ? (
-                <span className="hidden sm:block">Album</span>
-              ) : null}
-              <span>File</span>
-              {showInPlaylistColumn ? <span /> : null}
-              <span className="text-right">Time</span>
-              {onShowTrackMenu ? <span /> : null}
-            </div>
-            <ul className="divide-y divide-white/5">
-              {tracks.map((t, i) => {
-                const previewing =
-                  !!t.preview_url && playingPreviewUrl === t.preview_url;
-                // Playable in full only when the track has a local file (has_audio),
-                // or a non-downloaded track while live streaming AND the hub is
-                // reachable; otherwise fall back to the 30s Deezer preview.
-                const playable = canPlayNow(t);
-                const canPreview = !isPlayable(t) && !!t.preview_url;
-                const interactive = playable || canPreview;
-                const InfoArea: React.ElementType = interactive
-                  ? 'button'
-                  : 'div';
-                // Is this row the current playback track? Drives the Spotify-style
-                // row highlight + the bouncing equalizer bars in the # gutter, so
-                // the album/playlist page mirrors the library playlist page.
-                const current = !!isTrackCurrent && isTrackCurrent(t);
-                // Phone: a simple flex row (art · title · download) that matches
-                // the library playlist page — the base grid-cols in trackGrid go
-                // inert under flex, and sm:grid restores the desktop
-                // #/Album/File/Time columns. A swipe row is phone-only (no
-                // sm:grid needed) and adds a tap-feedback bg like the library.
-                const rowInnerClass = `group flex ${
-                  swipeEnabled
-                    ? 'active:bg-neutral-900 '
-                    : `sm:grid ${trackGrid} hover:bg-neutral-900/40 `
-                }gap-3 items-center ${listPadX} ${
-                  roomy ? 'h-14' : 'py-2'
-                } min-w-0 ${interactive ? '' : 'opacity-60'} ${
-                  current ? 'bg-neutral-900/50' : ''
-                } transition-colors`;
-                return (
-                  <li
-                    key={`${t.source}:${t.source_id}`}
-                    onContextMenu={
-                      onShowTrackMenu
-                        ? (e) => {
-                            e.preventDefault();
-                            onShowTrackMenu(t, e.clientX, e.clientY);
-                          }
-                        : undefined
-                    }
-                  >
-                    <MaybeSwipe
-                      enabled={swipeEnabled}
-                      onQueue={() => {
-                        // Mirror the library page: only queue a track that can
-                        // ever stream (downloaded, or live on a full build);
-                        // otherwise say so instead of silently no-op'ing.
-                        if (!isPlayable(t)) {
-                          showSwipeToast('Not available yet');
-                          return;
-                        }
-                        onQueueTrack?.(t);
-                        showSwipeToast('Added to queue');
-                      }}
-                      onSave={() => {
-                        onSaveTrack?.(t);
-                        showSwipeToast('Added to Favorites');
-                      }}
-                    >
-                    <div
-                      className={`${rowInnerClass}${
-                        interactive && !swipeEnabled ? ' cursor-pointer' : ''
-                      }`}
-                      // Click ANYWHERE in the row to play (Spotify-style), same
-                      // as the library playlist. The title button, the in-playlist
-                      // ✓, the ⋯ menu, and the artist/album links all
-                      // stopPropagation so they keep their own action. Desktop
-                      // only — phone rows use tap/swipe (MaybeSwipe).
-                      onClick={
-                        interactive && !swipeEnabled
-                          ? () =>
-                              playable
-                                ? onPlay(t, tracks, i)
-                                : onTogglePreview(t.preview_url as string)
-                          : undefined
-                      }>
-                    {/* Track number — or, on an album row while this track's
-                        preview plays, a mini depleting ring + pause glyph.
-                        Playlist rows show the preview state on the cover (below)
-                        instead, so here they always show the number. */}
-                    <div
-                      // ALBUM rows show the number gutter on every platform (all
-                      // tracks share the one album cover, so a per-track cover
-                      // would just repeat it — Apple Music / Spotify show numbers
-                      // instead). PLAYLIST rows hide it on phone (the per-track
-                      // cover below takes the leading slot) and show it on desktop.
-                      className={`relative ${
-                        isCatalogPlaylist ? 'hidden sm:grid' : 'grid'
-                      } h-6 w-6 place-items-center ${
-                        roomy ? 'text-sm' : 'text-xs'
-                      } ${
-                        current ? 'text-neutral-100' : 'text-neutral-600'
-                      } tabular-nums`}
-                    >
-                      {previewing && !isCatalogPlaylist ? (
-                        // 30s Deezer preview auditioning (fileless track): ring + pause.
-                        <>
-                          <PreviewRing size={22} strokeWidth={2.5} />
-                          <svg
-                            width="9"
-                            height="9"
-                            viewBox="0 0 24 24"
-                            fill="#34d399"
-                            aria-hidden
-                          >
-                            <rect x="6" y="5" width="4" height="14" rx="1" />
-                            <rect x="14" y="5" width="4" height="14" rx="1" />
-                          </svg>
-                        </>
-                      ) : current && isPlaying ? (
-                        // Now playing (audible): bouncing equalizer bars, Spotify-
-                        // style — replacing the track number for the active row.
-                        <EqualizerBars className="text-neutral-100" />
-                      ) : (
-                        // Number, swapping to a ▶ hint on hover for a playable row
-                        // that isn't the current track (the row/title click plays).
-                        <>
-                          <span
-                            className={
-                              playable && !current ? 'group-hover:opacity-0' : ''
-                            }
-                          >
-                            {i + 1}
-                          </span>
-                          {playable && !current ? (
-                            <span className="pointer-events-none absolute inset-0 grid place-items-center text-neutral-100 opacity-0 group-hover:opacity-100">
-                              <svg
-                                className="h-4 w-4 translate-x-[1px]"
-                                viewBox="0 0 24 24"
-                                fill="currentColor"
-                                aria-hidden
-                              >
-                                <path d="M8 5v14l11-7z" />
-                              </svg>
-                            </span>
-                          ) : null}
-                        </>
-                      )}
-                    </div>
-                    {/* PLAYLIST rows only: a per-track cover (tracks span many
-                        albums, each with its own art), with the preview ring/pause
-                        overlaid — matches the library playlist page. ALBUM rows
-                        deliberately omit it (one shared album cover, shown in the
-                        hero) and use the number gutter above instead. */}
-                    {isCatalogPlaylist ? (
-                      <div
-                        className={`relative ${
-                          catalogInline ? 'h-10 w-10' : 'h-9 w-9'
-                        } shrink-0 rounded-lg overflow-hidden bg-neutral-800 grid place-items-center`}
-                      >
-                        {t.album_art_url ? (
-                          <img
-                            src={t.album_art_url}
-                            alt=""
-                            className="h-full w-full object-cover"
-                            draggable={false}
-                            loading="lazy"
-                          />
-                        ) : (
-                          <span className="text-neutral-600 text-sm">♪</span>
-                        )}
-                        {previewing ? (
-                          <div className="absolute inset-0 grid place-items-center bg-black/50">
-                            <PreviewRing size={24} strokeWidth={2.5} />
-                            <svg
-                              width="10"
-                              height="10"
-                              viewBox="0 0 24 24"
-                              fill="#34d399"
-                              aria-hidden
-                              className="absolute"
-                            >
-                              <rect x="6" y="5" width="4" height="14" rx="1" />
-                              <rect x="14" y="5" width="4" height="14" rx="1" />
-                            </svg>
-                          </div>
-                        ) : null}
-                      </div>
-                    ) : null}
-                    <InfoArea
-                      {...(interactive
-                        ? {
-                            type: 'button' as const,
-                            onClick: (e: React.MouseEvent) => {
-                              e.stopPropagation();
-                              playable
-                                ? onPlay(t, tracks, i)
-                                : onTogglePreview(t.preview_url as string);
-                            },
-                            'aria-label': playable
-                              ? `Play ${t.title}`
-                              : previewing
-                                ? `Stop preview of ${t.title}`
-                                : `Preview ${t.title}`,
-                          }
-                        : {})}
-                      className="min-w-0 flex-1 text-left rounded-lg focus:outline-none focus-visible:ring-1 focus-visible:ring-white/60"
-                    >
-                      <div
-                        className={`${
-                          roomy ? 'text-base' : 'text-sm'
-                        } font-medium truncate ${
-                          current ? 'text-white' : ''
-                        }`}
-                      >
-                        {t.title}
-                      </div>
-                      <div
-                        className={`${
-                          roomy ? 'text-sm' : 'text-xs'
-                        } text-neutral-500 truncate flex items-center gap-1.5`}
-                      >
-                        {t.explicit && <ExplicitBadge />}
-                        <span className="truncate">{renderArtists(t.artists)}</span>
-                      </div>
-                    </InfoArea>
-                    {/* ALBUM — playlist rows only (desktop); the album each track
-                        comes from, clickable to open it. Hidden on phone to keep
-                        the row compact (column counts stay in sync with the grid). */}
-                    {isCatalogPlaylist ? (
-                      <div
-                        className={`hidden sm:block min-w-0 truncate ${
-                          catalogInline
-                            ? 'text-sm text-neutral-400'
-                            : 'text-xs text-neutral-500'
-                        }`}
-                      >
-                        {t.album ? (
-                          onGoToAlbum ? (
-                            <span
-                              role="link"
-                              tabIndex={0}
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                e.preventDefault();
-                                onGoToAlbum(t.album!, t.artists[0] ?? null);
-                              }}
-                              onKeyDown={(e) => {
-                                if (e.key === 'Enter' || e.key === ' ') {
-                                  e.stopPropagation();
-                                  e.preventDefault();
-                                  onGoToAlbum(t.album!, t.artists[0] ?? null);
-                                }
-                              }}
-                              className="cursor-pointer hover:text-neutral-100 hover:underline"
-                            >
-                              {t.album}
-                            </span>
-                          ) : (
-                            t.album
-                          )
-                        ) : (
-                          ''
-                        )}
-                      </div>
-                    ) : null}
-                    {/* FILE — the green "downloaded" seal. The "in a playlist" ✓
-                        is now its OWN column (below), on catalog playlists too, so
-                        this cell shows download state only. Desktop always renders
-                        the box (a real grid column); phone (onShowTrackSheet) only
-                        when there's a seal, so an undownloaded row doesn't push the
-                        ⋯ off-align from the saved-library rows. */}
-                    {t.has_audio || !onShowTrackSheet ? (
-                      <div className="shrink-0 grid place-items-start">
-                        <span className="grid h-7 w-7 place-items-center">
-                          {t.has_audio ? <AlbumDownloadedBadge /> : null}
-                        </span>
-                      </div>
-                    ) : null}
-                    {/* "In a playlist" ✓ — its own column on desktop albums AND
-                        catalog playlists (phone folds it into the ⋯ sheet). On a
-                        catalog playlist it's hidden below sm since those rows are
-                        flex on phone; albums keep their existing all-width cell. */}
-                    {showInPlaylistColumn ? (
-                      <div
-                        className={`shrink-0 place-items-center ${
-                          isCatalogPlaylist ? 'hidden sm:grid' : 'grid'
-                        }`}
-                      >
-                        {renderAddToLibrary(t)}
-                      </div>
-                    ) : null}
-                    <div
-                      className={`hidden sm:block tabular-nums text-right ${
-                        roomy
-                          ? 'text-sm text-neutral-500'
-                          : 'text-[11px] text-neutral-600'
-                      }`}
-                    >
-                      {formatDuration(t.duration_ms)}
-                    </div>
-                    {onShowTrackMenu ? (
-                      <div className="grid place-items-center">
-                        <button
-                          type="button"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            onShowTrackMenu(t, e.clientX, e.clientY);
-                          }}
-                          className="grid h-8 w-8 place-items-center rounded-full text-neutral-400 opacity-0 transition hover:bg-neutral-800 hover:text-neutral-100 group-hover:opacity-100 focus-visible:opacity-100"
-                          title="More options"
-                          aria-label={`More options for ${t.title}`}
-                        >
-                          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-                            <circle cx="5" cy="12" r="1.6" />
-                            <circle cx="12" cy="12" r="1.6" />
-                            <circle cx="19" cy="12" r="1.6" />
-                          </svg>
-                        </button>
-                      </div>
-                    ) : null}
-                    {/* Phone: a touch-visible ⋯ that opens the same bottom sheet
-                        as the library album/playlist rows (Favorite · Add · Go to
-                        artist). Only set on phone, so it never renders on desktop
-                        (which uses the hover ⋯ above). */}
-                    {onShowTrackSheet ? (
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          onShowTrackSheet(t);
-                        }}
-                        className="h-11 w-9 -my-2 -mr-2 shrink-0 grid place-items-center text-neutral-500 active:text-neutral-200"
-                        aria-label={`More options for ${t.title}`}
-                      >
-                        <svg width="19" height="19" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-                          <circle cx="5" cy="12" r="1.7" />
-                          <circle cx="12" cy="12" r="1.7" />
-                          <circle cx="19" cy="12" r="1.7" />
-                        </svg>
-                      </button>
-                    ) : null}
-                    </div>
-                    </MaybeSwipe>
-                  </li>
-                );
-              })}
-            </ul>
-          </div>
-        )}
-        {/* Full release date — Spotify shows this under the album tracklist. */}
-        {formatReleaseDate(album.release_date) ? (
-          <div className="px-1 pt-1 text-xs text-neutral-500">
-            {formatReleaseDate(album.release_date)}
-          </div>
-        ) : null}
-        {/* "More by {artist}" — the primary artist's other releases. */}
-        {onPickAlbum && moreBy && moreBy.length > 0 ? (
-          <div className="pt-5">
-            <div className={cn(EYEBROW, 'px-1 mb-2')}>
-              More by {album.artists[0]}
-            </div>
+            <SectionHeader label="Appears On" />
             <AlbumGrid
-              albums={moreBy}
+              albums={appearsOn}
               onOpen={onPickAlbum}
               onPlay={(a) => playAlbumCard(a, token, onPlay)}
-              subtitleMode="discography"
+              layout="row"
             />
           </div>
         ) : null}
+
+        {/* About + Similar Artists — one Apple-Music-style closing band.
+            Everything from "About" down sits on its own slightly-lighter
+            surface with a hairline top edge, so it reads as the page's footer
+            area rather than more floating sections. Full-bleed on the phone
+            (escapes the column's px-4/pb-4 and runs to the page bottom); a
+            rounded card on desktop, matching its floating-card chrome. */}
+        {bio || (related && related.length > 0) ? (
+          <div className="-mx-4 -mb-4 mt-2 flex flex-col gap-6 border-t border-white/[0.06] bg-neutral-900 px-4 pt-6 pb-8 sm:mx-0 sm:mb-0 sm:rounded-2xl sm:border sm:border-white/5 sm:px-6 sm:pb-6">
+            {bio ? (
+              <div>
+                <h2 className="text-lg font-bold tracking-tight">
+                  About {artist.name}
+                </h2>
+                {/* Apple-style: the bio clamps to a few lines with a MORE
+                    toggle instead of dumping the whole essay. */}
+                <p
+                  className={cn(
+                    'mt-3 max-w-2xl text-[15px] leading-relaxed text-neutral-300 whitespace-pre-line',
+                    !bioExpanded && 'line-clamp-3',
+                  )}
+                >
+                  {bio.extract}
+                </p>
+                {/* Collapsed: just MORE. The Wikipedia link is part of the
+                    expanded reading experience, so it only appears once the
+                    bio is opened (or when the bio is short enough that there
+                    is no clamp at all). */}
+                <div className="mt-2 flex items-center gap-5">
+                  {bio.extract.length > 220 ? (
+                    <button
+                      type="button"
+                      onClick={() => setBioExpanded((v) => !v)}
+                      className="text-[13px] font-semibold tracking-wide text-neutral-200 hover:text-white"
+                    >
+                      {bioExpanded ? 'LESS' : 'MORE'}
+                    </button>
+                  ) : null}
+                  {bio.url && (bioExpanded || bio.extract.length <= 220) ? (
+                    <a
+                      href={bio.url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-sm font-medium text-neutral-400 hover:text-white underline underline-offset-2"
+                    >
+                      Read more on Wikipedia →
+                    </a>
+                  ) : null}
+                </div>
+                {/* The facts column, Apple-style: stacked label/value rows on
+                    the phone, wrapping side-by-side on wider screens. Only the
+                    rows we actually know render (Wikidata is best-effort). */}
+                {artist.total_fans || bio.from || bio.born || bio.genre ? (
+                  <div className="mt-6 flex flex-col gap-5 sm:flex-row sm:flex-wrap sm:gap-x-14 sm:gap-y-5">
+                    {bio.from ? (
+                      <div>
+                        <div className="text-[11px] uppercase tracking-wide text-neutral-500">
+                          From
+                        </div>
+                        <div className="text-base text-neutral-100 mt-1">
+                          {bio.from}
+                        </div>
+                      </div>
+                    ) : null}
+                    {bio.born ? (
+                      <div>
+                        <div className="text-[11px] uppercase tracking-wide text-neutral-500">
+                          Born
+                        </div>
+                        <div className="text-base text-neutral-100 mt-1">
+                          {bio.born}
+                        </div>
+                      </div>
+                    ) : null}
+                    {bio.genre ? (
+                      <div>
+                        <div className="text-[11px] uppercase tracking-wide text-neutral-500">
+                          Genre
+                        </div>
+                        <div className="text-base text-neutral-100 mt-1">
+                          {bio.genre}
+                        </div>
+                      </div>
+                    ) : null}
+                    {artist.total_fans ? (
+                      <div>
+                        <div className="text-[11px] uppercase tracking-wide text-neutral-500">
+                          Listeners
+                        </div>
+                        <div className="text-base text-neutral-100 mt-1">
+                          {formatCompact(artist.total_fans)}
+                        </div>
+                      </div>
+                    ) : null}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+
+            {/* Similar Artists — related artists in a horizontal carousel
+                (Apple Music's last section); tapping drills into one. */}
+            {related && related.length > 0 ? (
+              <div>
+                <SectionHeader
+                  label="Similar Artists"
+                  onShowAll={
+                    onShowAll && related.length > 5
+                      ? () => onShowAll('related', { related })
+                      : undefined
+                  }
+                />
+                <ArtistGrid
+                  artists={related}
+                  onOpen={onPickArtist}
+                  onPlay={(a) => playArtistCard(a, token, onPlay)}
+                  layout="row"
+                />
+              </div>
+            ) : null}
+          </div>
+        ) : null}
       </div>
+      {heroMenu ? (
+        <ContextMenu state={heroMenu} onClose={() => setHeroMenu(null)} />
+      ) : null}
     </ModalShell>
-    {/* Phone swipe feedback — same transient pill the library playlist page
-        uses, positioned above the mini-player + nav via --overlay-bottom. */}
-    {swipeToast ? (
-      <div
-        className="fixed left-1/2 -translate-x-1/2 z-50 px-4 py-2 rounded-full bg-neutral-800 text-sm text-neutral-100 shadow-lg pointer-events-none"
-        style={{ bottom: 'calc(var(--overlay-bottom, 146px) + 0.5rem)' }}
-      >
-        {swipeToast}
-      </div>
-    ) : null}
-    </>
   );
 }
+
 
 /** A single catalog-playlist card — square cover + title + creator/count.
  *  Shared by the wrapping `PlaylistGrid` and the horizontal "shelf" carousel
@@ -6483,6 +6193,7 @@ export function PlaylistDetailModal({
   isTrackCurrent,
   isPlaying,
   onTogglePlay,
+  pin,
 }: {
   token: string;
   playlist: CatalogPlaylistSummary;
@@ -6508,6 +6219,8 @@ export function PlaylistDetailModal({
   isTrackCurrent?: (t: SearchTrackResult) => boolean;
   isPlaying?: boolean;
   onTogglePlay?: () => void;
+  /** Desktop "Pin to sidebar" — forwarded to the shared album-page header. */
+  pin?: SidebarPinController;
 }) {
   const [detail, setDetail] = useState<CatalogPlaylist | null>(null);
   // Id of an existing library playlist that already matches this catalog
@@ -6517,6 +6230,12 @@ export function PlaylistDetailModal({
   // "+" importer, so a playlist you've already added no longer reads as missing
   // (or invites a silent duplicate).
   const [savedCopyId, setSavedCopyId] = useState<number | null>(null);
+
+  // Re-fetch on a library change elsewhere. This page wraps AlbumDetailModal with
+  // `disableFetch`, so the shared page WON'T refresh itself — the fresh tracklist
+  // (with updated per-track ✓) and the "in your library" ✓ have to come from
+  // re-fetching here. (The picker floats over this still-mounted page.)
+  const libTick = useLibraryChangeTick();
 
   // Pull the full tracklist for this catalog playlist. The shared page below
   // renders its hero immediately (from the summary) and shows "Loading tracks…"
@@ -6533,7 +6252,7 @@ export function PlaylistDetailModal({
     return () => {
       cancelled = true;
     };
-  }, [playlist.source_id, token]);
+  }, [playlist.source_id, token, libTick]);
 
   // Detect an already-imported copy by name (case-insensitive, trimmed). A
   // best-effort library read; a failure just leaves the importer showing.
@@ -6552,7 +6271,7 @@ export function PlaylistDetailModal({
     return () => {
       cancelled = true;
     };
-  }, [playlist.title, token, activeProfileId]);
+  }, [playlist.title, token, activeProfileId, libTick]);
 
   const tracks = detail?.tracks ?? null;
   const cover = detail?.cover_url ?? playlist.cover_url;
@@ -6609,6 +6328,7 @@ export function PlaylistDetailModal({
       onTogglePreview={onTogglePreview}
       inline={inline}
       activeProfileId={activeProfileId}
+      pin={pin}
     />
   );
 }
@@ -6638,6 +6358,7 @@ export function MixDetailModal({
   isTrackCurrent,
   isPlaying,
   onTogglePlay,
+  pin,
 }: {
   token: string;
   mix: { title: string; eyebrow?: string | null; tracks: SearchTrackResult[] };
@@ -6660,6 +6381,8 @@ export function MixDetailModal({
   isTrackCurrent?: (t: SearchTrackResult) => boolean;
   isPlaying?: boolean;
   onTogglePlay?: () => void;
+  /** Desktop "Pin to sidebar" — forwarded to the shared album-page header. */
+  pin?: SidebarPinController;
 }) {
   const coverUrls = mix.tracks
     .map((t) => t.album_art_url)
@@ -6679,6 +6402,10 @@ export function MixDetailModal({
   // A mix can be SAVED to the library (imported as a snapshot playlist), same
   // as a catalog playlist — the hero +/✓ then doubles as save / remove. Detect
   // an existing copy by name so a re-open shows ✓ instead of offering a dup.
+  // Re-fetch on a library change so saving/removing the mix elsewhere keeps this
+  // ✓ honest. (The per-track "in a playlist" ✓ can't refresh — a mix is ephemeral
+  // Home-payload data with no catalog id to re-query; only a re-open rebuilds it.)
+  const libTick = useLibraryChangeTick();
   const [savedCopyId, setSavedCopyId] = useState<number | null>(null);
   useEffect(() => {
     let cancelled = false;
@@ -6696,7 +6423,7 @@ export function MixDetailModal({
     return () => {
       cancelled = true;
     };
-  }, [mix.title, token, activeProfileId]);
+  }, [mix.title, token, activeProfileId, libTick]);
   const handleImport = async () => {
     if (mix.tracks.length === 0) return;
     const r = await importPlaylist(mix.title, mix.tracks, token, activeProfileId);
@@ -6734,612 +6461,8 @@ export function MixDetailModal({
       onTogglePreview={onTogglePreview}
       inline={inline}
       activeProfileId={activeProfileId}
+      pin={pin}
     />
   );
 }
 
-/**
- * Multi-select playlist manager. The list of playlists is shown with
- * a checkbox on each row, pre-filled from `track.in_playlist_ids`.
- * The user toggles freely and taps Done; we send a single PATCH with
- * the {add, remove} diff so the round-trip is one call regardless of
- * how many changes were made.
- *
- * Triggered from both the + button (no current memberships) and the ✓
- * button (already in N playlists) on search results — same component
- * both ways, the only difference is the initial checked set.
- */
-export function AddToPlaylistModal({
-  token,
-  track,
-  onClose,
-  activeProfileId,
-}: {
-  token: string;
-  track: SearchTrackResult;
-  onClose: () => void;
-  /** Active profile a newly-created playlist should belong to. */
-  activeProfileId?: number | null;
-}) {
-  const [playlists, setPlaylists] = useState<PlaylistRow[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [filter, setFilter] = useState('');
-  // Initial = the server's snapshot at modal-open; current = the
-  // user's working selection. Diff between them is what gets sent.
-  const initialSelected = useMemo(
-    () => new Set<number>(track.in_playlist_ids),
-    [track.in_playlist_ids],
-  );
-  const [currentSelected, setCurrentSelected] = useState<Set<number>>(
-    () => new Set<number>(track.in_playlist_ids),
-  );
-  // 'list' = the multi-select; 'create' = name-input for a new playlist.
-  const [mode, setMode] = useState<'list' | 'create'>('list');
-  const [newName, setNewName] = useState('');
-  const [creating, setCreating] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const filterRef = useRef<HTMLInputElement>(null);
-  const nameRef = useRef<HTMLInputElement>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    // Scope the picker to the ACTIVE profile so you can only add to playlists
-    // you own — without profile_id the hub falls back to the default profile
-    // and lists another account's playlists.
-    listPlaylists(token, activeProfileId)
-      .then((rows) => {
-        if (!cancelled) setPlaylists(rows);
-      })
-      .catch((e) => {
-        if (!cancelled) setError(friendlyError(e));
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [token, activeProfileId]);
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        if (mode === 'create') setMode('list');
-        else onClose();
-      }
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [onClose, mode]);
-
-  useEffect(() => {
-    if (mode === 'create') {
-      const id = window.setTimeout(() => nameRef.current?.focus(), 50);
-      return () => window.clearTimeout(id);
-    }
-  }, [mode]);
-
-  const filtered = useMemo(() => {
-    if (!playlists) return null;
-    const f = filter.trim().toLowerCase();
-    // A saved album is NOT a playlist — you can't add arbitrary songs to it, so
-    // it never appears as an add-target here (Spotify keeps albums and playlists
-    // separate the same way).
-    const addable = playlists.filter((p) => p.source !== 'album');
-    const base = f
-      ? addable.filter((p) => p.name.toLowerCase().includes(f))
-      : addable;
-    // Pin Liked Songs to the TOP (Spotify-style) so liking is one tap; a stable
-    // sort keeps every other playlist in its original order.
-    return [...base].sort(
-      (a, b) => (a.source === 'liked' ? 0 : 1) - (b.source === 'liked' ? 0 : 1),
-    );
-  }, [playlists, filter]);
-
-  // Diff is what powers the "Done" button label + enabled state.
-  const { addIds, removeIds, hasChanges } = useMemo(() => {
-    const add: number[] = [];
-    const remove: number[] = [];
-    for (const id of currentSelected) {
-      if (!initialSelected.has(id)) add.push(id);
-    }
-    for (const id of initialSelected) {
-      if (!currentSelected.has(id)) remove.push(id);
-    }
-    return { addIds: add, removeIds: remove, hasChanges: add.length > 0 || remove.length > 0 };
-  }, [currentSelected, initialSelected]);
-
-  const toggle = useCallback((playlistId: number) => {
-    setCurrentSelected((prev) => {
-      const next = new Set(prev);
-      if (next.has(playlistId)) next.delete(playlistId);
-      else next.add(playlistId);
-      return next;
-    });
-  }, []);
-
-  const handleSave = useCallback(async () => {
-    if (!hasChanges) {
-      onClose();
-      return;
-    }
-    setSaving(true);
-    setError(null);
-    try {
-      await patchTrackPlaylists(track, addIds, removeIds, token);
-      onClose();
-    } catch (e) {
-      setError(friendlyError(e));
-    } finally {
-      setSaving(false);
-    }
-  }, [hasChanges, addIds, removeIds, track, token, onClose]);
-
-  const handleCreatePlaylist = useCallback(
-    async (e: React.FormEvent) => {
-      e.preventDefault();
-      const name = newName.trim();
-      if (!name) return;
-      setCreating(true);
-      setError(null);
-      try {
-        const pl = await createPlaylist(name, token, activeProfileId);
-        // Splice the new playlist into the local list with a 0 count,
-        // then auto-check it so the next tap on Done adds the track
-        // to it. The track-add itself happens on Save via the PATCH.
-        setPlaylists((prev) => {
-          const row: PlaylistRow = {
-            id: pl.id,
-            name: pl.name,
-            track_count: 0,
-            cover_url: null,
-            source: 'local',
-          };
-          return prev ? [row, ...prev] : [row];
-        });
-        setCurrentSelected((prev) => {
-          const next = new Set(prev);
-          next.add(pl.id);
-          return next;
-        });
-        setNewName('');
-        setMode('list');
-      } catch (err) {
-        setError(friendlyError(err));
-      } finally {
-        setCreating(false);
-      }
-    },
-    [newName, token, activeProfileId],
-  );
-
-  const doneLabel = saving
-    ? 'Saving…'
-    : !hasChanges
-      ? 'Done'
-      : `Done (${addIds.length} added${removeIds.length > 0 ? `, ${removeIds.length} removed` : ''})`;
-
-  return (
-    <ModalShell
-      title={mode === 'create' ? 'New playlist' : 'Add to playlist'}
-      subtitle={`${track.title} — ${track.artists.join(', ')}`}
-      onClose={onClose}
-      sheet
-      footer={
-        isHubReachable() && mode === 'list' ? (
-          <button
-            type="button"
-            onClick={handleSave}
-            disabled={saving}
-            className={cn(BTN_PRIMARY, 'w-full py-2.5')}
-          >
-            {doneLabel}
-          </button>
-        ) : undefined
-      }
-    >
-      {!isHubReachable() ? (
-        <div className="px-5 pb-6 pt-1 text-center">
-          <p className="text-sm text-neutral-200">
-            Saving songs needs Beetbot on your computer.
-          </p>
-          <p className="text-xs text-neutral-500 mt-2">
-            You&rsquo;re browsing on your phone&rsquo;s own connection. Reconnect
-            to your computer to add this to a playlist.
-          </p>
-          <button
-            type="button"
-            onClick={onClose}
-            className={cn(BTN_SECONDARY, 'mt-4')}
-          >
-            OK
-          </button>
-        </div>
-      ) : mode === 'create' ? (
-        <form
-          onSubmit={handleCreatePlaylist}
-          className="px-4 pb-4 flex flex-col gap-3"
-        >
-          <button
-            type="button"
-            onClick={() => setMode('list')}
-            className="self-start inline-flex items-center gap-1 text-xs text-neutral-400 hover:text-neutral-200 active:opacity-60 -mt-1 mb-1"
-          >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-              <path d="M19 12H5M12 19l-7-7 7-7" />
-            </svg>
-            Back to playlists
-          </button>
-          <label
-            htmlFor="new-playlist-name"
-            className={EYEBROW}
-          >
-            Playlist name
-          </label>
-          <input
-            id="new-playlist-name"
-            ref={nameRef}
-            type="text"
-            value={newName}
-            onChange={(e) => setNewName(e.target.value)}
-            maxLength={200}
-            placeholder="e.g. Workout Mix"
-            className={cn(INPUT, 'w-full text-base')}
-            disabled={creating}
-            autoCapitalize="words"
-            autoCorrect="off"
-          />
-          {error && (
-            <div className={cn(CALLOUT_ERROR, 'text-xs')}>
-              {error}
-            </div>
-          )}
-          <button
-            type="submit"
-            disabled={creating || !newName.trim()}
-            className={cn(BTN_PRIMARY, 'w-full py-2.5')}
-          >
-            {creating ? 'Creating…' : 'Create playlist'}
-          </button>
-          <p className="text-xs text-neutral-500 px-1 text-center">
-            The new playlist will be checked. Tap Done on the next
-            screen to actually add this song to it.
-          </p>
-        </form>
-      ) : (
-        <div className="px-4 pb-4 flex flex-col gap-3">
-          {/* "+ New playlist" — always at the top, above the filter,
-              so the action is reachable even when the user has typed
-              a filter string that would otherwise hide everything. */}
-          <button
-            type="button"
-            onClick={() => setMode('create')}
-            className="w-full py-2.5 px-2 flex items-center gap-3 text-left rounded-lg hover:bg-neutral-900 active:bg-neutral-900 transition"
-          >
-            <div className="h-10 w-10 shrink-0 rounded-lg bg-white/10 grid place-items-center text-neutral-200 leading-none">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-                <path d="M12 5v14M5 12h14" />
-              </svg>
-            </div>
-            <div className="flex-1 min-w-0">
-              <div className="text-sm font-medium text-neutral-200">
-                New playlist
-              </div>
-              <div className="text-xs text-neutral-500">
-                Add this song to a brand-new playlist
-              </div>
-            </div>
-          </button>
-
-          <input
-            ref={filterRef}
-            type="search"
-            value={filter}
-            onChange={(e) => setFilter(e.target.value)}
-            placeholder="Filter playlists"
-            className={cn(INPUT, 'w-full text-base')}
-          />
-          {error && (
-            <div className={cn(CALLOUT_ERROR, 'text-xs')}>
-              {error}
-            </div>
-          )}
-          {!filtered && !error && (
-            <div className="text-sm text-neutral-500 px-1">
-              Loading playlists…
-            </div>
-          )}
-          {filtered && filtered.length === 0 && (
-            <div className="text-sm text-neutral-500 px-1">
-              No playlists match.
-            </div>
-          )}
-          {filtered && filtered.length > 0 && (
-            <ul className="divide-y divide-white/5">
-              {filtered.map((p) => {
-                const checked = currentSelected.has(p.id);
-                return (
-                  <li key={p.id}>
-                    <button
-                      type="button"
-                      onClick={() => toggle(p.id)}
-                      disabled={saving}
-                      aria-pressed={checked}
-                      className="w-full py-2.5 px-1 flex items-center gap-3 text-left rounded-lg hover:bg-white/5 active:bg-white/5 transition disabled:opacity-50"
-                    >
-                      <div className="h-10 w-10 shrink-0 rounded-lg overflow-hidden bg-neutral-800">
-                        {p.cover_url ? (
-                          <img
-                            src={p.cover_url}
-                            alt=""
-                            className="h-full w-full object-cover"
-                            draggable={false}
-                            loading="lazy"
-                          />
-                        ) : (
-                          <div className="h-full grid place-items-center text-neutral-600">
-                            {p.source === 'liked' ? '★' : '♪'}
-                          </div>
-                        )}
-                      </div>
-                      <div className="flex-1 min-w-0">
-                        <div className="text-sm font-medium truncate">
-                          {p.name}
-                        </div>
-                        <div className="text-xs text-neutral-500">
-                          {p.track_count}{' '}
-                          {p.track_count === 1 ? 'song' : 'songs'}
-                        </div>
-                      </div>
-                      {/* Spotify-style ✓ in a filled green circle when
-                          checked, hollow circle when not. */}
-                      <div
-                        className={`h-6 w-6 shrink-0 rounded-full grid place-items-center border ${
-                          checked
-                            ? 'bg-neutral-100 border-white/30 text-neutral-950'
-                            : 'border-neutral-600 text-transparent'
-                        }`}
-                        aria-hidden
-                      >
-                        <svg
-                          width="14"
-                          height="14"
-                          viewBox="0 0 24 24"
-                          fill="none"
-                          stroke="currentColor"
-                          strokeWidth="3"
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                        >
-                          <path d="m5 12 5 5 9-11" />
-                        </svg>
-                      </div>
-                    </button>
-                  </li>
-                );
-              })}
-            </ul>
-          )}
-        </div>
-      )}
-    </ModalShell>
-  );
-}
-
-/** Bottom-sheet-style modal shell shared by both pickers. */
-function ModalShell({
-  title,
-  subtitle,
-  onClose,
-  children,
-  hero,
-  stickyBar,
-  condensed,
-  onHeaderPlay,
-  sheet,
-  footer,
-  // `wide` is accepted (callers still pass it) but no longer affects layout now
-  // that the phone shell is a full-bleed page and the desktop shell is inline.
-  inline,
-}: {
-  title: string;
-  subtitle?: string;
-  onClose: () => void;
-  children: React.ReactNode;
-  /** Sheet mode: a pinned footer (e.g. a "Done" action) that stays visible
-   *  below the scrolling body instead of scrolling off the bottom. */
-  footer?: React.ReactNode;
-  /** Optional full-bleed header (e.g. an artist banner). When provided,
-   *  the default title bar is replaced; the hero renders at the top of
-   *  the scrollable body and a floating close button is drawn over it. */
-  hero?: React.ReactNode;
-  /** Desktop only: a sticky element rendered BEFORE the hero (so it can pin
-   *  to the top of the scroll as the hero scrolls away). */
-  stickyBar?: React.ReactNode;
-  /** Phone: whether the hero has scrolled past its title. Drives the phone's
-   *  own unified top bar (which frosts + fades in the title/play), so the phone
-   *  matches the library playlist page rather than the desktop CondensedHeaderBar. */
-  condensed?: boolean;
-  /** Phone: the header play button's action (fades in when condensed). */
-  onHeaderPlay?: () => void;
-  /** Picker mode: render as a scrimmed dialog (centered on desktop, bottom
-   *  sheet on phone) rather than a full-bleed detail page. Used by the
-   *  add-to-playlist / create-playlist pickers. */
-  sheet?: boolean;
-  /** Wider panel for page-like modals (the artist page). */
-  wide?: boolean;
-  /** Desktop: render as an inline full page (no overlay/backdrop) with a
-   *  "Back" affordance instead of a floating modal. The parent content
-   *  area provides the scroll. `onClose` becomes "go back". */
-  inline?: boolean;
-}) {
-  // Lock body scroll only for the overlay modal — an inline page scrolls
-  // with its parent and shouldn't freeze the document.
-  useEffect(() => {
-    if (inline) return;
-    const prev = document.body.style.overflow;
-    document.body.style.overflow = 'hidden';
-    return () => {
-      document.body.style.overflow = prev;
-    };
-  }, [inline]);
-
-  if (inline) {
-    return (
-      <div
-        className="pb-6"
-        // Gentle fade + rise so the page eases in rather than hard-cutting.
-        // Replays whenever the shell remounts (e.g. drilling artist → artist,
-        // which is keyed on the artist id).
-        style={{ animation: 'beetbot-page-enter 280ms ease-out both' }}
-      >
-        {/* Condensed sticky bar pins to the top as the hero scrolls away. */}
-        {stickyBar}
-        {/* No inline Back button on desktop — the persistent top bar's global
-            Back arrow unwinds these inline pages (search + Discover drill-ins).
-            The phone's modal (non-inline branch below) keeps its own close. */}
-        {hero ?? (
-          <div className="px-1 mb-4 pt-6">
-            <h1 className="text-2xl font-bold tracking-tight">{title}</h1>
-            {subtitle ? (
-              <div className="text-sm text-neutral-400 mt-0.5">{subtitle}</div>
-            ) : null}
-          </div>
-        )}
-        {children}
-      </div>
-    );
-  }
-
-  if (sheet) {
-    // Picker mode: a scrimmed dialog — centered card on desktop, bottom sheet on
-    // phone. (Detail drill-ins use the full-bleed page below instead.)
-    return (
-      <div
-        className={cn(SCRIM, 'z-50 flex flex-col justify-end sm:justify-center sm:items-center')}
-        onClick={onClose}
-        role="presentation"
-      >
-        <div
-          className={cn(BOTTOM_SHEET, 'relative w-full flex flex-col overflow-hidden sm:max-w-md')}
-          // Cap the height so the picker doesn't stretch to nearly the full
-          // window on desktop (it read as oversized); still tall enough for a
-          // long playlist list, which scrolls inside the body.
-          style={{
-            maxHeight:
-              'min(calc(100dvh - max(env(safe-area-inset-top, 0px), 3rem)), 40rem)',
-          }}
-          onClick={(e) => e.stopPropagation()}
-          role="dialog"
-          aria-modal="true"
-        >
-          <div className="shrink-0 px-4 pt-4 pb-3 flex items-start justify-between gap-3 border-b border-white/5">
-            <div className="min-w-0 flex-1">
-              <h2 className="text-base font-semibold truncate">{title}</h2>
-              {subtitle ? (
-                <div className="text-xs text-neutral-500 truncate">{subtitle}</div>
-              ) : null}
-            </div>
-            <button
-              type="button"
-              onClick={onClose}
-              aria-label="Close"
-              className="-mr-1 h-8 w-8 shrink-0 grid place-items-center rounded-full text-neutral-400 hover:bg-neutral-900 hover:text-neutral-100 active:bg-white/10"
-            >
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden>
-                <path d="M6 6l12 12M18 6 6 18" />
-              </svg>
-            </button>
-          </div>
-          <div
-            className="overflow-y-auto overscroll-contain flex-1 min-h-0"
-            style={footer ? undefined : { paddingBottom: 'env(safe-area-inset-bottom)' }}
-          >
-            {hero}
-            {children}
-          </div>
-          {footer ? (
-            <div
-              className="shrink-0 border-t border-white/5 px-4 pt-3 pb-4"
-              style={{ paddingBottom: 'calc(env(safe-area-inset-bottom) + 1rem)' }}
-            >
-              {footer}
-            </div>
-          ) : null}
-        </div>
-      </div>
-    );
-  }
-
-  // Phone: a full-bleed PAGE (not a cover-everything sheet) at z-10 — it sits
-  // UNDER the app's z-20 bar+nav wrapper, so the mini player and bottom nav stay
-  // visible and tappable, exactly like an iOS push over the tab bar. The page
-  // reserves the chrome's height (--overlay-bottom, published by App) so its
-  // last row clears the bar+nav.
-  return (
-    <div
-      className="fixed inset-0 z-10 overflow-y-auto overscroll-contain bg-neutral-950"
-      style={{
-        paddingTop: 'env(safe-area-inset-top)',
-        paddingBottom: 'var(--overlay-bottom, 146px)',
-        animation: 'beetbot-page-enter 280ms ease-out both',
-      }}
-      role="region"
-      aria-label={title}
-    >
-      {/* One unified top bar — identical to the library playlist page: a
-          legibility gradient over the full-bleed hero at rest (just the back
-          chevron), frosting + fading in the title + play once the hero scrolls
-          past. Replaces the desktop CondensedHeaderBar (phone only). */}
-      <div
-        className={`sticky top-0 z-10 flex items-center gap-2 px-4 pt-3 pb-2 transition-colors duration-200 ${
-          condensed
-            ? 'bg-neutral-950/40 backdrop-blur-2xl backdrop-saturate-150 border-b border-white/5'
-            : 'bg-gradient-to-b from-black/50 to-transparent'
-        }`}
-      >
-        <button
-          type="button"
-          onClick={onClose}
-          aria-label="Back"
-          className="grid h-9 w-9 shrink-0 place-items-center rounded-full text-neutral-100 active:bg-white/10"
-        >
-          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-            <path d="m15 18-6-6 6-6" />
-          </svg>
-        </button>
-        <span
-          className={`min-w-0 flex-1 truncate text-sm font-semibold transition-opacity duration-200 ${
-            condensed ? 'opacity-100' : 'opacity-0'
-          }`}
-        >
-          {title}
-        </span>
-        {onHeaderPlay ? (
-          <button
-            type="button"
-            onClick={onHeaderPlay}
-            aria-label={`Play ${title}`}
-            className={`grid h-8 w-8 shrink-0 place-items-center rounded-full bg-neutral-100 text-neutral-950 transition active:scale-95 ${
-              condensed ? 'opacity-100' : 'pointer-events-none opacity-0'
-            }`}
-          >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-              <path d="M8 5v14l11-7z" />
-            </svg>
-          </button>
-        ) : null}
-      </div>
-      {/* -mt-14 lifts the hero up behind the floating bar so the wash runs
-          edge-to-edge to the top (no black band); the hero's own pt clears it. */}
-      <div className="-mt-14">
-        {hero ?? (
-          <div className="px-4 pt-20 pb-4">
-            <h1 className="text-2xl font-bold tracking-tight">{title}</h1>
-            {subtitle ? (
-              <div className="text-sm text-neutral-400 mt-0.5">{subtitle}</div>
-            ) : null}
-          </div>
-        )}
-      </div>
-      {children}
-    </div>
-  );
-}

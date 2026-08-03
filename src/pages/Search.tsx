@@ -3,8 +3,10 @@ import {
   SearchScreen,
   type OverlaySnapshot,
   type SidebarPinController,
+  type SavedArtistController,
 } from '@shared/components/SearchScreen';
 import { isPinned, usePinStore } from '@/lib/pins';
+import { isArtistSaved, useSavedStore } from '@/lib/saved';
 import {
   ensureSession,
   resolveCatalogTrack,
@@ -13,6 +15,7 @@ import {
   setTrackLiked,
   type ResolvedTrack,
   type SearchTrackResult,
+  type StreamTrack,
 } from '@shared/api';
 import { usePlayerStore, currentTrack } from '@/lib/store';
 import { useNavStore } from '@/lib/nav';
@@ -55,6 +58,8 @@ export function SearchOverlay({
   onOverlayBack,
   onSearchFocus,
   onOpenBrowse,
+  onOpenLibraryPlaylist,
+  onAddAudio,
 }: {
   /** Portal target (in the top bar) for the search input + dropdown. */
   barSlot: HTMLElement | null;
@@ -65,10 +70,17 @@ export function SearchOverlay({
   onOverlayPush: (snapshot: OverlaySnapshot) => void;
   /** Steps back one history entry — closing a detail (Escape / ✕) routes here. */
   onOverlayBack: () => void;
-  /** Focusing the idle search box → host opens Discover (Spotify-style). */
-  onSearchFocus: () => void;
+  /** Focusing the idle search box. Optional: we no longer auto-open Discover on
+   *  focus (jarring on desktop) — the in-field Browse button is the explicit way
+   *  in. Kept as a hook in case a host wants focus-time behavior. */
+  onSearchFocus?: () => void;
   /** In-field Browse button (always visible) → host opens Discover. */
   onOpenBrowse: () => void;
+  /** Open one of the user's own library playlists (a "From your library" match)
+   *  as a full page — the host navigates the main view. */
+  onOpenLibraryPlaylist: (id: number) => void;
+  /** "Add audio file" on a fileless album/single row — host resolves + imports. */
+  onAddAudio?: (t: SearchTrackResult) => void;
 }) {
   // One shared session token, fetched once per app launch (not per navigation).
   const { token } = useSession();
@@ -115,6 +127,18 @@ export function SearchOverlay({
     [pins, togglePin],
   );
 
+  // Bridge the saved-artists store into the shared artist page → its header
+  // "Save" pill populates Library › Artists.
+  const savedArtists = useSavedStore((s) => s.artists);
+  const toggleSaved = useSavedStore((s) => s.toggleArtist);
+  const saveController = useMemo<SavedArtistController>(
+    () => ({
+      isSaved: (name) => isArtistSaved(savedArtists, name),
+      toggle: (a) => toggleSaved(a),
+    }),
+    [savedArtists, toggleSaved],
+  );
+
   // Search is silently unavailable until the loopback session is ready (the rest
   // of the app still works). SearchScreen positions itself — an absolute overlay
   // when active, nothing when idle — so the underlying view shows through.
@@ -133,10 +157,13 @@ export function SearchOverlay({
       onOverlayBack={onOverlayBack}
       onSearchFocus={onSearchFocus}
       onOpenBrowse={onOpenBrowse}
+      onOpenLibraryPlaylist={onOpenLibraryPlaylist}
+      onPlayLibrarySong={playLibrarySongOnDesktop}
       openRequest={navRequest}
       onRequestHandled={clearNav}
       activeProfileId={activeProfileId}
       pin={pinController}
+      save={saveController}
       // Browse-album "⋯" menu (parity with library albums). These act on a
       // catalog row, which has no library track until resolved — so each
       // handler imports the track first, then queues / likes it.
@@ -146,6 +173,7 @@ export function SearchOverlay({
       }
       onAlbumAddToQueue={(t) => void queueCatalogTrack(t, token)}
       onAlbumSaveToLiked={(t) => void likeCatalogTrack(t, token, activeProfileId)}
+      onAddAudio={onAddAudio}
       isTrackCurrent={isTrackCurrent}
       isNowPlaying={isNowPlaying}
       onTogglePlay={() => usePlayerStore.getState().playPause()}
@@ -180,6 +208,20 @@ export async function queueCatalogTrack(
   if (id == null) return;
   const track = await ipc.getTrack(id);
   if (track) usePlayerStore.getState().appendToQueue([track]);
+}
+
+/**
+ * Play one of the user's OWN library songs (a "From your library" search
+ * match). Its `id` is already the library track id, so we just load the real
+ * row (for the local file path) and seed the queue — no catalog resolve.
+ */
+export async function playLibrarySongOnDesktop(t: StreamTrack): Promise<void> {
+  try {
+    const track = await ipc.getTrack(t.id);
+    if (track) usePlayerStore.getState().setQueue([track]);
+  } catch (e) {
+    console.warn('[beetbot] desktop play-library-song failed', e);
+  }
 }
 
 /** "Add to Favorites" for a browse-album row: resolve, then like. */

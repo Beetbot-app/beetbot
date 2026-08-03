@@ -57,7 +57,9 @@ export function CondensedHeaderBar({
 }: {
   condensed: boolean;
   title: string;
-  onPlay: () => void;
+  /** Omit to render a title-only bar — for pages where "play" has no clear
+   *  meaning (e.g. an artist's Albums grid). */
+  onPlay?: () => void;
   /** True when this playlist/album is the current playback and it's playing —
    *  the button then shows ⏸ and toggles, mirroring the now-playing bar. */
   playing?: boolean;
@@ -74,23 +76,25 @@ export function CondensedHeaderBar({
             : 'pointer-events-none opacity-0'
         }`}
       >
-        <button
-          type="button"
-          onClick={onPlay}
-          aria-label={`${playing ? 'Pause' : 'Play'} ${title}`}
-          className="grid h-10 w-10 shrink-0 place-items-center rounded-full bg-white text-neutral-950 shadow transition hover:scale-105 hover:bg-neutral-200"
-        >
-          {playing ? (
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-              <rect x="6" y="5" width="4" height="14" rx="1" />
-              <rect x="14" y="5" width="4" height="14" rx="1" />
-            </svg>
-          ) : (
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-              <path d="M8 5v14l11-7z" />
-            </svg>
-          )}
-        </button>
+        {onPlay ? (
+          <button
+            type="button"
+            onClick={onPlay}
+            aria-label={`${playing ? 'Pause' : 'Play'} ${title}`}
+            className="grid h-10 w-10 shrink-0 place-items-center rounded-full bg-white text-neutral-950 shadow transition hover:scale-105 hover:bg-neutral-200"
+          >
+            {playing ? (
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                <rect x="6" y="5" width="4" height="14" rx="1" />
+                <rect x="14" y="5" width="4" height="14" rx="1" />
+              </svg>
+            ) : (
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                <path d="M8 5v14l11-7z" />
+              </svg>
+            )}
+          </button>
+        ) : null}
         <span className="truncate text-lg font-bold tracking-tight">{title}</span>
       </div>
     </div>

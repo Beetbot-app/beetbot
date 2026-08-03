@@ -16,22 +16,31 @@ import {
   type SearchArtistResult,
   type SearchTrackResult,
 } from '../api';
+import { AddToPlaylistModal } from './modals/AddToPlaylistModal';
 import {
-  AddToPlaylistModal,
   AlbumDetailModal,
   AlbumGrid,
   ArtistDetailModal,
   ArtistGrid,
   PlaylistDetailModal,
   PlaylistGrid,
+  type SidebarPinController,
+  type SavedArtistController,
   PREVIEW_RING_KEYFRAMES,
   playAlbumCard,
   playArtistCard,
   TrackList,
   usePreviewPlayer,
 } from './SearchScreen';
-import { ContextMenu, type MenuItem, type MenuState } from './ContextMenu';
-import { cn, CALLOUT_WARN, EYEBROW_ON_ART } from '../ui';
+import {
+  ContextMenu,
+  MenuGlyphs,
+  fileMenuItems,
+  type MenuItem,
+  type MenuState,
+} from './ContextMenu';
+import { cn, EYEBROW, EYEBROW_ON_ART } from '../ui';
+import { useLibraryChangeTick } from '../useLibraryChange';
 import { HeroWash } from './HeroWash';
 import { CondensedHeaderBar, useCondensedHeader } from './StickyHeader';
 
@@ -73,6 +82,20 @@ interface Props {
     list?: SearchTrackResult[],
     index?: number,
   ) => void;
+  /** Top-of-grid heading style. `'browse-all'` (default) is the big standalone
+   *  "Browse all" title; `'eyebrow'` is the small uppercase "Browse" kicker —
+   *  used when this grid is embedded as the phone search screen's empty state. */
+  titleVariant?: 'browse-all' | 'eyebrow';
+  /** Open straight to a genre feed on mount (skip the grid). The phone uses this
+   *  to render a tapped genre as its own page. */
+  initialGenre?: Genre | null;
+  /** When set, tapping a genre tile in the grid calls this instead of drilling
+   *  in place — so the host can navigate to a SEPARATE page (phone: the search
+   *  grid hands off to a dedicated genre view rather than expanding inline). */
+  onOpenGenre?: (genre: Genre) => void;
+  /** When set, the phone genre page's back control calls this (e.g. return to
+   *  Search) instead of clearing back to this component's own grid. */
+  onExitGenre?: () => void;
   /** Desktop: render artist/album drill-ins as inline full pages instead
    *  of modal overlays (phone keeps the modals). */
   pageMode?: boolean;
@@ -104,6 +127,15 @@ interface Props {
   onAlbumSaveToLiked?: (t: SearchTrackResult) => void;
   /** Open an album by name (clickable Album column on catalog-playlist rows). */
   onAlbumGoToAlbum?: (name: string, artist: string | null) => void;
+  /** Desktop file actions for a Discover album/playlist row (the same set as
+   *  every other ⋯ menu). The host binds them to its download / add-audio
+   *  stores; omitted on the phone, which can't attach or download files. */
+  onAddAudio?: (t: SearchTrackResult) => void;
+  onDownload?: (t: SearchTrackResult) => void;
+  onRemoveDownload?: (t: SearchTrackResult) => void;
+  /** Whether this build can acquire — gates the save/remove pair. The host
+   *  resolves it (desktop capabilities); the phone leaves it false. */
+  canDownload?: boolean;
   /** Phone-only: open the per-song "⋯" bottom sheet for an opened Discover
    *  album/playlist row (same TrackActionSheet the library rows use). Its
    *  presence also arms the row's swipe-to-queue / swipe-to-save gestures. */
@@ -119,6 +151,10 @@ interface Props {
   onTogglePlay?: () => void;
   /** Album name of the now-playing track (for the album cards' persistent play). */
   currentAlbumName?: string | null;
+  /** Desktop-only Pin/Save controls, forwarded to the artist / album / playlist
+   *  detail pages so those buttons show here too. Omitted on the phone. */
+  pin?: SidebarPinController;
+  save?: SavedArtistController;
 }
 
 // Discover is assembled on the desktop from several sources (Billboard,
@@ -188,6 +224,10 @@ function relativeAge(ts: number): string {
 export function BrowseScreen({
   token,
   onPlayTrack,
+  titleVariant = 'browse-all',
+  initialGenre,
+  onOpenGenre,
+  onExitGenre,
   pageMode,
   desktop,
   activeProfileId,
@@ -198,15 +238,23 @@ export function BrowseScreen({
   onAlbumAddToQueue,
   onAlbumSaveToLiked,
   onAlbumGoToAlbum,
+  onAddAudio,
+  onDownload,
+  onRemoveDownload,
+  canDownload = false,
   onShowTrackSheet,
   isTrackCurrent,
   isNowPlaying,
   onTogglePlay,
   currentAlbumName,
+  pin,
+  save,
 }: Props) {
   const [data, setData] = useState<BrowseResults | null>(null);
   const [genres, setGenres] = useState<Genre[]>([]);
-  const [activeGenre, setActiveGenre] = useState<Genre | null>(null);
+  const [activeGenre, setActiveGenre] = useState<Genre | null>(
+    initialGenre ?? null,
+  );
   // When the live feed can't be fetched (desktop off) we fall back to the
   // persisted copy: `staleAt` = its save time (banner shown), or `offline`
   // when there's nothing cached yet for this view (clean gate message).
@@ -224,27 +272,54 @@ export function BrowseScreen({
     (t: SearchTrackResult, x: number, y: number) => {
       const artist = t.artists[0]?.trim() ?? '';
       const items: MenuItem[] = [
-        { label: 'Add to playlist', onClick: () => setPickerTrack(t) },
+        {
+          label: 'Add to playlist',
+          icon: MenuGlyphs.addToPlaylist,
+          onClick: () => setPickerTrack(t),
+        },
       ];
       if (onAlbumSaveToLiked)
         items.push({
           label: 'Add to Favorites',
+          icon: MenuGlyphs.star,
           onClick: () => onAlbumSaveToLiked(t),
         });
       if (onAlbumAddToQueue)
         items.push({
           label: 'Add to queue',
+          icon: MenuGlyphs.queue,
           onClick: () => onAlbumAddToQueue(t),
         });
       if (onAlbumGoToArtist)
         items.push({
           label: 'Go to artist',
+          icon: MenuGlyphs.artist,
           disabled: !artist,
           onClick: () => onAlbumGoToArtist(artist),
         });
+      // Save offline / remove / attach-a-file — the shared file actions, so a
+      // Discover row matches the player and library menus. The host binds them;
+      // on the phone they're absent and nothing is added.
+      items.push(
+        ...fileMenuItems({
+          hasFile: !!t.has_audio,
+          canDownload,
+          onDownload: onDownload ? () => onDownload(t) : undefined,
+          onRemove: onRemoveDownload ? () => onRemoveDownload(t) : undefined,
+          onAddAudio: onAddAudio ? () => onAddAudio(t) : undefined,
+        }),
+      );
       setMenu({ x, y, items });
     },
-    [onAlbumSaveToLiked, onAlbumAddToQueue, onAlbumGoToArtist],
+    [
+      onAlbumSaveToLiked,
+      onAlbumAddToQueue,
+      onAlbumGoToArtist,
+      onAddAudio,
+      onDownload,
+      onRemoveDownload,
+      canDownload,
+    ],
   );
   const {
     playingUrl: playingPreviewUrl,
@@ -279,6 +354,7 @@ export function BrowseScreen({
   // nothing cached for this view yet, show the offline gate.
   useEffect(() => {
     let cancelled = false;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
     // Scope the persisted Discover cache by profile: its chart tracks carry
     // per-profile ✓ "in library" marks, so one profile must not seed from
     // another's cached feed.
@@ -287,29 +363,74 @@ export function BrowseScreen({
     setData(seed ? seed.data : null);
     setStaleAt(null);
     setOffline(false);
+
+    // A failed refresh is almost always transient on the desktop — the app
+    // just restarted and the first call raced startup, or a chart source
+    // (Billboard / Last.fm / iTunes / Deezer) briefly didn't answer. Rather
+    // than sit on a stale banner until the user navigates away and back, we
+    // retry quietly in the background on a short backoff. A success clears the
+    // stale flag on its own, so the note simply disappears with no user action.
+    const BACKOFF_MS = [15_000, 45_000, 120_000];
+    const attempt = (retry: number) => {
+      getBrowse(token, activeGenre)
+        .then((r) => {
+          if (cancelled) return;
+          writeFeed(lsKey, r);
+          setData(r);
+          setStaleAt(null);
+          setOffline(false);
+        })
+        .catch(() => {
+          if (cancelled) return;
+          const p = readFeed(lsKey);
+          if (p) {
+            setData(p.data);
+            setStaleAt(p.savedAt);
+          } else {
+            setData(null);
+            setOffline(true);
+          }
+          if (retry < BACKOFF_MS.length) {
+            retryTimer = setTimeout(() => attempt(retry + 1), BACKOFF_MS[retry]);
+          }
+        });
+    };
+    attempt(0);
+
+    return () => {
+      cancelled = true;
+      if (retryTimer) clearTimeout(retryTimer);
+    };
+  }, [token, activeGenre, activeProfileId]);
+
+  // Refresh the feed when the library changes elsewhere — the genre track rows
+  // carry per-profile "in library" ✓ marks, so adding/removing one of these
+  // tracks to a playlist (via the ⋯ picker) would otherwise leave the ✓ stale
+  // until you re-open the genre. A light refetch that just updates the marks;
+  // skip the mount pass since the main effect above already fetched.
+  const libTick = useLibraryChangeTick();
+  const libSeeded = useRef(true);
+  useEffect(() => {
+    if (libSeeded.current) {
+      libSeeded.current = false;
+      return;
+    }
+    let cancelled = false;
+    const lsKey = profileScopedKey(feedStoreKey(activeGenre), activeProfileId);
     getBrowse(token, activeGenre)
       .then((r) => {
         if (cancelled) return;
         writeFeed(lsKey, r);
         setData(r);
-        setStaleAt(null);
-        setOffline(false);
       })
       .catch(() => {
-        if (cancelled) return;
-        const p = readFeed(lsKey);
-        if (p) {
-          setData(p.data);
-          setStaleAt(p.savedAt);
-        } else {
-          setData(null);
-          setOffline(true);
-        }
+        /* keep what's shown on a transient failure */
       });
     return () => {
       cancelled = true;
     };
-  }, [token, activeGenre, activeProfileId]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- refresh ✓ marks on a library change
+  }, [libTick]);
 
   const openGenre = (g: Genre | null) => {
     stopPreview();
@@ -404,16 +525,21 @@ export function BrowseScreen({
   return (
     <div
       className={
-        // Desktop: a drill-in (album/playlist/artist) AND a genre page both have
-        // a full-bleed hero that owns its edges + the sticky condensed bar pins
-        // flush under the top bar — so NO container padding (the sections below
-        // add their own px-8). The "Browse all" grid keeps px + pt. The phone
-        // (no pageMode) keeps its own modest padding.
+        // A genre page (desktop OR phone) is full-bleed: its hero owns the
+        // edges + bleeds under the top bar, and the sections below add their
+        // own px. The "Browse all" grid keeps its modest padding.
         pageMode
           ? showingPage || genrePage
             ? 'pb-6'
             : 'px-4 pt-6 pb-6'
-          : 'px-4 pt-4 pb-6'
+          : genrePage
+            ? 'pb-6'
+            : // Embedded under the Search bar (eyebrow kicker): the SearchScreen
+              // owns the horizontal inset so the grid lines up with the bar —
+              // don't add our own px on top of it.
+              titleVariant === 'eyebrow'
+              ? 'pb-6'
+              : 'px-4 pt-4 pb-6'
       }
     >
       <style>{PREVIEW_RING_KEYFRAMES}</style>
@@ -433,46 +559,108 @@ export function BrowseScreen({
           {/* Header: a Spotify-style hero (matching the artist/album pages)
               in genre view, else the plain Discover title. */}
           {activeGenre ? (
-            <div className={pageMode ? '' : 'mb-1'}>
-              {/* No inline "Discover" back on desktop — the persistent top
-                  bar's global Back arrow handles it (the genre feed is its own
-                  history stop). The phone has no global back, so it keeps this. */}
-              {!pageMode && (
-                <button
-                  type="button"
-                  onClick={() => openGenre(null)}
-                  className="flex items-center gap-1.5 text-sm text-neutral-400 hover:text-neutral-100 active:opacity-60 mb-3"
-                >
-                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-                    <path d="m15 18-6-6 6-6" />
-                  </svg>
-                  Discover
-                </button>
-              )}
+            pageMode ? (
+              // Desktop: the persistent top bar's global Back handles it (the
+              // genre feed is its own history stop), so no inline back here.
               <GenreHero
                 genre={activeGenre}
-                pageMode={!!pageMode}
+                pageMode
                 sentinelRef={genreSentinelRef}
                 hasTracks={genreTop.length > 0}
                 playing={genrePlaying}
                 onPlay={genreHeaderPlay}
                 onShuffle={genreShuffle}
               />
-            </div>
+            ) : (
+              // Phone: full-bleed, playlist-style — a sticky back header floats
+              // over the artwork wash, and the hero lifts up behind it (-mt-14)
+              // so the wash runs edge-to-edge to the very top.
+              <>
+                {/* Sticky bar: at rest just a legibility gradient behind the
+                    back arrow; once the hero scrolls past it frosts into the
+                    chrome and the genre title + play fade in — same pattern as
+                    the playlist / album detail pages. */}
+                <div
+                  className={`sticky top-0 z-10 flex items-center gap-2 px-4 pt-3 pb-2 transition-colors duration-200 ${
+                    genreCondensed
+                      ? 'bg-neutral-950/40 backdrop-blur-2xl backdrop-saturate-150 border-b border-white/5'
+                      : 'bg-gradient-to-b from-black/50 to-transparent'
+                  }`}
+                >
+                  <button
+                    type="button"
+                    onClick={() => (onExitGenre ? onExitGenre() : openGenre(null))}
+                    aria-label={onExitGenre ? 'Back to Search' : 'Back to Discover'}
+                    className="h-9 w-9 grid place-items-center rounded-full text-neutral-400 active:bg-white/10 active:text-neutral-100"
+                  >
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                      <path d="M15 18l-6-6 6-6" />
+                    </svg>
+                  </button>
+                  <span
+                    className={`min-w-0 flex-1 truncate text-sm font-semibold transition-opacity duration-200 ${
+                      genreCondensed ? 'opacity-100' : 'opacity-0'
+                    }`}
+                  >
+                    {activeGenre.name}
+                  </span>
+                  <button
+                    type="button"
+                    disabled={genreTop.length === 0}
+                    onClick={genreHeaderPlay}
+                    aria-label={genrePlaying ? 'Pause' : `Play ${activeGenre.name}`}
+                    className={`grid h-8 w-8 shrink-0 place-items-center rounded-full bg-white text-neutral-950 transition active:scale-95 disabled:bg-neutral-800 disabled:text-neutral-500 ${
+                      genreCondensed ? 'opacity-100' : 'pointer-events-none opacity-0'
+                    }`}
+                  >
+                    {genrePlaying ? (
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                        <rect x="6" y="5" width="4" height="14" rx="1" />
+                        <rect x="14" y="5" width="4" height="14" rx="1" />
+                      </svg>
+                    ) : (
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                        <path d="M7 4.5v15l12-7.5z" />
+                      </svg>
+                    )}
+                  </button>
+                </div>
+                <div className="relative -mt-14">
+                  <GenreHero
+                    genre={activeGenre}
+                    pageMode={false}
+                    sentinelRef={genreSentinelRef}
+                    hasTracks={genreTop.length > 0}
+                    playing={genrePlaying}
+                    onPlay={genreHeaderPlay}
+                    onShuffle={genreShuffle}
+                  />
+                </div>
+              </>
+            )
+          ) : titleVariant === 'eyebrow' ? (
+            <h2 className={cn(EYEBROW, 'mb-2')}>Browse</h2>
           ) : (
             <h1 className="text-2xl font-bold tracking-tight mb-4 px-1">Browse all</h1>
           )}
 
-          {/* Everything below the hero. On the desktop genre page the container
-              is full-bleed, so the sections carry their own px (px-4, matching
-              the album/playlist tracklists under their px-8 hero). */}
-          <div className={genrePage && pageMode ? 'px-4' : ''}>
+          {/* Everything below the hero. On a genre page (desktop or phone) the
+              container is full-bleed, so the sections carry their own px-4,
+              matching the album/playlist tracklists under their hero. */}
+          <div className={genrePage ? 'px-4' : ''}>
 
-          {staleAt != null && (
-            <div className={cn(CALLOUT_WARN, 'mx-1 mb-3 text-xs break-words')}>
+          {/* Staleness only matters on a genre page — those show live charts
+              that can age. The global "Browse all" grid is fixed category tiles
+              (Pop, Rock, Jazz…) that never go stale, so a warning there is pure
+              noise. And it's a quiet ambient line, not an alarm: the desktop
+              retries in the background (see the fetch effect), so it clears
+              itself; "Restart Beetbot" was misleading advice for a transient,
+              self-healing upstream hiccup. */}
+          {staleAt != null && activeGenre && (
+            <div className="mx-1 mb-3 text-xs text-neutral-500 break-words">
               {desktop
-                ? `Showing your last sync (${relativeAge(staleAt)}). Restart Beetbot if it doesn’t refresh.`
-                : `Showing your last sync (${relativeAge(staleAt)}). Reconnect to Beetbot on your computer to refresh.`}
+                ? `Showing charts from ${relativeAge(staleAt)}.`
+                : `Showing charts from ${relativeAge(staleAt)}. Reconnect your computer to update.`}
             </div>
           )}
 
@@ -484,7 +672,13 @@ export function BrowseScreen({
               <div className="mb-8">
                 <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
                   {genres.map((g) => (
-                    <GenreTile key={g.id} genre={g} onOpen={() => openGenre(g)} />
+                    <GenreTile
+                      key={g.id}
+                      genre={g}
+                      onOpen={() =>
+                        onOpenGenre ? onOpenGenre(g) : openGenre(g)
+                      }
+                    />
                   ))}
                 </div>
               </div>
@@ -533,6 +727,7 @@ export function BrowseScreen({
                     isTrackCurrent={isTrackCurrent}
                     isNowPlaying={isNowPlaying}
                     onShowMenu={pageMode ? showTrackMenu : undefined}
+                    onShowTrackSheet={pageMode ? undefined : onShowTrackSheet}
                   />
                 </Section>
               )}
@@ -556,6 +751,7 @@ export function BrowseScreen({
                     isTrackCurrent={isTrackCurrent}
                     isNowPlaying={isNowPlaying}
                     onShowMenu={pageMode ? showTrackMenu : undefined}
+                    onShowTrackSheet={pageMode ? undefined : onShowTrackSheet}
                   />
                 </Section>
               )}
@@ -609,6 +805,8 @@ export function BrowseScreen({
           key={openArtist.source_id}
           token={token}
           artist={openArtist}
+          pin={pin}
+          save={save}
           onClose={
             // Desktop: closing (Escape) is a real history Back, not an in-place
             // unwind — so it pops cleanly without pushing a phantom entry.
@@ -628,6 +826,10 @@ export function BrowseScreen({
           }}
           playingPreviewUrl={playingPreviewUrl}
           onTogglePreview={togglePreview}
+          isTrackCurrent={isTrackCurrent}
+          isPlaying={isNowPlaying}
+          onTogglePlay={onTogglePlay}
+          onShowTrackSheet={pageMode ? undefined : onShowTrackSheet}
         />
       )}
       {openAlbum && (
@@ -636,6 +838,7 @@ export function BrowseScreen({
           token={token}
           album={openAlbum}
           activeProfileId={activeProfileId}
+          pin={pin}
           onClose={
             pageMode
               ? () => onBrowseBack?.()
@@ -656,6 +859,9 @@ export function BrowseScreen({
           onGoToAlbum={onAlbumGoToAlbum}
           playingPreviewUrl={playingPreviewUrl}
           onTogglePreview={togglePreview}
+          isTrackCurrent={isTrackCurrent}
+          isPlaying={isNowPlaying}
+          onTogglePlay={onTogglePlay}
         />
       )}
       {openPlaylist && (!pageMode || (!openAlbum && !openArtist)) && (
@@ -665,6 +871,7 @@ export function BrowseScreen({
           token={token}
           playlist={openPlaylist}
           activeProfileId={activeProfileId}
+          pin={pin}
           onClose={
             pageMode
               ? () => onBrowseBack?.()
@@ -685,6 +892,9 @@ export function BrowseScreen({
           onGoToAlbum={onAlbumGoToAlbum}
           playingPreviewUrl={playingPreviewUrl}
           onTogglePreview={togglePreview}
+          isTrackCurrent={isTrackCurrent}
+          isPlaying={isNowPlaying}
+          onTogglePlay={onTogglePlay}
         />
       )}
       {pickerTrack && (
@@ -786,7 +996,7 @@ function GenreHero({
                   disabled={!hasTracks}
                   aria-label="Shuffle play"
                   title="Shuffle play"
-                  className="rounded-lg px-3 py-2 text-neutral-300 hover:text-neutral-100 hover:bg-neutral-900 disabled:text-neutral-600 disabled:hover:bg-transparent transition"
+                  className="grid h-10 w-10 place-items-center rounded-full text-neutral-300 hover:text-neutral-100 hover:bg-white/10 disabled:text-neutral-600 disabled:hover:bg-transparent transition"
                 >
                   <ShuffleGlyph />
                 </button>
@@ -802,8 +1012,8 @@ function GenreHero({
   return (
     <div className="relative overflow-hidden">
       <HeroWash coverUrl={genre.picture_url} />
-      <div className="relative px-4 pt-2 pb-5 flex flex-col items-center text-center">
-        <div className="relative h-44 w-44 rounded-2xl overflow-hidden bg-neutral-800 shadow-2xl shadow-black/60 ring-1 ring-white/10 grid place-items-center">
+      <div className="relative px-4 pt-20 pb-5 flex flex-col items-center text-center">
+        <div className="relative h-52 w-52 rounded-2xl overflow-hidden bg-neutral-800 shadow-2xl shadow-black/60 ring-1 ring-white/10 grid place-items-center">
           {cover}
         </div>
         <div className="mt-4 w-full min-w-0 flex flex-col items-center">
@@ -861,7 +1071,7 @@ function GenreTile({ genre, onOpen }: { genre: Genre; onOpen: () => void }) {
     <button
       type="button"
       onClick={onOpen}
-      className="relative aspect-[2/1] rounded-lg overflow-hidden text-left p-4 transition hover:brightness-110 active:scale-95"
+      className="relative isolate aspect-[2/1] rounded-lg overflow-hidden text-left p-4 transition hover:brightness-110 active:scale-95"
       style={{ backgroundColor: color }}
     >
       <span className="relative z-10 text-base font-bold tracking-tight text-white drop-shadow">

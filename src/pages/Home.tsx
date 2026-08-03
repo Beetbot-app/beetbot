@@ -1,12 +1,21 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { HomeScreen, type HomeDrillSnapshot } from '@shared/components/HomeScreen';
+import {
+  HomeScreen,
+  clearHomeFeedCache,
+  type HomeDrillSnapshot,
+} from '@shared/components/HomeScreen';
 import { setApiBase, type PlaylistRow, type SearchTrackResult } from '@shared/api';
 import { useProfileStore } from '@/lib/profile';
+import {
+  useSidebarPinController,
+  useSavedArtistController,
+} from '@/lib/detailControllers';
 import { useNavStore } from '@/lib/nav';
 import { useSession } from '@/lib/session';
 import { ipc } from '@/lib/tauri';
 import { playOnDesktop, queueCatalogTrack, likeCatalogTrack } from '@/pages/Search';
 import { usePlayerStore, currentTrack } from '@/lib/store';
+import { useScrollMemory } from '@shared/useScrollMemory';
 
 // Point the shared api.ts at the loopback streaming server (the Tauri
 // webview origin isn't a valid fetch scheme). Idempotent with Search's /
@@ -32,6 +41,7 @@ export function HomePage({
   onMixPush,
   mixRestore,
   onMixBack,
+  homeReset = 0,
 }: {
   onOpenPlaylist: (id: number) => void;
   onOpenBrowse: () => void;
@@ -39,10 +49,16 @@ export function HomePage({
   onMixPush?: (snap: HomeDrillSnapshot) => void;
   mixRestore?: { signal: number; snapshot: HomeDrillSnapshot | null };
   onMixBack?: () => void;
+  /** Bumped when the top bar's Home button is pressed. That's an explicit "take
+   *  me home", not a Back — so the feed jumps to the top rather than resuming
+   *  where you last were (Spotify's behaviour). */
+  homeReset?: number;
 }) {
   // One shared session token, fetched once per app launch (not per navigation).
   const { token, error } = useSession();
   const activeProfileId = useProfileStore((s) => s.activeProfileId);
+  const pinController = useSidebarPinController();
+  const saveController = useSavedArtistController();
   const openArtist = useNavStore((s) => s.openArtist);
   const openAlbum = useNavStore((s) => s.openAlbum);
   // Now-playing state for the Spotify-style card play/pause on Home.
@@ -123,6 +139,20 @@ export function HomePage({
     };
   }, []);
 
+  // Explicit, un-guarded refetch: the onboarding wizard fires this on finish
+  // (after it has written the user's picks and warmed the server feed) so the
+  // user is dropped straight onto a filled, picks-seeded Home instead of the
+  // empty page cached at first launch. Bumping the key re-mints the visit nonce
+  // → a fresh getHome, which the just-warmed server cache answers immediately.
+  useEffect(() => {
+    const onRefresh = () => {
+      clearHomeFeedCache(activeProfileId);
+      setHomeRefreshKey((k) => k + 1);
+    };
+    window.addEventListener('beetbot:home-refresh', onRefresh);
+    return () => window.removeEventListener('beetbot:home-refresh', onRefresh);
+  }, [activeProfileId]);
+
   // Load the quick-access playlists straight from the DB over IPC, not the
   // loopback HTTP server, so a momentary server blip never blanks Home (the
   // sidebar reads the same source). Memoised so HomeScreen's effect is stable.
@@ -140,6 +170,43 @@ export function HomePage({
       ),
     [activeProfileId],
   );
+
+  // Remember Home's scroll so returning to it (Back, or the Home button) lands
+  // where you were instead of at the top of the feed. Just one key: a drill-in
+  // no longer shares this container (see `drillHost` below), so nothing else
+  // can write to it.
+  const rememberScroll = useScrollMemory('home');
+  // Keep our own handle on the same node so the Home button can jump it to the
+  // top (the hook only owns save/restore).
+  const feedElRef = useRef<HTMLDivElement | null>(null);
+  const scrollRef = useCallback(
+    (node: HTMLDivElement | null) => {
+      feedElRef.current = node;
+      rememberScroll(node);
+    },
+    [rememberScroll],
+  );
+  // Home button: land at the top of the feed. Covers the case where Home is
+  // already the current view (so it never remounts and nothing would otherwise
+  // move); arriving from another view is handled by the host clearing the saved
+  // position before it navigates.
+  useEffect(() => {
+    if (homeReset > 0) feedElRef.current?.scrollTo({ top: 0 });
+  }, [homeReset]);
+
+  // Desktop drill-ins (station/mix, editorial playlist, show-all grid) render
+  // into THIS overlay — a sibling of the feed's scroll container, not a child.
+  // The feed is therefore never unmounted or scrolled when you open one, so
+  // coming back reveals it exactly where you left it, with no restoration step
+  // at all (the iOS navigation-stack model). Doing it in-flow used to rebuild
+  // the feed on Back — and a cold feed is still assembling shelves for several
+  // seconds, so the old position no longer meant anything and you landed on top.
+  const [drillKey, setDrillKey] = useState<string | null>(null);
+  const [drillHost, setDrillHost] = useState<HTMLDivElement | null>(null);
+  // A different drill (or a re-open) starts at its own top, like a fresh page.
+  useEffect(() => {
+    if (drillHost) drillHost.scrollTop = 0;
+  }, [drillKey, drillHost]);
 
   if (error) {
     return (
@@ -163,17 +230,19 @@ export function HomePage({
   }
 
   return (
-    <div
-      className="h-full overflow-y-auto"
-      style={{
-        // Daft-style: let the window's warm ambient wash show through the top of
-        // the card (a colored "hero atmosphere"), fading to solid black below so
-        // the content stays readable. The card now sits below the transparent
-        // header, so the wash reads as the card's own top-lit atmosphere.
-        background:
-          'linear-gradient(to bottom, transparent 0, rgba(10,10,11,0.86) 150px, #0a0a0b 320px)',
-      }}
-    >
+    <div className="relative h-full">
+      <div
+        ref={scrollRef}
+        className="h-full overflow-y-auto"
+        style={{
+          // Daft-style: let the window's warm ambient wash show through the top of
+          // the card (a colored "hero atmosphere"), fading to solid black below so
+          // the content stays readable. The card now sits below the transparent
+          // header, so the wash reads as the card's own top-lit atmosphere.
+          background:
+            'linear-gradient(to bottom, transparent 0, rgba(10,10,11,0.86) 150px, #0a0a0b 320px)',
+        }}
+      >
       <HomeScreen
         token={token}
         activeProfileId={activeProfileId}
@@ -194,12 +263,32 @@ export function HomePage({
         onPlayedFrom={setNowPlayingKey}
         onOpenPlaylist={onOpenPlaylist}
         onOpenBrowse={onOpenBrowse}
+        // The welcome card's "find something to play". The desktop has no Search
+        // tab — the search field lives in the top bar permanently, and focusing
+        // it just surfaces Browse — so Browse IS this platform's route to the
+        // same genre grid the phone's Search tab opens on.
+        onOpenSearch={onOpenBrowse}
         onOpenArtist={(name) => openArtist(name)}
         onOpenAlbum={(name, artist) => openAlbum(name, artist)}
         onWinBack={onWinBack}
         onMixPush={onMixPush}
         mixRestore={mixRestore}
         onMixBack={onMixBack}
+        onDrillKeyChange={setDrillKey}
+        drillPortal={drillHost}
+        pin={pinController}
+        save={saveController}
+      />
+      </div>
+      {/* The drill-in overlay's own scroll container. Always mounted (HomeScreen
+          portals into it), hidden while no drill is open so it can't cover the
+          feed. `overscroll-contain` keeps a bounce here from scrolling the feed
+          underneath. */}
+      <div
+        ref={setDrillHost}
+        className={`absolute inset-0 z-10 overflow-y-auto overscroll-contain bg-neutral-950 ${
+          drillKey ? '' : 'hidden'
+        }`}
       />
     </div>
   );

@@ -1,6 +1,7 @@
 import { useEffect, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { cn, POPOVER, SCRIM } from '@shared/ui';
+import { SLEEP_OPTIONS } from '@shared/sleep';
 
 export interface SheetAction {
   key: string;
@@ -11,7 +12,7 @@ export interface SheetAction {
 
 /**
  * A track "⋯" menu, styled like an iOS context menu (Apple Music): a rounded,
- * frosted popover with a top row of quick actions (Favorite · Add · Share)
+ * frosted popover with a top row of quick actions (Favorite · Add)
  * over a list (Go to Artist/Album · Sleep Timer). Sleep Timer (optional —
  * only the now-playing overlay passes it) flips the popover to a time-picker
  * sub-view. Used by the Now Playing overlay and playlist track rows.
@@ -39,15 +40,6 @@ export function TrackActionSheet({
     fn();
     onClose();
   };
-  const SLEEP_OPTS: { label: string; val: 'off' | 'track' | number }[] = [
-    { label: 'Off', val: 'off' },
-    { label: 'End of track', val: 'track' },
-    { label: '5 minutes', val: 5 },
-    { label: '15 minutes', val: 15 },
-    { label: '30 minutes', val: 30 },
-    { label: '45 minutes', val: 45 },
-    { label: '1 hour', val: 60 },
-  ];
   const rowCls =
     'w-full flex items-center gap-3 px-4 py-3 text-left text-[15px] border-t border-white/10 active:bg-white/10';
   return createPortal(
@@ -109,11 +101,11 @@ export function TrackActionSheet({
               </svg>
               <span className="text-sm font-semibold">Sleep Timer</span>
             </button>
-            {SLEEP_OPTS.map((o) => (
+            {SLEEP_OPTIONS.map((o) => (
               <button
-                key={String(o.val)}
+                key={String(o.value)}
                 type="button"
-                onClick={() => run(() => sleep.onPick(o.val))}
+                onClick={() => run(() => sleep.onPick(o.value))}
                 className="w-full flex items-center px-4 py-3 text-left text-[15px] border-t border-white/10 first:border-t-0 active:bg-white/10"
               >
                 <span className="flex-1">{o.label}</span>

@@ -644,6 +644,9 @@ fn open_output(dead: &Arc<AtomicBool>) -> Option<rodio::MixerDeviceSink> {
 
 /// Name of the current default output device, for change detection. None if the
 /// name can't be read (treated as "no observable change" so we don't churn).
+// cpal's DeviceTrait::name is deprecated in the rodio re-export; the name is
+// only used to detect a device change, so the plain name is exactly what we want.
+#[allow(deprecated)]
 fn default_output_name() -> Option<String> {
     rodio::cpal::default_host()
         .default_output_device()

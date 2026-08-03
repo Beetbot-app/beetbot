@@ -16,11 +16,16 @@
  * Compose with `cn(...)`: `className={cn(SHEET, 'w-full max-w-lg mx-4')}`.
  */
 
-/** Join class fragments, dropping falsy ones (tiny clsx). */
+import { twMerge } from 'tailwind-merge';
+
+/** Compose class fragments, dropping falsy ones AND resolving Tailwind conflicts
+ *  so a later class wins — e.g. `cn(CALLOUT_ERROR, 'text-xs')` yields text-xs,
+ *  letting a recipe be overridden inline instead of leaving both classes to
+ *  fight on CSS source order. */
 export function cn(
   ...parts: Array<string | false | null | undefined>
 ): string {
-  return parts.filter(Boolean).join(' ');
+  return twMerge(parts.filter(Boolean).join(' '));
 }
 
 // ---------------------------------------------------------------------------
@@ -114,6 +119,26 @@ export const CALLOUT_ERROR =
 // Type + misc
 // ---------------------------------------------------------------------------
 
+/**
+ * Width for a square cover that has to fit a box which may be shorter than it
+ * is wide — a phone's Now Playing, once the safe-area insets and a lyrics-card
+ * peek have taken their cut.
+ *
+ * `min(100%, 100cqh)` is "the smaller of the box's width and its height", so
+ * the cover shrinks PROPORTIONALLY and stays square. Max-height alone (what
+ * this replaces) clamps the height while the width stays put, which quietly
+ * letterboxes the cover — visible first on the remote device screen, whose
+ * extra "Play here instead" button leaves its artwork box 46px shorter.
+ *
+ * The parent must declare `container-type: size`. Where container-query units
+ * aren't supported this falls back to full width, and the max-h-full alongside
+ * it still prevents overflow exactly as before.
+ */
+export const ART_FIT_WIDTH =
+  typeof CSS !== 'undefined' && CSS.supports?.('width', 'min(100%, 100cqh)')
+    ? 'min(100%, 100cqh)'
+    : '100%';
+
 /** Uppercase section kicker. */
 export const EYEBROW =
   'text-[11px] font-semibold uppercase tracking-wide text-neutral-500';
@@ -165,3 +190,10 @@ export const PICKER_ITEM =
 
 /** Range slider — white fill + white thumb (the shared neutral accent). */
 export const SLIDER = 'w-full cursor-pointer accent-white';
+
+/** Beetbot's leaf-green — the brand's own green, from the beet's leaves.
+ *  Used for "this is playing right now" status: a status colour has to mean
+ *  one thing every time, so it is deliberately NOT `--color-accent` (that is
+ *  extracted per-track from album art and can land on grey). Emerald-400 read
+ *  as Spotify; this is the palette's own green. See the beetbot-brand skill. */
+export const BEET_LIVE = '#37C871';

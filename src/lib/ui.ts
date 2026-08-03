@@ -9,7 +9,7 @@ import { create } from 'zustand';
 // Neither is persisted — you shouldn't launch into them.
 
 export type NowPlayingTab = 'lyrics' | 'queue';
-export type RightBar = 'closed' | 'lyrics' | 'queue';
+export type RightBar = 'closed' | 'lyrics' | 'queue' | 'connect';
 
 interface UiState {
   // Full-window now playing.
@@ -21,7 +21,7 @@ interface UiState {
   setNowPlayingTab: (tab: NowPlayingTab) => void;
   // Docked right bar.
   rightBar: RightBar;
-  toggleRightBar: (tab: 'lyrics' | 'queue') => void;
+  toggleRightBar: (tab: 'lyrics' | 'queue' | 'connect') => void;
   setRightBar: (tab: RightBar) => void;
   closeRightBar: () => void;
 }

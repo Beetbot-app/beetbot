@@ -17,7 +17,7 @@
 //!   urn:x-cast:com.google.cast.receiver       — LAUNCH / GET_STATUS / STOP
 //!   urn:x-cast:com.google.cast.media          — LOAD / PLAY / PAUSE / SEEK / STOP
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{BufMut, BytesMut};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -216,8 +216,6 @@ pub struct SeekPayload<'a> {
 pub struct InboundEnvelope {
     #[serde(rename = "type")]
     pub kind: String,
-    #[serde(default, rename = "requestId")]
-    pub request_id: Option<u32>,
     #[serde(default)]
     pub status: Option<serde_json::Value>,
 }

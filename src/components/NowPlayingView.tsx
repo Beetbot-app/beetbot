@@ -4,21 +4,27 @@ import { currentTrack, usePlayerStore } from '@/lib/store';
 import { useNavStore } from '@/lib/nav';
 import { useUiStore } from '@/lib/ui';
 import { useProfileStore } from '@/lib/profile';
+import { useAddAudio } from '@/lib/addAudio';
+import { useDownloadsStore, trackHasFile } from '@/lib/downloads';
+import { useCapabilitiesStore } from '@/lib/capabilities';
 import { useLikesStore } from '@/lib/likes';
 import { extractDominantColor } from '@shared/albumColor';
 import { LyricsView } from '@shared/components/LyricsView';
 import { LikeButton } from '@shared/components/LikeButton';
-import { EqualizerBars } from '@shared/components/EqualizerBars';
-import { ContextMenu, MenuGlyphs, type MenuState } from '@shared/components/ContextMenu';
-import { AddToPlaylistModal } from '@shared/components/SearchScreen';
 import {
-  ShareDialog,
-  spotifyTrackId,
-  type ShareTarget,
-} from '@/components/ShareDialog';
+  ContextMenu,
+  MenuGlyphs,
+  fileMenuItems,
+  sleepTimerMenuItems,
+  sleepTimerMenuLabel,
+  type MenuState,
+} from '@shared/components/ContextMenu';
+import { AddToPlaylistModal } from '@shared/components/modals/AddToPlaylistModal';
+import { playlistTrackToSearch } from '@/lib/trackAdapter';
 import { ensureSession, getTrackPlaylistIds, type SearchTrackResult } from '@shared/api';
 import { useLyrics } from '@/lib/useLyrics';
-import type { PlaylistTrack } from '@/lib/tauri';
+import { QueuePanel } from '@/components/QueuePanel';
+import { LyricsIcon, QueueIcon } from '@/components/PlayerIcons';
 
 /**
  * Full-area "Now Playing" — Apple Music-style. Fills the main content area
@@ -37,10 +43,6 @@ export function NowPlayingView() {
   const volume = usePlayerStore((s) => s.volume);
   const repeat = usePlayerStore((s) => s.repeat);
   const shuffle = usePlayerStore((s) => s.shuffle);
-  const autoplay = usePlayerStore((s) => s.autoplay);
-  const setAutoplay = usePlayerStore((s) => s.setAutoplay);
-  const queue = usePlayerStore((s) => s.queue);
-  const currentIndex = usePlayerStore((s) => s.currentIndex);
   const playPause = usePlayerStore((s) => s.playPause);
   const next = usePlayerStore((s) => s.next);
   const prev = usePlayerStore((s) => s.prev);
@@ -48,12 +50,9 @@ export function NowPlayingView() {
   const setCurrentTime = usePlayerStore((s) => s.setCurrentTime);
   const toggleShuffle = usePlayerStore((s) => s.toggleShuffle);
   const toggleRepeat = usePlayerStore((s) => s.toggleRepeat);
-  const playAt = usePlayerStore((s) => s.playAt);
-  const removeFromQueue = usePlayerStore((s) => s.removeFromQueue);
-  const playNext = usePlayerStore((s) => s.playNext);
-  const moveItem = usePlayerStore((s) => s.moveItem);
-  const clearUpcoming = usePlayerStore((s) => s.clearUpcoming);
-
+  const sleepTimerEndsAt = usePlayerStore((s) => s.sleepTimerEndsAt);
+  const sleepAtTrackEnd = usePlayerStore((s) => s.sleepAtTrackEnd);
+  const setSleepTimer = usePlayerStore((s) => s.setSleepTimer);
   const openArtist = useNavStore((s) => s.openArtist);
   const openAlbum = useNavStore((s) => s.openAlbum);
   const tab = useUiStore((s) => s.nowPlayingTab);
@@ -70,17 +69,54 @@ export function NowPlayingView() {
   }, [activeProfileId, refreshLikes]);
   const trackLiked = track ? likedIds.has(track.id) : false;
 
-  // ⋯ menu + the surfaces it opens.
+  // ⋯ menu + the surfaces it opens. `sleepMenu` is the duration picker the
+  // menu's "Sleep timer" row opens — separate state so the first menu's
+  // onClose (which fires right after the row's onClick) can't wipe it.
   const [menu, setMenu] = useState<MenuState | null>(null);
+  const [sleepMenu, setSleepMenu] = useState<MenuState | null>(null);
   const [addToPlaylist, setAddToPlaylist] = useState<{
     track: SearchTrackResult;
     token: string;
   } | null>(null);
-  const [share, setShare] = useState<ShareTarget | null>(null);
-  // HTML5 drag-reorder of the up-next list. The ref is the authoritative source
-  // read on drop (immune to render timing); the state just drives the ghost.
-  const [dragIndex, setDragIndex] = useState<number | null>(null);
-  const dragIndexRef = useRef<number | null>(null);
+
+  // Keep the Lyrics / Up-next pane the same height as the player column (album
+  // art → volume) so they read as one block and the corner toggles sit clear
+  // below both. A callback ref + ResizeObserver tracks the column's live height.
+  const roRef = useRef<ResizeObserver | null>(null);
+  const [playerH, setPlayerH] = useState(0);
+  const playerColRef = useCallback((el: HTMLDivElement | null) => {
+    roRef.current?.disconnect();
+    if (!el) return;
+    const measure = () => setPlayerH(el.offsetHeight);
+    measure();
+    roRef.current = new ResizeObserver(measure);
+    roRef.current.observe(el);
+  }, []);
+
+  // Apple Music model: open collapsed (big centered artwork), then a corner
+  // toggle slides in the Lyrics / Up-next pane. Local so every open starts
+  // collapsed; `tab` (in the UI store) remembers which pane you last used.
+  const [paneOpen, setPaneOpen] = useState(false);
+  const togglePane = useCallback(
+    (which: 'lyrics' | 'queue') => {
+      setPaneOpen((open) => !(open && tab === which));
+      setTab(which);
+    },
+    [tab, setTab],
+  );
+  // Keep the pane's CONTENT mounted through its close animation so it fades out
+  // with the collapsing panel instead of vanishing the instant you toggle it
+  // shut (the width still animates to 0 either way; this just keeps something in
+  // it to see). Matches the 300ms width/opacity transition below.
+  const [paneMounted, setPaneMounted] = useState(false);
+  useEffect(() => {
+    if (paneOpen) {
+      setPaneMounted(true);
+      return;
+    }
+    const t = window.setTimeout(() => setPaneMounted(false), 320);
+    return () => window.clearTimeout(t);
+  }, [paneOpen]);
 
   // Navigating to an artist/album leaves the now-playing surface (matches Apple
   // Music) — otherwise the full view would just cover the page you opened.
@@ -106,21 +142,7 @@ export function NowPlayingView() {
         .then((inIds) => {
           setAddToPlaylist({
             token: tok,
-            track: {
-              source: 'local',
-              source_id: String(t.id),
-              title: t.title,
-              artists: t.artists ?? [],
-              album: t.album ?? null,
-              album_art_url: t.album_art_url ?? null,
-              duration_ms: t.duration_ms ?? 0,
-              isrc: t.isrc ?? null,
-              local_track_id: t.id,
-              in_playlist_ids: inIds,
-              has_audio: t.local_path != null,
-              preview_url: null,
-              explicit: false,
-            },
+            track: playlistTrackToSearch(t, { inPlaylistIds: inIds }),
           });
         }),
     );
@@ -137,6 +159,7 @@ export function NowPlayingView() {
       if (!track) return;
       e.preventDefault();
       e.stopPropagation();
+      const pid = activeProfileId; // captured for the download actions' closures
       setMenu({
         x: e.clientX,
         y: e.clientY,
@@ -158,22 +181,52 @@ export function NowPlayingView() {
             onClick: goAlbum,
             disabled: !track.album,
           },
+          // Save offline / remove / attach-a-file — the shared file actions, so
+          // every ⋯ menu offers the same set. Save and remove appear only on a
+          // build that can acquire.
+          ...fileMenuItems({
+            hasFile: trackHasFile(track),
+            downloading:
+              useDownloadsStore.getState().byTrack[track.id] !== undefined,
+            canDownload: useCapabilitiesStore.getState().canDownload,
+            onDownload:
+              pid != null
+                ? () =>
+                    void useDownloadsStore.getState().download(track.id, pid)
+                : undefined,
+            onRemove:
+              pid != null
+                ? () => void useDownloadsStore.getState().remove(track.id, pid)
+                : undefined,
+            onAddAudio: () => useAddAudio.getState().openForTrack(track),
+          }),
           {
-            label: 'Share',
-            icon: MenuGlyphs.share,
+            label: sleepTimerMenuLabel(sleepTimerEndsAt, sleepAtTrackEnd),
+            icon: MenuGlyphs.sleep,
             separator: true,
             onClick: () =>
-              setShare({
-                title: track.title,
-                artist: track.artists[0] ?? null,
-                spotifyId: spotifyTrackId(track.spotify_id),
-                art: track.album_art_url,
+              setSleepMenu({
+                x: e.clientX,
+                y: e.clientY,
+                items: sleepTimerMenuItems(
+                  sleepTimerEndsAt,
+                  sleepAtTrackEnd,
+                  setSleepTimer,
+                ),
               }),
           },
         ],
       });
     },
-    [track, openAddToPlaylist, goArtist, goAlbum],
+    [
+      track,
+      openAddToPlaylist,
+      goArtist,
+      goAlbum,
+      sleepTimerEndsAt,
+      sleepAtTrackEnd,
+      setSleepTimer,
+    ],
   );
 
   // Artwork-derived wash for an immersive, album-forward backdrop.
@@ -199,10 +252,6 @@ export function NowPlayingView() {
   const bg = tint
     ? `radial-gradient(120% 90% at 25% 10%, rgba(${tint[0]},${tint[1]},${tint[2]},0.42), rgba(${tint[0]},${tint[1]},${tint[2]},0.10) 45%, transparent 75%), #0a0a0b`
     : 'radial-gradient(120% 90% at 25% 10%, rgba(120,90,80,0.25), transparent 70%), #0a0a0b';
-
-  const upNext = queue
-    .map((t, i) => ({ t, i }))
-    .filter(({ i }) => i > currentIndex);
 
   const dur = duration || (track ? track.duration_ms / 1000 : 0);
   const remaining = Math.max(0, Math.round(dur - currentTime));
@@ -230,14 +279,24 @@ export function NowPlayingView() {
       </button>
 
       {track ? (
-        <div className="flex-1 min-h-0 flex gap-8 px-10 pt-14 pb-8">
-          {/* Left: cover + meta + transport */}
-          <div className="flex-1 min-w-0 flex flex-col items-center justify-center max-w-[46%]">
+        <div className="flex-1 min-h-0 flex items-center justify-center px-10 pt-14 pb-8">
+          {/* Left: cover + meta + transport. Centered when collapsed; shifts
+              left and shrinks when a pane opens (Apple Music). The pane is
+              sized to this column's height (below), so both centre as one
+              block and the corner toggles clear them. */}
+          <div
+            ref={playerColRef}
+            className="min-w-0 flex-none flex flex-col items-center justify-center transition-all duration-300 ease-out"
+            // Width animates (not mx-auto, which can't be transitioned and made
+            // the artwork jump). justify-center on the parent centers this when
+            // the pane is 0-width, and lets it slide left as the pane widens.
+            style={{ width: paneOpen ? 300 : 'min(54vh, 440px)' }}
+          >
             <button
               type="button"
               onClick={goAlbum}
               disabled={!track.album}
-              className="w-full max-w-[min(52vh,38vw)] aspect-square rounded-2xl overflow-hidden bg-neutral-900 shadow-2xl disabled:cursor-default"
+              className="w-full aspect-square rounded-2xl overflow-hidden bg-neutral-900 shadow-2xl disabled:cursor-default transition-all duration-300"
             >
               {track.album_art_url ? (
                 <img src={track.album_art_url} alt="" className="h-full w-full object-cover" draggable={false} />
@@ -246,7 +305,7 @@ export function NowPlayingView() {
               )}
             </button>
 
-            <div className="w-full max-w-[min(52vh,38vw)] mt-6">
+            <div className="w-full mt-6">
               {/* Title + artist on the left; heart + ⋯ on the right (Apple Music). */}
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
@@ -333,7 +392,7 @@ export function NowPlayingView() {
 
               {/* Transport */}
               <div className="mt-4 flex items-center justify-center gap-7">
-                <button type="button" onClick={toggleShuffle} aria-label="Shuffle" className={shuffle ? 'text-accent' : 'text-neutral-500 hover:text-neutral-200'}>
+                <button type="button" onClick={toggleShuffle} aria-label="Shuffle" aria-pressed={shuffle} className={`h-9 w-9 grid place-items-center rounded-full transition ${shuffle ? 'text-accent' : 'text-neutral-500 hover:text-neutral-200'}`} style={shuffle ? { backgroundColor: 'color-mix(in srgb, var(--color-accent) 20%, transparent)' } : undefined}>
                   <svg width={20} height={20} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" aria-hidden>
                     <path d="M16 3h5v5M4 20 21 3M21 16v5h-5M15 15l6 6M4 4l5 5" />
                   </svg>
@@ -361,11 +420,11 @@ export function NowPlayingView() {
                     <path d="M12.5 6 12.5 18 20.5 12z" />
                   </svg>
                 </button>
-                <button type="button" onClick={toggleRepeat} aria-label="Repeat" className={repeat !== 'off' ? 'text-accent' : 'text-neutral-500 hover:text-neutral-200'}>
+                <button type="button" onClick={toggleRepeat} aria-label="Repeat" aria-pressed={repeat !== 'off'} className={`relative h-9 w-9 grid place-items-center rounded-full transition ${repeat !== 'off' ? 'text-accent' : 'text-neutral-500 hover:text-neutral-200'}`} style={repeat !== 'off' ? { backgroundColor: 'color-mix(in srgb, var(--color-accent) 20%, transparent)' } : undefined}>
                   <svg width={20} height={20} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" aria-hidden>
                     <path d="M17 2l4 4-4 4M3 11V9a4 4 0 0 1 4-4h14M7 22l-4-4 4-4M21 13v2a4 4 0 0 1-4 4H3" />
                   </svg>
-                  {repeat === 'one' ? <span className="text-[9px] font-bold">1</span> : null}
+                  {repeat === 'one' ? <span className="absolute -top-0.5 -right-0.5 text-[9px] font-bold leading-none bg-neutral-950 rounded-full px-1">1</span> : null}
                 </button>
               </div>
 
@@ -391,80 +450,67 @@ export function NowPlayingView() {
             </div>
           </div>
 
-          {/* Right: Lyrics / Up Next */}
-          <div className="flex-1 min-w-0 flex flex-col">
-            <div className="shrink-0 flex items-center gap-1 mb-3">
-              <TabBtn active={tab === 'lyrics'} onClick={() => setTab('lyrics')}>Lyrics</TabBtn>
-              <TabBtn active={tab === 'queue'} onClick={() => setTab('queue')}>Up next</TabBtn>
-              <button
-                type="button"
-                onClick={() => setAutoplay(!autoplay)}
-                title="Autoplay similar songs when the queue ends"
-                aria-pressed={autoplay}
-                className={`ml-auto flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm transition ${
-                  autoplay ? 'bg-white/10 text-neutral-100' : 'text-neutral-400 hover:text-neutral-100 hover:bg-white/5'
-                }`}
-              >
-                <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-                  <path d="M6 16c5 0 7-8 12-8a4 4 0 0 1 0 8c-5 0-7-8-12-8a4 4 0 1 0 0 8" />
-                </svg>
-                Autoplay
-              </button>
-            </div>
-            <div className="flex-1 min-h-0">
-              {tab === 'lyrics' ? (
-                <LyricsView lyrics={lyrics} currentTime={currentTime} loading={lyricsLoading} onSeekTo={(s) => setCurrentTime(s)} />
-              ) : (
-                <div className="h-full overflow-y-auto overscroll-contain pr-1">
-                  <div className="text-[11px] uppercase tracking-wide text-neutral-500 px-2 pt-1 pb-1">Now playing</div>
-                  <QueueRow t={track} isCurrent playing={isPlaying} onPlay={() => {}} />
-                  <div className="flex items-center justify-between px-2 pt-4 pb-1">
-                    <span className="text-[11px] uppercase tracking-wide text-neutral-500">Up next</span>
-                    {upNext.length > 0 ? (
-                      <button type="button" onClick={clearUpcoming} className="text-xs text-neutral-400 hover:text-neutral-200">
-                        Clear
-                      </button>
-                    ) : null}
-                  </div>
-                  {upNext.length === 0 ? (
-                    <div className="text-sm text-neutral-500 px-2 py-4">Nothing up next.</div>
-                  ) : (
-                    upNext.map(({ t, i }) => (
-                      <QueueRow
-                        key={`${t.id}-${i}`}
-                        t={t}
-                        onPlay={() => playAt(i)}
-                        onPlayNext={() => playNext(i)}
-                        onRemove={() => removeFromQueue(i)}
-                        dragging={dragIndex === i}
-                        onDragStart={() => {
-                          dragIndexRef.current = i;
-                          setDragIndex(i);
-                        }}
-                        onDragOver={(e) => e.preventDefault()}
-                        onDrop={() => {
-                          const from = dragIndexRef.current;
-                          if (from != null) moveItem(from, i);
-                          dragIndexRef.current = null;
-                          setDragIndex(null);
-                        }}
-                        onDragEnd={() => {
-                          dragIndexRef.current = null;
-                          setDragIndex(null);
-                        }}
-                      />
-                    ))
-                  )}
-                </div>
-              )}
-            </div>
+          {/* Right pane — Lyrics / Up next. Its WIDTH, margin and opacity animate
+              in lock-step with the artwork column's width, so opening/closing
+              glides instead of snapping. Kept mounted through the close (see
+              paneMounted) so the content fades out with the panel rather than
+              vanishing first. The artwork centers when the pane is 0-width. */}
+          <div
+            aria-hidden={!paneOpen}
+            className="min-w-0 overflow-hidden flex flex-col"
+            style={{
+              width: paneOpen ? '52%' : '0%',
+              maxWidth: 680,
+              marginLeft: paneOpen ? 40 : 0,
+              opacity: paneOpen ? 1 : 0,
+              // `height` tracks the (live-measured) column height, so it must NOT
+              // transition — only the open/close properties do, or the height
+              // would smear as the artwork resizes.
+              height: playerH || undefined,
+              transitionProperty: 'width, margin-left, opacity',
+              transitionDuration: '300ms',
+              transitionTimingFunction: 'cubic-bezier(0.4, 0, 0.2, 1)',
+            }}
+          >
+            {paneMounted ? (
+              <div key={tab} className="flex-1 min-h-0">
+                {tab === 'lyrics' ? (
+                  <LyricsView lyrics={lyrics} currentTime={currentTime} loading={lyricsLoading} onSeekTo={(s) => setCurrentTime(s)} />
+                ) : (
+                  <QueuePanel className="pr-1" />
+                )}
+              </div>
+            ) : null}
           </div>
         </div>
       ) : (
         <div className="flex-1 grid place-items-center text-neutral-500">Nothing playing</div>
       )}
 
+      {/* Corner toggles — Lyrics + Up next (Apple Music places them here). */}
+      {track && (
+        <div className="absolute right-6 bottom-6 z-10 flex items-center gap-2.5">
+          <CornerToggle
+            on={paneOpen && tab === 'lyrics'}
+            label="Lyrics"
+            onClick={() => togglePane('lyrics')}
+          >
+            <LyricsIcon size={20} />
+          </CornerToggle>
+          <CornerToggle
+            on={paneOpen && tab === 'queue'}
+            label="Up next"
+            onClick={() => togglePane('queue')}
+          >
+            <QueueIcon size={20} />
+          </CornerToggle>
+        </div>
+      )}
+
       {menu && <ContextMenu state={menu} onClose={() => setMenu(null)} />}
+      {sleepMenu && (
+        <ContextMenu state={sleepMenu} onClose={() => setSleepMenu(null)} />
+      )}
       {addToPlaylist && (
         <AddToPlaylistModal
           track={addToPlaylist.track}
@@ -473,107 +519,39 @@ export function NowPlayingView() {
           onClose={closeAddToPlaylist}
         />
       )}
-      {share && <ShareDialog target={share} onClose={() => setShare(null)} />}
     </div>
   );
 }
 
-function TabBtn({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
+
+/** A bottom-corner toggle (Lyrics / Up next). `children` are the glyph — pass
+ *  the shared PlayerIcons so these read as the same controls as the player
+ *  bar's. Lit with the artwork accent when its pane is open. */
+function CornerToggle({
+  on,
+  label,
+  onClick,
+  children,
+}: {
+  on: boolean;
+  label: string;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
   return (
     <button
       type="button"
       onClick={onClick}
-      className={`px-3 py-1.5 rounded-full text-sm transition ${
-        active ? 'bg-white/10 text-neutral-100' : 'text-neutral-400 hover:text-neutral-100 hover:bg-white/5'
+      aria-label={label}
+      aria-pressed={on}
+      title={label}
+      className={`h-10 w-10 grid place-items-center rounded-xl border transition ${
+        on
+          ? 'bg-white/10 text-accent border-white/15'
+          : 'bg-black/30 text-neutral-300 border-transparent hover:text-neutral-100 hover:bg-black/45 backdrop-blur-sm'
       }`}
     >
       {children}
     </button>
-  );
-}
-
-function QueueRow({
-  t,
-  isCurrent = false,
-  playing = false,
-  onPlay,
-  onPlayNext,
-  onRemove,
-  dragging = false,
-  onDragStart,
-  onDragOver,
-  onDrop,
-  onDragEnd,
-}: {
-  t: PlaylistTrack;
-  isCurrent?: boolean;
-  playing?: boolean;
-  onPlay: () => void;
-  onPlayNext?: () => void;
-  onRemove?: () => void;
-  dragging?: boolean;
-  onDragStart?: () => void;
-  onDragOver?: (e: React.DragEvent) => void;
-  onDrop?: () => void;
-  onDragEnd?: () => void;
-}) {
-  return (
-    <div
-      draggable={!isCurrent}
-      onDragStart={onDragStart}
-      onDragOver={onDragOver}
-      onDrop={onDrop}
-      onDragEnd={onDragEnd}
-      className={`group flex items-center gap-3 px-2 py-2 rounded-lg ${
-        isCurrent ? '' : 'hover:bg-white/5'
-      } ${dragging ? 'opacity-40' : ''}`}
-      style={
-        isCurrent
-          ? {
-              // The now-playing row takes a faint artwork-accent wash + hairline
-              // ring instead of a flat white highlight (title/EQ are already tinted).
-              backgroundColor:
-                'color-mix(in srgb, var(--color-accent) 12%, transparent)',
-              boxShadow:
-                'inset 0 0 0 1px color-mix(in srgb, var(--color-accent) 18%, transparent)',
-            }
-          : undefined
-      }
-    >
-      {!isCurrent ? (
-        <span className="cursor-grab text-neutral-600 group-hover:text-neutral-400 select-none shrink-0" aria-hidden title="Drag to reorder">
-          ⠿
-        </span>
-      ) : null}
-      <button type="button" onClick={onPlay} disabled={isCurrent} className="flex items-center gap-3 flex-1 min-w-0 text-left disabled:cursor-default">
-        <div className="h-11 w-11 shrink-0 rounded-lg bg-neutral-800 overflow-hidden grid place-items-center">
-          {t.album_art_url ? (
-            <img src={t.album_art_url} alt="" className="h-full w-full object-cover" draggable={false} loading="lazy" />
-          ) : (
-            <span className="text-neutral-600 text-xs">♪</span>
-          )}
-        </div>
-        <div className="min-w-0">
-          <div className={`text-sm truncate ${isCurrent ? 'text-accent' : 'text-neutral-100'}`}>{t.title}</div>
-          <div className="text-xs text-neutral-500 truncate">{t.artists.join(', ') || '—'}</div>
-        </div>
-      </button>
-      {isCurrent ? (
-        <span className="text-accent shrink-0 pr-1">
-          <EqualizerBars playing={playing} />
-        </span>
-      ) : (
-        <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition shrink-0">
-          <button type="button" onClick={onPlayNext} aria-label="Play next" title="Play next" className="h-7 w-7 grid place-items-center rounded text-neutral-500 hover:text-neutral-200">
-            <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-              <path d="M4 6l8 6-8 6zM18 5v14" />
-            </svg>
-          </button>
-          <button type="button" onClick={onRemove} aria-label="Remove from queue" title="Remove" className="h-7 w-7 grid place-items-center rounded text-neutral-500 hover:text-neutral-200">
-            ✕
-          </button>
-        </div>
-      )}
-    </div>
   );
 }

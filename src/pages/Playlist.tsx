@@ -15,12 +15,17 @@ import { isPinned, usePinStore, type Pin } from '@/lib/pins';
 import { useProfileStore } from '@/lib/profile';
 import { useSession } from '@/lib/session';
 import { useNavStore } from '@/lib/nav';
+import { useScrollMemory } from '@shared/useScrollMemory';
+import { useLibraryChangeTick } from '@shared/useLibraryChange';
 import {
   ipc,
   type PlaylistDetail,
   type PlaylistTrack,
 } from '@/lib/tauri';
+import { useCanDownload } from '@/lib/capabilities';
+import { useDownloadsStore } from '@/lib/downloads';
 import {
+  friendlyError,
   markPlaylistPlayed,
   patchTrackPlaylists,
   resolveTrackPreview,
@@ -28,7 +33,14 @@ import {
   type SearchAlbumResult,
   type SearchTrackResult,
 } from '@shared/api';
-import { cn, SCRIM, SHEET } from '@shared/ui';
+import {
+  cn,
+  BTN_DANGER,
+  CALLOUT_ERROR,
+  EYEBROW_ON_ART,
+  SCRIM,
+  SHEET,
+} from '@shared/ui';
 import { HeroWash } from '@shared/components/HeroWash';
 import {
   ContextMenu,
@@ -37,11 +49,13 @@ import {
   type MenuState,
 } from '@shared/components/ContextMenu';
 import {
-  AddToPlaylistModal,
   AlbumDetailModal,
   usePreviewPlayer,
   type SidebarPinController,
 } from '@shared/components/SearchScreen';
+import { AddToPlaylistModal } from '@shared/components/modals/AddToPlaylistModal';
+import { buildSearchTrackResult } from '@shared/trackAdapter';
+import { notifyLibraryChanged } from '@shared/libraryChanged';
 import {
   CondensedHeaderBar,
   useCondensedHeader,
@@ -65,25 +79,22 @@ function playlistTrackToSearch(
   playlistId: number,
   opts?: { albumContext?: boolean },
 ): SearchTrackResult {
-  return {
+  return buildSearchTrackResult({
     source: 'library',
-    source_id: String(t.id),
+    id: t.id,
     title: t.title,
     artists: t.artists,
     album: t.album,
     album_art_url: t.album_art_url,
     duration_ms: t.duration_ms,
     isrc: t.isrc,
-    local_track_id: t.id,
     // A saved album is NOT a playlist: on the album page we DON'T mark its
     // tracks as "in a playlist" (no per-song ✓ — the album-level save indicator
     // at the top already says it's saved). In a real playlist, the membership is
     // genuine, so we keep it (pre-checks this playlist in the add picker).
     in_playlist_ids: opts?.albumContext ? [] : [playlistId],
     has_audio: t.local_path != null || t.status === 'downloaded',
-    preview_url: null,
-    explicit: false,
-  };
+  });
 }
 
 export function PlaylistPage({ playlistId, onBack, onChanged }: Props) {
@@ -102,6 +113,17 @@ export function PlaylistPage({ playlistId, onBack, onChanged }: Props) {
   );
   const [renameError, setRenameError] = useState<string | null>(null);
   const parentRef = useRef<HTMLDivElement>(null);
+  // Remember scroll per playlist so Back (e.g. from a track's album) lands
+  // where you were. Merged onto parentRef — the same element the virtualizer
+  // scrolls — so both share one node.
+  const rememberScroll = useScrollMemory(`playlist:${playlistId}`);
+  const setScrollEl = useCallback(
+    (node: HTMLDivElement | null) => {
+      parentRef.current = node;
+      rememberScroll(node);
+    },
+    [rememberScroll],
+  );
   // Spotify-style condensed header: the whole page scrolls in one container
   // (parentRef); a sentinel under the hero title flips `condensed` true as the
   // title scrolls past the top bar. The virtualized list sits below the hero,
@@ -143,6 +165,11 @@ export function PlaylistPage({ playlistId, onBack, onChanged }: Props) {
   const [pickerTrack, setPickerTrack] = useState<SearchTrackResult | null>(null);
   // Per-song "⋯" overflow menu (Spotify-style); null = closed.
   const [menu, setMenu] = useState<MenuState | null>(null);
+  // Download affordances (full build only — false on the open-core/OSS build).
+  const canDownload = useCanDownload();
+  const startDownload = useDownloadsStore((s) => s.download);
+  const removeDownload = useDownloadsStore((s) => s.remove);
+  const downloadWholePlaylist = useDownloadsStore((s) => s.downloadPlaylist);
 
   // 30s preview auditioning for not-yet-downloaded tracks needs a session token
   // to hit the catalog search. Shared token, fetched once per app launch.
@@ -248,19 +275,24 @@ export function PlaylistPage({ playlistId, onBack, onChanged }: Props) {
     markPlaylistPlayed(playlistId);
   }, [playlistId]);
 
+  // Re-run when the library changes elsewhere (a track added to THIS playlist
+  // from the floating search/album overlay, or the star toggling Liked Songs
+  // while this Favorites page is open) — the overlay sits over this still-mounted
+  // page, so without this the new/removed row wouldn't show until nav away/back.
+  const libTick = useLibraryChangeTick();
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
         await loadTracks();
       } catch (e) {
-        if (!cancelled) setError(String(e));
+        if (!cancelled) setError(friendlyError(e));
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [loadTracks]);
+  }, [loadTracks, libTick]);
 
 
   const handleConfirmDelete = useCallback(async () => {
@@ -268,11 +300,15 @@ export function PlaylistPage({ playlistId, onBack, onChanged }: Props) {
     setDeleteError(null);
     try {
       await ipc.deletePlaylist(playlistId);
+      // Announce it so the persistent sidebar drops the row (it doesn't remount
+      // on the back-navigation the way the LibraryPage grid does, so without
+      // this the just-deleted playlist lingers in the sidebar).
+      notifyLibraryChanged();
       // Pop back to the library; the LibraryPage refetches on mount so
       // the deleted playlist disappears from the grid.
       onBack();
     } catch (e) {
-      setDeleteError(e instanceof Error ? e.message : String(e));
+      setDeleteError(friendlyError(e));
       setDeleteState('pending');
     }
   }, [playlistId, onBack]);
@@ -294,7 +330,7 @@ export function PlaylistPage({ playlistId, onBack, onChanged }: Props) {
         onChanged?.();
         setRenameState(null);
       } catch (e) {
-        setRenameError(e instanceof Error ? e.message : String(e));
+        setRenameError(friendlyError(e));
         setRenameState('pending');
       }
     },
@@ -333,6 +369,11 @@ export function PlaylistPage({ playlistId, onBack, onChanged }: Props) {
       }
       await loadTracks();
       onChanged?.();
+      // Let the rest of the app react: the sidebar refetches its playlist
+      // list/counts, and the player-bar / Now Playing star re-derives its
+      // liked state — so removing the current track from Favorites clears its
+      // star live instead of leaving a stale filled star.
+      notifyLibraryChanged();
     } catch (e) {
       console.warn('[beetbot] remove from playlist failed', e);
     }
@@ -343,6 +384,7 @@ export function PlaylistPage({ playlistId, onBack, onChanged }: Props) {
   // dropped; the rest reuse existing handlers.
   const showTrackMenu = (track: PlaylistTrack, x: number, y: number) => {
     const artist = track.artists[0]?.trim() ?? '';
+    const pid = activeProfileId; // captured for the download actions' closures
     const items: MenuItem[] = [
       {
         label: 'Add to playlist',
@@ -357,6 +399,40 @@ export function PlaylistPage({ playlistId, onBack, onChanged }: Props) {
           appendToQueue([track]);
         },
       },
+      // Download / Remove download — full build only, one or the other by state.
+      ...(canDownload && pid != null && !(track.local_path != null || track.status === 'downloaded')
+        ? [
+            {
+              label: 'Download',
+              icon: MenuGlyphs.download,
+              onClick: () => {
+                void startDownload(track.id, pid);
+              },
+            },
+          ]
+        : []),
+      ...(canDownload && pid != null && (track.local_path != null || track.status === 'downloaded')
+        ? [
+            {
+              label: 'Remove download',
+              icon: MenuGlyphs.download,
+              onClick: () => {
+                void removeDownload(track.id, pid);
+              },
+            },
+          ]
+        : []),
+      ...(track.local_path
+        ? [
+            {
+              label: 'Show in Finder',
+              icon: MenuGlyphs.folder,
+              onClick: () => {
+                void ipc.revealInFinder(track.local_path!).catch(() => {});
+              },
+            },
+          ]
+        : []),
       {
         label:
           detail?.source === 'liked'
@@ -388,7 +464,7 @@ export function PlaylistPage({ playlistId, onBack, onChanged }: Props) {
   if (error) {
     return (
       <div className="h-full p-8">
-        <div className="rounded-lg border border-red-900 bg-red-950/40 p-3 text-sm text-red-200">
+        <div className={CALLOUT_ERROR}>
           {error}
         </div>
       </div>
@@ -481,7 +557,12 @@ export function PlaylistPage({ playlistId, onBack, onChanged }: Props) {
           album={syntheticAlbum}
           presetTracks={presetTracks}
           savedPlaylistId={playlistId}
-          onRemoveFromLibrary={() => setDeleteState('pending')}
+          // Un-saving an album is a light action (it removes the saved copy, not
+          // your own content) → do it instantly, no confirm dialog. Deleting a
+          // playlist you MADE still confirms (that's the trash button below).
+          // The confirm modal stays as the error fallback (handleConfirmDelete
+          // re-opens it if the delete fails).
+          onRemoveFromLibrary={handleConfirmDelete}
           onClose={onBack}
           onPlay={playFromAlbum}
           // Now-playing awareness → Spotify-style row highlight + equalizer bars
@@ -535,7 +616,7 @@ export function PlaylistPage({ playlistId, onBack, onChanged }: Props) {
   return (
     <>
       <div
-        ref={parentRef}
+        ref={setScrollEl}
         className="relative h-full overflow-y-auto overflow-x-hidden"
       >
         {/* Condensed bar — small Play + name, pinned under the top bar once the
@@ -566,7 +647,7 @@ export function PlaylistPage({ playlistId, onBack, onChanged }: Props) {
             }}
             title="Edit details"
             aria-label="Edit details"
-            className="group/cover relative h-44 w-44 shrink-0 rounded-lg overflow-hidden bg-neutral-800 grid place-items-center shadow-lg"
+            className="group/cover relative h-44 w-44 shrink-0 rounded-xl overflow-hidden bg-neutral-800 grid place-items-center shadow-lg"
           >
             {detail.cover_url ? (
               <img
@@ -598,9 +679,9 @@ export function PlaylistPage({ playlistId, onBack, onChanged }: Props) {
             </span>
           </button>
           <div className="min-w-0">
-            <p className="text-xs font-semibold uppercase tracking-wider text-neutral-400 mb-1">
-              Playlist
-            </p>
+            {/* Shared eyebrow recipe — album/artist/genre/phone all use it;
+                this page had a hand-rolled variant that drifted. */}
+            <p className={cn(EYEBROW_ON_ART, 'mb-1')}>Playlist</p>
             <h1 className="mb-2">
               <button
                 type="button"
@@ -658,7 +739,7 @@ export function PlaylistPage({ playlistId, onBack, onChanged }: Props) {
                 disabled={!playable}
                 aria-label="Shuffle play"
                 title={playable ? 'Shuffle play' : 'No songs with audio files yet'}
-                className="rounded-lg px-3 py-2 text-neutral-300 hover:text-neutral-100 hover:bg-neutral-900 disabled:text-neutral-600 disabled:hover:bg-transparent transition"
+                className="grid h-10 w-10 place-items-center rounded-full text-neutral-300 hover:text-neutral-100 hover:bg-white/10 disabled:text-neutral-600 disabled:hover:bg-transparent transition"
               >
                 <svg
                   width="20"
@@ -678,6 +759,34 @@ export function PlaylistPage({ playlistId, onBack, onChanged }: Props) {
                   <path d="M4 4l5 5" />
                 </svg>
               </button>
+              {canDownload && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (activeProfileId != null)
+                      void downloadWholePlaylist(playlistId, activeProfileId);
+                  }}
+                  disabled={!playable || activeProfileId == null}
+                  aria-label="Download all songs"
+                  title={playable ? 'Download all songs' : 'No songs to download yet'}
+                  className="grid h-10 w-10 place-items-center rounded-full text-neutral-300 hover:text-neutral-100 hover:bg-white/10 disabled:text-neutral-600 disabled:hover:bg-transparent transition"
+                >
+                  <svg
+                    width="20"
+                    height="20"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.8"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    aria-hidden
+                  >
+                    <path d="M12 4v10M8 11l4 4 4-4" />
+                    <path d="M5 19h14" />
+                  </svg>
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() => {
@@ -693,7 +802,7 @@ export function PlaylistPage({ playlistId, onBack, onChanged }: Props) {
                 title={pinned ? 'Unpin from sidebar' : 'Pin to sidebar'}
                 aria-label={pinned ? 'Unpin from sidebar' : 'Pin to sidebar'}
                 aria-pressed={pinned}
-                className={`rounded-lg px-3 py-2 transition hover:bg-neutral-900 ${
+                className={`grid h-10 w-10 place-items-center rounded-full transition hover:bg-white/10 ${
                   pinned ? 'text-white' : 'text-neutral-400 hover:text-neutral-100'
                 }`}
               >
@@ -719,7 +828,7 @@ export function PlaylistPage({ playlistId, onBack, onChanged }: Props) {
                 type="button"
                 onClick={() => setDeleteState('pending')}
                 title="Delete this playlist (songs stay in your library)"
-                className="rounded-lg px-3 py-2 text-neutral-400 hover:text-red-400 hover:bg-neutral-900 transition"
+                className="grid h-10 w-10 place-items-center rounded-full text-neutral-400 hover:text-red-400 hover:bg-white/10 transition"
                 aria-label="Delete playlist"
               >
                 {/* Inline trash icon for visual consistency with the
@@ -901,10 +1010,10 @@ function DeleteConfirmModal({
           <p className="text-xs text-neutral-500 mt-3">
             {isAlbum
               ? 'The songs stay in your library and on disk — only the album goes away. You can add it again any time.'
-              : 'Songs in the playlist stay in your library and on disk — only this collection goes away. If it was synced from Spotify, the next sync will bring it back.'}
+              : 'Songs in the playlist stay in your library and on disk — only this collection goes away.'}
           </p>
           {error && (
-            <div className="mt-3 rounded-lg border border-red-900 bg-red-950/40 px-3 py-2 text-xs text-red-200 break-words">
+            <div className={cn(CALLOUT_ERROR, 'mt-3 text-xs break-words')}>
               {error}
             </div>
           )}
@@ -922,7 +1031,7 @@ function DeleteConfirmModal({
             type="button"
             onClick={onConfirm}
             disabled={isDeleting}
-            className="px-4 py-2 rounded-lg text-sm font-medium bg-red-500 hover:bg-red-400 text-neutral-950 disabled:opacity-60"
+            className={cn(BTN_DANGER, 'disabled:opacity-60')}
           >
             {isDeleting
               ? isAlbum
@@ -1049,14 +1158,8 @@ function EditDetailsModal({
               />
             </div>
           </div>
-          {source === 'spotify' && (
-            <p className="mt-3 text-xs text-amber-300/80">
-              This playlist syncs from Spotify — a future sync may restore its
-              original name and description.
-            </p>
-          )}
           {error && (
-            <div className="mt-3 rounded-lg border border-red-900 bg-red-950/40 px-3 py-2 text-xs text-red-200 break-words">
+            <div className={cn(CALLOUT_ERROR, 'mt-3 text-xs break-words')}>
               {error}
             </div>
           )}

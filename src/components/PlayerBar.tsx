@@ -1,22 +1,21 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { formatDuration } from '@/lib/format';
-import { currentTrack, usePlayerStore } from '@/lib/store';
+import { canStream, currentTrack, usePlayerStore } from '@/lib/store';
+import { heartbeatQueue } from '@shared/playerStore';
 import { useNativeEngine } from '@/lib/nativeEngine';
 import { useAppearanceStore } from '@/lib/appearance';
 import { useAudioFxStore, LOUDNESS_TARGET_LUFS } from '@/lib/audiofx';
 import { useNavStore } from '@/lib/nav';
+import { ConnectIcon, LyricsIcon, QueueIcon } from '@/components/PlayerIcons';
 import { ipc, type PlaylistTrack } from '@/lib/tauri';
 import {
   castControl,
   castStart,
   castStop,
   ensureSession,
-  fetchRadioStreamTracks,
   getCastStatus,
   getTrackPlaylistIds,
-  logPlay,
-  logPlayFinish,
   listCastDevices,
   listDevices,
   pollHandoff,
@@ -26,20 +25,38 @@ import {
   requestHandoff,
   sendHeartbeat,
   setApiBase,
+  HEARTBEAT_QUEUE_MAX,
   type CastDevice,
   type HandoffPayload,
   type RemoteAction,
   type RemoteDevice,
   type SearchTrackResult,
 } from '@shared/api';
-import { CastPicker } from '@shared/components/CastPicker';
+import { cn, CALLOUT_ERROR } from '@shared/ui';
+import { useConnectStore } from '@/lib/connect';
 import { Marquee } from '@shared/components/Marquee';
-import { SleepTimerButton } from '@shared/components/SleepTimerButton';
 import { LikeButton } from '@shared/components/LikeButton';
-import { AddToPlaylistModal } from '@shared/components/SearchScreen';
+import { useAddAudio } from '@/lib/addAudio';
+import { useDownloadsStore, trackHasFile } from '@/lib/downloads';
+import { useCapabilitiesStore } from '@/lib/capabilities';
+import { AddToPlaylistModal } from '@shared/components/modals/AddToPlaylistModal';
+import {
+  ContextMenu,
+  MenuGlyphs,
+  fileMenuItems,
+  sleepTimerMenuItems,
+  sleepTimerMenuLabel,
+  type MenuState,
+} from '@shared/components/ContextMenu';
+import { playlistTrackToSearch } from '@/lib/trackAdapter';
+import {
+  useSleepTimer,
+  useAutoplayRadio,
+  usePlayLogging,
+  useCompletionSignal,
+} from '@shared/playerHooks';
 import { useProfileStore } from '@/lib/profile';
 import { useLikesStore } from '@/lib/likes';
-import { RemoteNowPlaying } from '@shared/components/RemoteNowPlaying';
 import { audioStarted, registerAudioPauser } from '@shared/audioCoordinator';
 import { useUiStore } from '@/lib/ui';
 
@@ -51,7 +68,7 @@ setApiBase('http://127.0.0.1:47823');
 
 /// Fixed-height (80px) audio control + a hidden &lt;audio&gt; element that drives
 /// it. Mounted once at the App level so playback survives page navigation.
-export function PlayerBar({ floating = false }: { floating?: boolean }) {
+export function PlayerBar() {
   // Two <audio> elements that ping-pong: `audioRef` is the active one,
   // `fadeRef` the idle/crossfade one. They swap on each crossfade so the
   // incoming track is never reloaded at the boundary (no gap). With crossfade
@@ -86,18 +103,15 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
   const setCurrentTime = usePlayerStore((s) => s.setCurrentTime);
   const setDuration = usePlayerStore((s) => s.setDuration);
   const setVolume = usePlayerStore((s) => s.setVolume);
+  const toggleMute = usePlayerStore((s) => s.toggleMute);
   const toggleRepeat = usePlayerStore((s) => s.toggleRepeat);
   const toggleShuffle = usePlayerStore((s) => s.toggleShuffle);
   const handleTrackEnded = usePlayerStore((s) => s.handleTrackEnded);
   const adoptHandoff = usePlayerStore((s) => s.adoptHandoff);
-  const autoplay = usePlayerStore((s) => s.autoplay);
-  const appendToQueue = usePlayerStore((s) => s.appendToQueue);
-  const playAt = usePlayerStore((s) => s.playAt);
   const sleepTimerEndsAt = usePlayerStore((s) => s.sleepTimerEndsAt);
   const sleepAtTrackEnd = usePlayerStore((s) => s.sleepAtTrackEnd);
   const setSleepTimer = usePlayerStore((s) => s.setSleepTimer);
   const queue = usePlayerStore((s) => s.queue);
-  const currentIndex = usePlayerStore((s) => s.currentIndex);
   const crossfadeSeconds = usePlayerStore((s) => s.crossfadeSeconds);
   const crossfadeAdvance = usePlayerStore((s) => s.crossfadeAdvance);
 
@@ -108,28 +122,24 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
   const cfStateRef = useRef<'idle' | 'fading'>('idle');
   const cfRafRef = useRef<number | null>(null);
 
-  // Consecutive failed-load counter for the onError skip: a track whose
-  // stream/live-resolve fails advances to the next one, but after 3 failures
-  // in a row we stop instead of skip-looping a whole queue through a broken
-  // backend. Reset whenever a track actually starts playing.
-  const errorSkipRef = useRef(0);
+  // Playback error recovery (mirrors the phone player). A streamed /live resolve
+  // that momentarily fails — the engine re-minting a session, a stale URL after
+  // sleep — recovers on a retry, so we retry the SAME track a few times with
+  // backoff rather than skipping a song that would have played. `retryRef` counts
+  // those retries; `goneRef` caps skips through 404 (gone) / undecodable tracks
+  // so a dead queue stops with a message instead of looping. Both reset when a
+  // track actually starts. `errorMsg` surfaces the failure in a small banner —
+  // the desktop used to die silently with the bar stuck paused.
+  const retryRef = useRef<{ count: number; timer: number }>({
+    count: 0,
+    timer: 0,
+  });
+  const goneRef = useRef(0);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
-  // Sleep timer: pause when the scheduled time arrives. (The "end of track"
-  // variant is handled in the store's handleTrackEnded.)
-  useEffect(() => {
-    if (sleepTimerEndsAt == null) return;
-    const fire = () => {
-      usePlayerStore.getState().pause();
-      usePlayerStore.getState().setSleepTimer('off');
-    };
-    const ms = sleepTimerEndsAt - Date.now();
-    if (ms <= 0) {
-      fire();
-      return;
-    }
-    const t = setTimeout(fire, ms);
-    return () => clearTimeout(t);
-  }, [sleepTimerEndsAt]);
+  // Sleep timer, play-logging, completion signal, and autoplay-radio are shared
+  // with the phone player via hooks (see shared/playerHooks.ts).
+  useSleepTimer(usePlayerStore);
 
   // Click-through from the now-playing bar to the artist / album pages.
   const openArtistPage = useNavStore((s) => s.openArtist);
@@ -244,12 +254,13 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
   // mount via ensureSession() and cache for the lifetime of the bar.
   const [castToken, setCastToken] = useState<string | null>(null);
   const [castDevices, setCastDevices] = useState<CastDevice[]>([]);
-  const [castPickerOpen, setCastPickerOpen] = useState(false);
   const [castActive, setCastActive] = useState<{
     id: string;
     name: string;
   } | null>(null);
   const [castError, setCastError] = useState<string | null>(null);
+  // True while warming a streamed track's /live temp file before hand-off.
+  const [castPreparing, setCastPreparing] = useState(false);
 
   // ---- Liked Songs (heart) ----
   const activeProfileId = useProfileStore((s) => s.activeProfileId);
@@ -259,109 +270,59 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
   const toggleLike = useLikesStore((s) => s.toggle);
   const refreshLikes = useLikesStore((s) => s.refresh);
   useEffect(() => {
-    void refreshLikes(activeProfileId);
+    const reload = () => void refreshLikes(activeProfileId);
+    reload();
+    // Re-derive the star from the server on ANY library change — so un-liking
+    // the current track from somewhere else (e.g. removing it from the
+    // Favorites playlist page) clears the bar's star live, not just on the
+    // next mount. The store's own toggle already awaits the server before it
+    // fires this, so the refetch reflects the committed state (no flicker).
+    window.addEventListener('beetbot:library-changed', reload);
+    return () =>
+      window.removeEventListener('beetbot:library-changed', reload);
   }, [activeProfileId, refreshLikes]);
 
-  // ---- Autoplay / radio: keep the queue flowing past its end ----
-  // When you reach the end of the queue with repeat OFF and autoplay ON, fetch
-  // songs similar to the current track and append them — so a single searched
-  // song (or a finished playlist) rolls into a radio of similar music instead of
-  // stopping. Fires while the last/second-to-last track plays so the appended
-  // songs are ready before this one ends. Mirrors the phone player.
-  const radioKeyRef = useRef('');
-  const radioInFlightRef = useRef(false);
-  useEffect(() => {
-    if (!isPlaying || !autoplay || shuffle || repeat !== 'off' || !track) return;
-    const upcoming = queue.length - 1 - currentIndex; // tracks queued after current
-    if (upcoming > 1) return; // still plenty ahead
-    const seed = track.artists?.[0];
-    if (!seed) return;
-    // De-dupe identical triggers (same queue length + seed) so we fetch once per
-    // tail; after appending, queue.length changes and a new tail can re-trigger.
-    const key = `${queue.length}:${track.id}`;
-    if (radioInFlightRef.current || radioKeyRef.current === key) return;
-    radioKeyRef.current = key;
-    radioInFlightRef.current = true;
-    void (async () => {
-      try {
-        const tok = await ensureSession();
-        const more = await fetchRadioStreamTracks(seed, tok, {
-          title: track.title,
-          limit: 30,
-          profileId: activeProfileId,
-        });
-        if (!more.length) return;
-        // Map radio StreamTracks → desktop PlaylistTracks (the queue's row shape).
-        // Only rows with an audio file (status 'downloaded') survive the queue's
-        // canStream filter; non-audio radio picks are dropped by appendToQueue.
-        const rows: PlaylistTrack[] = more.map((m) => ({
-          id: m.id,
-          spotify_id: '',
-          title: m.title,
-          artists: m.artists,
-          album: m.album ?? null,
-          album_art_url: m.album_art_url ?? null,
-          duration_ms: m.duration_ms,
-          isrc: null,
-          status: m.status,
-          failure_reason: null,
-          local_path: null,
-          position: 0,
-          added_at: null,
-        }));
-        const before = usePlayerStore.getState().queue.length;
-        const n = appendToQueue(rows);
-        // If the track already ended while this fetch was in flight (queue ran
-        // dry and playback stopped at the tail), roll into the fresh radio.
-        if (n > 0) {
-          const s = usePlayerStore.getState();
-          if (!s.isPlaying && s.currentTime === 0 && s.currentIndex === before - 1) {
-            playAt(s.currentIndex + 1);
-          }
-        }
-      } finally {
-        radioInFlightRef.current = false;
-      }
-    })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoplay, repeat, shuffle, isPlaying, track?.id, queue.length, currentIndex, activeProfileId]);
+  // Autoplay-radio (maps radio StreamTracks → desktop PlaylistTracks; only
+  // status 'downloaded' rows survive appendToQueue's canStream filter).
+  useAutoplayRadio({
+    store: usePlayerStore,
+    getToken: ensureSession,
+    profileId: activeProfileId,
+    buildRadioTracks: (more) =>
+      more.map((m) => ({
+        id: m.id,
+        spotify_id: '',
+        title: m.title,
+        artists: m.artists,
+        album: m.album ?? null,
+        album_art_url: m.album_art_url ?? null,
+        duration_ms: m.duration_ms,
+        isrc: null,
+        status: m.status,
+        failure_reason: null,
+        local_path: null,
+        position: 0,
+        added_at: null,
+      })),
+  });
 
-  // ---- Listening stats: log a play once a track passes ~20s ----
-  const playLoggedRef = useRef<number | null>(null);
-  useEffect(() => {
-    if (!track || !castToken) return;
-    if (currentTime < 1 && playLoggedRef.current === track.id) {
-      playLoggedRef.current = null;
-    } else if (currentTime >= 20 && playLoggedRef.current !== track.id) {
-      playLoggedRef.current = track.id;
-      void logPlay(castToken, track.id, activeProfileId);
-      // Same threshold the server uses to record a play: surface it to Home so
-      // the live "Recently played" prepend only shows tracks the feed will keep.
-      usePlayerStore.getState().markPlayLogged(track);
-    }
-  }, [currentTime, track?.id, castToken, activeProfileId]);
+  usePlayLogging({
+    store: usePlayerStore,
+    token: castToken,
+    profileId: activeProfileId,
+  });
 
-  // ---- Phase 0: completion signal (finished vs skipped) ----
   // Latest position of the current track, refreshed each timeupdate (snapped to
   // full length on natural end); reported for the OUTGOING track on track change.
   const lastTickRef = useRef<{ id: number; ms: number; durMs: number } | null>(
     null,
   );
-  const reportFinishRef = useRef<
-    (p: { id: number; ms: number; durMs: number }) => void
-  >(() => {});
-  reportFinishRef.current = (p) => {
-    if (p.ms < 5000 || !castToken) return; // ignore accidental taps
-    const completed = p.durMs > 0 && p.ms >= 0.85 * p.durMs;
-    void logPlayFinish(castToken, p.id, p.ms, completed, activeProfileId);
-  };
-  useEffect(() => {
-    const myId = track?.id;
-    return () => {
-      const p = lastTickRef.current;
-      if (p && p.id === myId) reportFinishRef.current(p);
-    };
-  }, [track?.id]);
+  useCompletionSignal({
+    store: usePlayerStore,
+    token: castToken,
+    profileId: activeProfileId,
+    lastTickRef,
+  });
 
   const trackLiked = track ? likedIds.has(track.id) : false;
   // The heart opens a Spotify-style "Add to playlist" picker (Liked Songs pinned
@@ -385,21 +346,7 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
           token: tok,
           // source 'local' + source_id = the library track id makes the hub link
           // this existing row rather than upsert a duplicate (see patch handler).
-          track: {
-            source: 'local',
-            source_id: String(t.id),
-            title: t.title,
-            artists: t.artists ?? [],
-            album: t.album ?? null,
-            album_art_url: t.album_art_url ?? null,
-            duration_ms: t.duration_ms ?? 0,
-            isrc: t.isrc ?? null,
-            local_track_id: t.id,
-            in_playlist_ids: inIds,
-            has_audio: t.local_path != null,
-            preview_url: null,
-            explicit: false,
-          },
+          track: playlistTrackToSearch(t, { inPlaylistIds: inIds }),
         });
       });
   }, [track, castToken, activeProfileId]);
@@ -409,6 +356,89 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
     // the heart fill reflects it.
     void refreshLikes(activeProfileId);
   }, [refreshLikes, activeProfileId]);
+  // The bar's ⋯ opens the SAME menu as the fullscreen Now Playing (Add to
+  // playlist · Go to artist · Go to album · Sleep timer) — it used to jump
+  // straight into the playlist picker, so the same-looking control did two
+  // different things depending on the surface.
+  const [trackMenu, setTrackMenu] = useState<MenuState | null>(null);
+  // The duration picker the menu's "Sleep timer" row opens — separate state so
+  // the first menu's onClose (which fires right after the row's onClick)
+  // can't wipe it.
+  const [sleepMenu, setSleepMenu] = useState<MenuState | null>(null);
+  const openTrackMenu = useCallback(
+    (e: React.MouseEvent) => {
+      if (!track) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const t = track;
+      const pid = activeProfileId; // captured for the download actions' closures
+      setTrackMenu({
+        x: e.clientX,
+        y: e.clientY,
+        items: [
+          {
+            label: 'Add to playlist',
+            icon: MenuGlyphs.addToPlaylist,
+            onClick: openAddToPlaylist,
+          },
+          {
+            label: 'Go to artist',
+            icon: MenuGlyphs.artist,
+            onClick: () => openArtistPage(t.artists[0]),
+            disabled: !t.artists[0],
+          },
+          {
+            label: 'Go to album',
+            icon: MenuGlyphs.album,
+            onClick: () => openAlbumPage(t.album!, t.artists[0] ?? null),
+            disabled: !t.album,
+          },
+          // Save offline / remove / attach-a-file — the shared file actions, so
+          // every ⋯ menu offers the same set. Save and remove appear only on a
+          // build that can acquire.
+          ...fileMenuItems({
+            hasFile: trackHasFile(t),
+            downloading:
+              useDownloadsStore.getState().byTrack[t.id] !== undefined,
+            canDownload: useCapabilitiesStore.getState().canDownload,
+            onDownload:
+              pid != null
+                ? () => void useDownloadsStore.getState().download(t.id, pid)
+                : undefined,
+            onRemove:
+              pid != null
+                ? () => void useDownloadsStore.getState().remove(t.id, pid)
+                : undefined,
+            onAddAudio: () => useAddAudio.getState().openForTrack(t),
+          }),
+          {
+            label: sleepTimerMenuLabel(sleepTimerEndsAt, sleepAtTrackEnd),
+            icon: MenuGlyphs.sleep,
+            separator: true,
+            onClick: () =>
+              setSleepMenu({
+                x: e.clientX,
+                y: e.clientY,
+                items: sleepTimerMenuItems(
+                  sleepTimerEndsAt,
+                  sleepAtTrackEnd,
+                  setSleepTimer,
+                ),
+              }),
+          },
+        ],
+      });
+    },
+    [
+      track,
+      openAddToPlaylist,
+      openArtistPage,
+      openAlbumPage,
+      sleepTimerEndsAt,
+      sleepAtTrackEnd,
+      setSleepTimer,
+    ],
+  );
   // Two now-playing surfaces: the artwork opens the FULL-window view (takes over
   // the app); the lyrics / queue buttons open the docked right bar.
   const nowPlayingFull = useUiStore((s) => s.nowPlayingFull);
@@ -419,7 +449,6 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
   // ---- Playback handoff (control the computer's playback from the phone,
   // and hand a queue back and forth). Other online devices we can hand to:
   const [handoffDevices, setHandoffDevices] = useState<RemoteDevice[]>([]);
-  const [handoffMenuOpen, setHandoffMenuOpen] = useState(false);
 
   // Buffering: true while the active <audio> is loading/stalled, so the UI can
   // show a spinner instead of looking frozen. Lives in the store so the full
@@ -543,7 +572,13 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
     () => engineSrcFor(track ?? null),
     [engineSrcFor, track?.id, track?.local_path, track?.status],
   );
-  const nextTrack = queue[currentIndex + 1] ?? null;
+  // The TRUE next track — shuffle-aware via the store's plan (peekNextIndex),
+  // so the crossfade/gapless pre-buffer loads what will actually play, not
+  // queue[currentIndex + 1]. Selector form keeps it reactive to plan changes.
+  const nextTrack = usePlayerStore((s) => {
+    const i = s.peekNextIndex();
+    return i >= 0 ? s.queue[i] : null;
+  });
   const nextSource = useMemo(
     () => engineSrcFor(nextTrack),
     [engineSrcFor, nextTrack?.id, nextTrack?.local_path, nextTrack?.status],
@@ -567,6 +602,54 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
     repeatOne: repeat === 'one',
   });
 
+  // Pre-warm the next 1–2 queue tracks while the current one plays, so an
+  // auto-advance or skip is instant instead of cold-starting the transition.
+  // The win is streamed (/live) tracks: a tiny range request makes the host
+  // resolve + remux the source into its temp cache NOW (that resolve is the
+  // "few seconds" you'd otherwise wait for at the boundary). Downloaded/local
+  // tracks load from disk instantly, so we skip them. Mirrors the phone's
+  // prefetch. Staggered so neither warm competes with the current track's own
+  // buffer fill; aborts on track change so we never resolve tracks we skip past.
+  // Skipped while casting (the receiver owns its buffer) or on the native engine
+  // (it preloads the next itself via nextSource).
+  useEffect(() => {
+    if (!track || castActive || nativeActive) return;
+    const { queue: q, currentIndex: idx } = usePlayerStore.getState();
+    const upcoming = [q[idx + 1], q[idx + 2]].filter(
+      (t): t is PlaylistTrack => !!t && canStream(t),
+    );
+    if (upcoming.length === 0) return;
+    const ctrl = new AbortController();
+    const timers: number[] = [];
+    const warm = (t: PlaylistTrack, delay: number) => {
+      timers.push(
+        window.setTimeout(() => {
+          const url = srcFor(t);
+          // Only server-streamed URLs benefit; a local file (convertFileSrc)
+          // needs no resolve. We don't keep the bytes — the server-side prep is
+          // the point.
+          if (!url.startsWith('http')) return;
+          void fetch(url, {
+            method: 'GET',
+            headers: { Range: 'bytes=0-1' },
+            cache: 'no-store',
+            signal: ctrl.signal,
+          })
+            .then((r) => r.arrayBuffer())
+            .catch(() => {});
+        }, delay),
+      );
+    };
+    warm(upcoming[0], 2000);
+    if (upcoming[1]) warm(upcoming[1], 6000);
+    return () => {
+      ctrl.abort();
+      timers.forEach((id) => clearTimeout(id));
+    };
+    // Re-warm only when the CURRENT track changes (id), not on every object ref.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [track?.id, castActive, nativeActive, srcFor]);
+
   // Arm the crossfade once the current track is within crossfadeSeconds of the
   // end. Off entirely when crossfadeSeconds is 0, while casting, or on native.
   useEffect(() => {
@@ -580,7 +663,10 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
     if (document.hidden) return;
     if (cfStateRef.current !== 'idle') return;
     if (!(duration > 0)) return;
-    const next = queue[currentIndex + 1];
+    // Shuffle-aware: fade into the store's actual next pick, matching what
+    // crossfadeAdvance will commit to (both read the same plan).
+    const ni = usePlayerStore.getState().peekNextIndex();
+    const next = ni >= 0 ? queue[ni] : undefined;
     if (!next) return;
     const remaining = duration - currentTime;
     if (remaining > 0.2 && remaining <= crossfadeSeconds) {
@@ -714,7 +800,7 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
   // gentle on the network and snappy enough to catch a device
   // coming online mid-search.
   useEffect(() => {
-    if (!castPickerOpen || !castToken) return;
+    if (rightBar !== 'connect' || !castToken) return;
     let cancelled = false;
     const refresh = () => {
       listCastDevices(castToken)
@@ -732,7 +818,7 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
       cancelled = true;
       window.clearInterval(id);
     };
-  }, [castPickerOpen, castToken]);
+  }, [rightBar, castToken]);
 
   // Mute the local element while a cast is active. Otherwise we'd
   // have two sources of the same audio playing in parallel.
@@ -803,11 +889,11 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
   // new track onto the receiver. Guard against re-LOADing the track
   // that's already playing.
   useEffect(() => {
-    // A 'downloaded'-status row may carry a null in-memory local_path (a catalog
-    // row built for the queue) — the hub still has the file and castStart
-    // resolves the path from the DB by id, so it's castable.
+    // Castable = a downloaded file OR a live-streamable track; a streamed
+    // next-track is warmed server-side inside cast_start before the receiver
+    // LOADs it (a cold one adds a short gap; an already-warm one is instant).
     if (!castActive || !castToken || !track) return;
-    if (!track.local_path && track.status !== 'downloaded') return;
+    if (!canStream(track)) return;
     if (castedTrackIdRef.current === track.id) return;
     castedTrackIdRef.current = track.id;
     castStart(castActive.id, track.id, castToken)
@@ -828,18 +914,34 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
     const beat = () => {
       const st = usePlayerStore.getState();
       const cur = st.queue[st.currentIndex];
+      // What we play next, in true (shuffle-aware) order, so another device's
+      // "Up next" for us matches what will actually happen.
+      const up = heartbeatQueue(
+        st.queue,
+        st.currentIndex,
+        st.shuffle,
+        st.shuffleUpcomingIds,
+        HEARTBEAT_QUEUE_MAX,
+      );
       const np = cur
         ? {
             title: cur.title,
             artists: cur.artists,
             album_art_url: cur.album_art_url,
+            album: cur.album ?? null,
             is_playing: st.isPlaying,
+            position_ms: Math.round((st.currentTime ?? 0) * 1000),
+            duration_ms: cur.duration_ms,
+            // The id, not a URL: the reader signs its own art request.
+            track_id: cur.id,
+            queue: up.items,
+            queue_len: up.total,
           }
         : null;
       // Scope presence to the active profile (read live so a profile switch
       // takes effect next tick) — accounts must not see each other's devices.
       const pid = useProfileStore.getState().activeProfileId;
-      void sendHeartbeat(castToken, 'Computer', 'desktop', np, pid);
+      void sendHeartbeat(castToken, null, 'desktop', np, pid);
       listDevices(castToken, pid)
         .then((d) => {
           if (!cancelled) setHandoffDevices(d);
@@ -962,7 +1064,6 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
         position: audioRef.current?.currentTime ?? st.currentTime ?? 0,
         playing: true,
       };
-      setHandoffMenuOpen(false);
       try {
         await postHandoff(castToken, device.device_id, payload);
         usePlayerStore.setState({ isPlaying: false });
@@ -975,11 +1076,19 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
 
   const handleStartCast = useCallback(
     async (device: CastDevice) => {
-      if (!track || (!track.local_path && track.status !== 'downloaded') || !castToken) {
-        setCastError("Track isn't downloaded yet.");
+      if (!track || !castToken) return;
+      if (!canStream(track)) {
+        setCastError("This track can't be cast yet.");
         return;
       }
       setCastError(null);
+      // Streamed (not-downloaded) track → warm its /live temp file BEFORE
+      // handing the Chromecast the URL, so the receiver gets a ready, seekable
+      // stream and never times out cold. Usually instant (we're likely already
+      // playing it); a genuinely cold track blocks a few seconds here, shown
+      // as "Preparing…". A 0-1 range is enough — the hub remuxes the whole
+      // file before serving any bytes.
+      const isLive = !track.local_path && track.status !== 'downloaded';
       try {
         // Carry the local playhead over so the receiver picks up
         // where the listener was. Read the <audio> element directly
@@ -989,6 +1098,19 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
           audioRef.current?.currentTime ??
           usePlayerStore.getState().currentTime ??
           0;
+        if (isLive) {
+          setCastPreparing(true);
+          try {
+            await fetch(
+              `http://127.0.0.1:47823/stream/${track.id}/live?t=${encodeURIComponent(castToken)}`,
+              { headers: { Range: 'bytes=0-1' }, cache: 'no-store' },
+            );
+          } catch {
+            /* cast_start also warms server-side; a failed pre-warm isn't fatal */
+          } finally {
+            setCastPreparing(false);
+          }
+        }
         const res = await castStart(device.id, track.id, castToken, localPos);
         // Remember what we LOADed so the track-change effect doesn't
         // fire a redundant castStart.
@@ -997,8 +1119,8 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
         // Chromecast starts immediately on LOAD; mirror that in the
         // store so the play/pause button shows Pause.
         usePlayerStore.setState({ isPlaying: true });
-        setCastPickerOpen(false);
       } catch (e) {
+        setCastPreparing(false);
         setCastError(e instanceof Error ? e.message : String(e));
       }
     },
@@ -1015,7 +1137,6 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
     }
     setCastActive(null);
     castedTrackIdRef.current = null;
-    setCastPickerOpen(false);
     usePlayerStore.setState({ isPlaying: false });
   }, [castToken]);
 
@@ -1087,29 +1208,54 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
     if (remoteActive && castToken)
       void postRemoteCommand(castToken, remoteActive.device_id, action);
   };
+  // The active OUTPUT of THIS session — only a Chromecast we're casting to.
+  // Another Beetbot device playing (remoteActive) is an INDEPENDENT session,
+  // not our output: it gets the awareness strip above the bar, never a
+  // takeover of the local player (both can play at once — household model).
+  const connectedName = castActive?.name ?? null;
+
+  // Publish the connect snapshot for the RightBar's Connect panel (it renders
+  // elsewhere in the tree; PlayerBar stays the single owner of the cast and
+  // handoff machinery — see src/lib/connect.ts).
+  useEffect(() => {
+    useConnectStore.setState({
+      castDevices,
+      castActive,
+      handoffDevices,
+      remotePlayingId: remoteActive?.device_id ?? null,
+      error: castError,
+      preparing: castPreparing,
+      onPickCast: handleStartCast,
+      onStopCast: handleStopCast,
+      onPickHandoff: handleHandoff,
+    });
+  }, [
+    castDevices,
+    castActive,
+    handoffDevices,
+    remoteActive,
+    castError,
+    castPreparing,
+    handleStartCast,
+    handleStopCast,
+    handleHandoff,
+  ]);
 
   return (
     <>
-      {remoteActive && remoteActive.now_playing && (
-        <div className="fixed top-16 left-1/2 -translate-x-1/2 ml-[22px] z-50 w-[28rem] max-w-[44vw]">
-          {/* Sits just below the top bar (h-14), lined up with the search
-              input: same 28rem width, shifted +22px to match the input's
-              centre (it's offset right of viewport-centre by half the Home
-              button + gap in the top bar's centred group). */}
-          <RemoteNowPlaying
-            label={remoteActive.label}
-            nowPlaying={remoteActive.now_playing}
-            onPlayPause={() =>
-              sendRemote(remoteActive.now_playing!.is_playing ? 'pause' : 'play')
-            }
-            onPrev={() => sendRemote('prev')}
-            onNext={() => sendRemote('next')}
-            onSync={() =>
-              castToken && void requestHandoff(castToken, remoteActive.device_id)
-            }
-          />
-        </div>
-      )}
+      {errorMsg ? (
+        <button
+          type="button"
+          onClick={() => setErrorMsg(null)}
+          className={cn(
+            CALLOUT_ERROR,
+            'fixed bottom-[88px] left-1/2 z-50 -translate-x-1/2 max-w-[90vw] rounded-lg px-3 py-2 text-xs shadow-lg',
+          )}
+          title="Dismiss"
+        >
+          {errorMsg}
+        </button>
+      ) : null}
       {/* Two ping-pong audio elements. Only the active one (=== audioRef.current)
           drives the store; the other is idle, or the crossfade incoming. src is
           managed imperatively (see the effect above), never via a `src=` prop,
@@ -1132,7 +1278,9 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
           onPlaying={(e) => {
             if (e.currentTarget === audioRef.current) {
               setBuffering(false);
-              errorSkipRef.current = 0;
+              retryRef.current.count = 0;
+              goneRef.current = 0;
+              setErrorMsg(null);
             }
           }}
           onCanPlay={(e) => {
@@ -1147,16 +1295,83 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
             // While casting the receiver owns playback; a local-element error
             // is meaningless.
             if (castActive) return;
-            // A failed load (bad file, or a /live resolve the engine can't
-            // match) used to die HERE silently — no message, bar stuck paused,
-            // which reads as "clicking the song does nothing". Skip to the
-            // next track instead (mirrors the phone player's handler), capped
-            // by the consecutive-failure counter above.
             setBuffering(false);
-            errorSkipRef.current += 1;
-            if (errorSkipRef.current <= 3) {
-              usePlayerStore.getState().next();
+            const failedSrc = e.currentTarget.currentSrc;
+            const isStreamError =
+              err.code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED ||
+              err.code === MediaError.MEDIA_ERR_NETWORK;
+            // Streamed (/live) failure: probe the URL. 404 ⇒ the track's gone,
+            // skip it (capped by queue length). Anything else ⇒ transient (the
+            // engine is re-minting a session, a stale URL after sleep) — retry
+            // the SAME track a few times with backoff instead of skipping a song
+            // that would have played, then surface a banner if it truly won't.
+            if (failedSrc && isStreamError) {
+              const STREAM_RETRY_MAX = 4;
+              const r = retryRef.current;
+              const scheduleRetry = () => {
+                if (r.count >= STREAM_RETRY_MAX) {
+                  setErrorMsg(
+                    "Couldn't play this track — press play to try again.",
+                  );
+                  usePlayerStore.getState().pause();
+                  return;
+                }
+                r.count += 1;
+                setBuffering(true);
+                window.clearTimeout(r.timer);
+                r.timer = window.setTimeout(() => {
+                  setErrorMsg(null);
+                  const el = audioRef.current;
+                  if (el) {
+                    el.load(); // re-fetch the SAME src (resume from metadata)
+                    el.play().catch(() => {});
+                  }
+                  usePlayerStore.setState({ isPlaying: true });
+                }, Math.min(700 * r.count, 4000));
+              };
+              void fetch(failedSrc, {
+                method: 'GET',
+                cache: 'no-store',
+                headers: { Range: 'bytes=0-0' },
+              })
+                .then((res) => {
+                  if (res.status === 404) {
+                    const store = usePlayerStore.getState();
+                    const cap = Math.max(store.queue.length, 1);
+                    goneRef.current += 1;
+                    r.count = 0;
+                    if (goneRef.current > cap) {
+                      // Whole queue skipped, nothing played — stop and show a
+                      // persistent banner so the silence is explained.
+                      goneRef.current = 0;
+                      setErrorMsg('Song source not available');
+                      store.pause();
+                      return;
+                    }
+                    // A single dead row: skip on silently. Desktop is the library
+                    // host, so an unavailable track is rare here — not worth a
+                    // per-skip banner. Only the all-dead case above surfaces one.
+                    setErrorMsg(null);
+                    store.next();
+                  } else {
+                    scheduleRetry();
+                  }
+                })
+                .catch(() => scheduleRetry());
+              return;
             }
+            // Non-stream error (a corrupt/undecodable local file): skip past it,
+            // capped by queue length so a run of bad rows can't loop forever.
+            const store = usePlayerStore.getState();
+            const cap = Math.max(store.queue.length, 1);
+            goneRef.current += 1;
+            if (goneRef.current > cap) {
+              goneRef.current = 0;
+              setErrorMsg("Couldn't play this track.");
+              store.pause();
+              return;
+            }
+            store.next();
           }}
           onTimeUpdate={(e) => {
             if (e.currentTarget !== audioRef.current) return;
@@ -1210,13 +1425,71 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
           }}
         />
       ))}
+      {/* Slim remote-awareness strip — IN FLOW just above the player bar, so
+          it never covers Home and never replaces the local player. The two
+          players stay independent (the household model: this computer and a
+          phone can both play at once) — this is awareness + control of the
+          OTHER device, with a one-tap "Play here" to pull its queue over. */}
+      {remoteActive?.now_playing && (
+        <div className="relative z-30 shrink-0 mx-2 mb-1 flex items-center gap-3 rounded-xl border border-white/10 bg-neutral-950/45 backdrop-blur-2xl px-3 py-1.5">
+          <div className="h-8 w-8 shrink-0 rounded overflow-hidden bg-neutral-800 grid place-items-center">
+            {remoteActive.now_playing.album_art_url ? (
+              <img src={remoteActive.now_playing.album_art_url} alt="" className="h-full w-full object-cover" />
+            ) : (
+              <span className="text-neutral-600 text-xs">♪</span>
+            )}
+          </div>
+          <div className="min-w-0 flex-1 flex items-baseline gap-2">
+            <span className="flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-accent shrink-0">
+              <span className="inline-block h-1.5 w-1.5 rounded-full bg-current" />
+              Playing on {remoteActive.label}
+            </span>
+            <span className="text-xs text-neutral-200 truncate">
+              {remoteActive.now_playing.title}
+              {remoteActive.now_playing.artists.length > 0 && (
+                <span className="text-neutral-500"> · {remoteActive.now_playing.artists.join(', ')}</span>
+              )}
+            </span>
+          </div>
+          <div className="flex items-center gap-2 shrink-0 text-neutral-300">
+            <button type="button" onClick={() => sendRemote('prev')} aria-label={`Previous on ${remoteActive.label}`} className="hover:text-neutral-100">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                <path d="M19 20 9 12l10-8z" /><rect x="5" y="4" width="2" height="16" rx="1" />
+              </svg>
+            </button>
+            <button
+              type="button"
+              onClick={() => sendRemote(remoteActive.now_playing!.is_playing ? 'pause' : 'play')}
+              aria-label={remoteActive.now_playing.is_playing ? `Pause on ${remoteActive.label}` : `Play on ${remoteActive.label}`}
+              className="hover:text-neutral-100"
+            >
+              {remoteActive.now_playing.is_playing ? (
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor" aria-hidden><rect x="6" y="5" width="4" height="14" rx="1" /><rect x="14" y="5" width="4" height="14" rx="1" /></svg>
+              ) : (
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor" aria-hidden><path d="M8 5v14l11-7z" /></svg>
+              )}
+            </button>
+            <button type="button" onClick={() => sendRemote('next')} aria-label={`Next on ${remoteActive.label}`} className="hover:text-neutral-100">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                <path d="M5 4l10 8-10 8z" /><rect x="17" y="4" width="2" height="16" rx="1" />
+              </svg>
+            </button>
+            <button
+              type="button"
+              onClick={() =>
+                castToken && void requestHandoff(castToken, remoteActive.device_id)
+              }
+              className="ml-1 text-xs text-neutral-300 hover:text-neutral-100 rounded-lg px-2 py-1 hover:bg-neutral-900 transition"
+              title="Bring that queue to this computer and continue here"
+            >
+              Play here
+            </button>
+          </div>
+        </div>
+      )}
       {!isEmpty && (
         <footer
-          className={`relative z-30 h-20 shrink-0 bg-neutral-950/45 backdrop-blur-2xl backdrop-saturate-150 px-4 grid grid-cols-[1fr_2fr_1fr] gap-4 items-center ${
-            floating
-              ? 'mx-2 mb-2 rounded-2xl border border-white/10'
-              : 'border-t border-white/5'
-          }`}
+          className="relative z-30 h-20 shrink-0 bg-neutral-950/45 backdrop-blur-2xl backdrop-saturate-150 px-4 grid grid-cols-[1fr_2fr_1fr] gap-4 items-center mx-2 mb-2 rounded-2xl border border-white/10"
         >
           {/* Left: now-playing */}
           <div className="flex items-center gap-3 min-w-0">
@@ -1311,9 +1584,9 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
               />
               <button
                 type="button"
-                onClick={openAddToPlaylist}
-                aria-label="Add to playlist"
-                title="Add to playlist"
+                onClick={openTrackMenu}
+                aria-label="More"
+                title="More"
                 className="h-8 w-8 grid place-items-center rounded-full text-neutral-400 hover:text-neutral-100 hover:bg-white/10"
               >
                 <svg width={18} height={18} viewBox="0 0 24 24" fill="currentColor" aria-hidden>
@@ -1331,13 +1604,25 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
               <button
                 type="button"
                 onClick={toggleShuffle}
-                className={
+                // Active = accent icon PLUS a tinted chip, so on/off reads at a
+                // glance even when the artwork accent is near-white (icon-color
+                // alone was ambiguous). Matches the phone's queue-pill recipe.
+                className={`h-8 w-8 grid place-items-center rounded-full transition ${
                   shuffle
                     ? 'text-accent'
-                    : 'text-neutral-400 hover:text-neutral-100'
+                    : 'text-neutral-400 hover:text-neutral-100 hover:bg-white/5'
+                }`}
+                style={
+                  shuffle
+                    ? {
+                        backgroundColor:
+                          'color-mix(in srgb, var(--color-accent) 20%, transparent)',
+                      }
+                    : undefined
                 }
-                title="Shuffle"
+                title="Shuffle (S)"
                 aria-label="Shuffle"
+                aria-pressed={shuffle}
               >
                 <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
                   <path d="M16 3h5v5" />
@@ -1351,6 +1636,7 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
                 type="button"
                 onClick={prev}
                 className="text-neutral-300 hover:text-neutral-100"
+                title="Previous (⇧←)"
                 aria-label="Previous"
               >
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
@@ -1362,6 +1648,7 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
                 type="button"
                 onClick={handlePlayPause}
                 className="grid place-items-center h-9 w-9 rounded-full bg-neutral-100 text-neutral-950 hover:bg-white hover:scale-105 transition"
+                title={isPlaying ? 'Pause (Space)' : 'Play (Space)'}
                 aria-label={isPlaying ? 'Pause' : 'Play'}
               >
                 {isPlaying ? (
@@ -1379,6 +1666,7 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
                 type="button"
                 onClick={next}
                 className="text-neutral-300 hover:text-neutral-100"
+                title="Next (⇧→)"
                 aria-label="Next"
               >
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
@@ -1389,13 +1677,22 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
               <button
                 type="button"
                 onClick={toggleRepeat}
-                className={`relative ${
+                className={`relative h-8 w-8 grid place-items-center rounded-full transition ${
                   repeat !== 'off'
                     ? 'text-accent'
-                    : 'text-neutral-400 hover:text-neutral-100'
+                    : 'text-neutral-400 hover:text-neutral-100 hover:bg-white/5'
                 }`}
-                title={`Repeat: ${repeat}`}
+                style={
+                  repeat !== 'off'
+                    ? {
+                        backgroundColor:
+                          'color-mix(in srgb, var(--color-accent) 20%, transparent)',
+                      }
+                    : undefined
+                }
+                title={`Repeat: ${repeat} (R)`}
                 aria-label="Repeat"
+                aria-pressed={repeat !== 'off'}
               >
                 <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
                   <path d="m17 2 4 4-4 4" />
@@ -1421,6 +1718,7 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
                 step={0.5}
                 value={Math.min(currentTime, seekMax)}
                 onChange={(e) => handleSeek(parseFloat(e.target.value))}
+                title="Seek (← / →)"
                 aria-label="Seek"
                 className="flex-1 h-1 appearance-none rounded-full cursor-pointer [--sf:rgba(255,255,255,0.8)] [--st:rgba(255,255,255,0.18)] [--sth:transparent] hover:[--sf:rgba(255,255,255,0.98)] hover:[--st:rgba(255,255,255,0.28)] hover:[--sth:#ffffff] [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-[var(--sth)] [&::-webkit-slider-thumb]:transition-colors [&::-moz-range-thumb]:appearance-none [&::-moz-range-thumb]:h-3 [&::-moz-range-thumb]:w-3 [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:border-0 [&::-moz-range-thumb]:bg-[var(--sth)]"
                 style={{
@@ -1446,12 +1744,6 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
               exists — tap to stop. Inline monochrome SVGs match
               the rest of the bar's grayscale chrome. */}
           <div className="flex items-center justify-end gap-2 text-neutral-500">
-            <SleepTimerButton
-              sleepTimerEndsAt={sleepTimerEndsAt}
-              sleepAtTrackEnd={sleepAtTrackEnd}
-              onPick={setSleepTimer}
-              placement="top"
-            />
             <button
               type="button"
               onClick={() => toggleRightBar('lyrics')}
@@ -1463,11 +1755,7 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
                   : 'text-neutral-500 hover:text-neutral-200 hover:bg-neutral-900'
               }`}
             >
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-                <path d="M4 7h16" />
-                <path d="M4 12h10" />
-                <path d="M4 17h13" />
-              </svg>
+              <LyricsIcon />
             </button>
             <button
               type="button"
@@ -1480,121 +1768,69 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
                   : 'text-neutral-500 hover:text-neutral-200 hover:bg-neutral-900'
               }`}
             >
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-                <path d="M3 6h11" />
-                <path d="M3 12h11" />
-                <path d="M3 18h7" />
-                <circle cx="18" cy="16" r="3" />
-                <path d="M21 16V7l-3 1" />
-              </svg>
+              <QueueIcon />
             </button>
-            {/* Hand the queue to another device ("Play on Phone"). Shown only
-                when another device is online. One target → one-tap; several → a
-                small menu. */}
-            {handoffDevices.length > 0 && (
-              <div className="relative">
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (handoffDevices.length === 1)
-                      void handleHandoff(handoffDevices[0]);
-                    else setHandoffMenuOpen((v) => !v);
-                  }}
-                  aria-label="Play on another device"
-                  title={
-                    handoffDevices.length === 1
-                      ? `Play on ${handoffDevices[0].label}`
-                      : 'Play on another device'
-                  }
-                  className="h-8 w-8 grid place-items-center rounded-lg text-neutral-500 hover:text-neutral-200 hover:bg-neutral-900 transition"
-                >
-                  {/* Transfer / swap-arrows glyph — "move playback elsewhere". */}
-                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-                    <path d="M7 16V4m0 0L3 8m4-4 4 4" />
-                    <path d="M17 8v12m0 0 4-4m-4 4-4-4" />
-                  </svg>
-                </button>
-                {handoffMenuOpen && handoffDevices.length > 1 && (
-                  <div className="absolute bottom-full right-0 mb-2 w-44 rounded-lg border border-neutral-800 bg-neutral-900 shadow-xl overflow-hidden z-50">
-                    <div className="px-3 py-1.5 text-[10px] uppercase tracking-wide text-neutral-500">
-                      Play on
-                    </div>
-                    {handoffDevices.map((d) => (
-                      <button
-                        key={d.device_id}
-                        type="button"
-                        onClick={() => void handleHandoff(d)}
-                        className="w-full text-left px-3 py-2 text-sm text-neutral-200 hover:bg-neutral-800"
-                      >
-                        {d.label}
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )}
-            {castActive && (
-              <button
-                type="button"
-                onClick={handleStopCast}
-                className="text-xs text-neutral-200 hover:text-neutral-200 truncate max-w-[12rem]"
-                title={`Stop casting to ${castActive.name}`}
-              >
-                <span className="text-neutral-100">●</span>{' '}
-                {castActive.name}
-              </button>
-            )}
+            {/* One persistent "Connect" button — always present, so the toolbar
+                never shifts. Toggles the RightBar's Connect tab (This computer /
+                Chromecasts / other Beetbot devices), matching how Lyrics and
+                Up next open; accent + device name while casting. */}
             <button
               type="button"
-              // Casting needs a file on the hub. Every queued track has one
-              // (local or 'downloaded'); this just guards an empty slot. Stays
-              // enabled while a cast is active so you can still manage it.
-              disabled={
-                !castActive && !track?.local_path && track?.status !== 'downloaded'
-              }
-              onClick={() => setCastPickerOpen(true)}
+              onClick={() => toggleRightBar('connect')}
               aria-label={
-                castActive
-                  ? `Casting to ${castActive.name}`
-                  : 'Cast to device'
+                connectedName ? `Connected to ${connectedName}` : 'Connect to a device'
               }
               title={
-                castActive
-                  ? `Playing on ${castActive.name}`
-                  : 'Cast to a Chromecast on your network'
+                connectedName ? `Playing on ${connectedName}` : 'Connect to a device'
               }
-              className={`h-8 w-8 grid place-items-center rounded-lg transition disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-neutral-500 ${
-                castActive
-                  ? 'text-neutral-100 bg-white/10'
-                  : 'text-neutral-500 hover:text-neutral-200 hover:bg-neutral-900'
+              // Icon-only (Spotify-style): the accent tint says "connected";
+              // the device NAME lives in the tooltip + Connect panel. An inline
+              // name chip overflowed into the volume slider at narrow widths.
+              className={`h-8 w-8 grid place-items-center rounded-lg transition ${
+                connectedName
+                  ? 'text-accent bg-white/10'
+                  : rightBar === 'connect'
+                    ? 'text-neutral-100 bg-white/10'
+                    : 'text-neutral-500 hover:text-neutral-200 hover:bg-neutral-900'
               }`}
             >
-              {/* Material Design "cast" icon — filled. */}
+              <ConnectIcon />
+            </button>
+            {/* Speaker doubles as a mute toggle (same action as the M hotkey):
+                click to drop to 0 and show the muted glyph, click again to
+                restore the pre-mute level. Muted == volume 0. */}
+            <button
+              type="button"
+              onClick={toggleMute}
+              aria-label={volume === 0 ? 'Unmute' : 'Mute'}
+              title={volume === 0 ? 'Unmute (M)' : 'Mute (M)'}
+              className="h-8 w-8 grid place-items-center rounded-lg text-neutral-500 hover:text-neutral-200 hover:bg-neutral-900 transition"
+            >
               <svg
                 width="18"
                 height="18"
                 viewBox="0 0 24 24"
-                fill="currentColor"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+                strokeLinejoin="round"
                 aria-hidden
               >
-                <path d="M1 18v3h3c0-1.66-1.34-3-3-3zm0-4v2c2.76 0 5 2.24 5 5h2c0-3.87-3.13-7-7-7zm0-4v2c4.97 0 9 4.03 9 9h2C12 14.37 7.07 10 1 10zm20-7H3c-1.1 0-2 .9-2 2v3h2V5h18v14h-7v2h7c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2z" />
+                <path d="M11 5 6 9H3v6h3l5 4V5Z" fill="currentColor" />
+                {volume === 0 ? (
+                  <>
+                    <path d="m16 9 5 6" />
+                    <path d="m21 9-5 6" />
+                  </>
+                ) : (
+                  <>
+                    <path d="M15.5 8.5a5 5 0 0 1 0 7" />
+                    <path d="M18.5 5.5a9 9 0 0 1 0 13" />
+                  </>
+                )}
               </svg>
             </button>
-            <svg
-              width="16"
-              height="16"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.8"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              aria-hidden
-            >
-              <path d="M11 5 6 9H3v6h3l5 4V5Z" fill="currentColor" />
-              <path d="M15.5 8.5a5 5 0 0 1 0 7" />
-              <path d="M18.5 5.5a9 9 0 0 1 0 13" />
-            </svg>
             <input
               type="range"
               min={0}
@@ -1602,6 +1838,7 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
               step={0.01}
               value={volume}
               onChange={(e) => setVolume(parseFloat(e.target.value))}
+              title="Volume (↑ / ↓) · M to mute"
               aria-label="Volume"
               className="w-28 h-1.5 appearance-none rounded-full cursor-pointer [--vf:rgba(255,255,255,0.45)] [--vt:rgba(255,255,255,0.13)] [--vth:transparent] hover:[--vf:rgba(255,255,255,0.95)] hover:[--vt:rgba(255,255,255,0.28)] hover:[--vth:#ffffff] [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-[var(--vth)] [&::-webkit-slider-thumb]:transition-colors [&::-moz-range-thumb]:appearance-none [&::-moz-range-thumb]:h-3 [&::-moz-range-thumb]:w-3 [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:border-0 [&::-moz-range-thumb]:bg-[var(--vth)]"
               style={{
@@ -1619,18 +1856,11 @@ export function PlayerBar({ floating = false }: { floating?: boolean }) {
           onClose={closeAddToPlaylist}
         />
       )}
-      {castPickerOpen && (
-        <CastPicker
-          devices={castDevices}
-          activeId={castActive?.id ?? null}
-          error={castError}
-          onPick={handleStartCast}
-          onStop={handleStopCast}
-          onClose={() => {
-            setCastPickerOpen(false);
-            setCastError(null);
-          }}
-        />
+      {trackMenu && (
+        <ContextMenu state={trackMenu} onClose={() => setTrackMenu(null)} />
+      )}
+      {sleepMenu && (
+        <ContextMenu state={sleepMenu} onClose={() => setSleepMenu(null)} />
       )}
     </>
   );

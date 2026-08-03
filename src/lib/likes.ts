@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { ensureSession, getLikedTrackIds, setTrackLiked } from '@shared/api';
+import { notifyLibraryChanged } from '@shared/libraryChanged';
 
 /**
  * Shared "Favorites" (liked) state for the desktop. Both the mini player bar and
@@ -40,6 +41,11 @@ export const useLikesStore = create<LikesState>((set, get) => ({
     try {
       const token = await ensureSession();
       await setTrackLiked(token, trackId, next, profileId);
+      // The FIRST like creates the Favorites (Liked Songs) playlist server-side,
+      // and later toggles change its track count. The sidebar only refetches its
+      // playlist list on this event, so without it a brand-new account's star
+      // fills but "Favorites" doesn't appear in the sidebar until a navigation.
+      notifyLibraryChanged();
     } catch {
       // Reconcile with the server's truth rather than reverting to the captured
       // `next` — robust against interleaved taps that would leave a stale value.

@@ -1,7 +1,7 @@
 [package]
 name = "beetbot"
 version = "0.2.0"
-description = "Local-first Spotify playlist mirror"
+description = "Local-first music player and personal media server"
 authors = ["Beetbot"]
 edition = "2021"
 rust-version = "1.77"

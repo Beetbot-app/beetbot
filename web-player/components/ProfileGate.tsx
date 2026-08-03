@@ -61,16 +61,32 @@ export function ProfileGate({
 
   useEffect(() => {
     getProfiles(token)
-      .then(setProfiles)
+      .then((list) => {
+        // One unlocked account and nothing to choose between: don't ask.
+        //
+        // This is what somebody sees after accepting an invitation — the server
+        // shows them their own account and no sign of anybody else's, so
+        // "Who's listening?" over a single tile is a question with one answer.
+        // They followed a link to a music library; put them in it.
+        if (list.length === 1 && !list[0].has_pin) {
+          void bindSessionProfile(token, list[0].id);
+          onSelect(list[0].id);
+          return;
+        }
+        setProfiles(list);
+      })
       .catch(() => setProfiles([]));
-  }, [token]);
+  }, [token, onSelect]);
 
   const pick = (p: Profile) => {
     if (p.has_pin) {
       setPinFor(p);
     } else {
       // Bind the session to this profile server-side (no PIN to send) so the
-      // server can enforce per-profile ownership; best-effort.
+      // server can enforce per-profile ownership; best-effort. It is refused for
+      // an account that belongs to somebody signed in elsewhere, which is
+      // correct and harmless: their scope comes from their identity on every
+      // request, not from this binding.
       void bindSessionProfile(token, p.id);
       onSelect(p.id);
     }

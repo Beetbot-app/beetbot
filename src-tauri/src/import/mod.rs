@@ -171,19 +171,17 @@ pub fn import_from_str(
     let tx = conn.transaction()?;
 
     let synthetic_spotify_id = format!("csv:{}", slug(playlist_name));
-    let snapshot = format!("csv-import:{}", chrono::Utc::now().timestamp());
 
     // Upsert the playlist by synthetic spotify_id.
     tx.execute(
         "INSERT INTO playlists
-             (spotify_id, name, snapshot_id, track_count, last_synced_at, profile_id)
-         VALUES (?1, ?2, ?3, 0, strftime('%s','now'),
+             (spotify_id, name, track_count, last_synced_at, profile_id)
+         VALUES (?1, ?2, 0, strftime('%s','now'),
                  (SELECT COALESCE(MIN(id), 1) FROM profiles))
          ON CONFLICT(spotify_id) DO UPDATE SET
              name = excluded.name,
-             snapshot_id = excluded.snapshot_id,
              last_synced_at = excluded.last_synced_at",
-        params![synthetic_spotify_id, playlist_name, snapshot],
+        params![synthetic_spotify_id, playlist_name],
     )?;
     let playlist_id: i64 = tx.query_row(
         "SELECT id FROM playlists WHERE spotify_id = ?1",
@@ -213,31 +211,59 @@ pub fn import_from_str(
 
         let artists_json = serde_json::to_string(&row.artists)?;
 
-        let inserted = tx.execute(
-            "INSERT INTO tracks (spotify_id, title, artists, album, album_art_url, duration_ms, isrc)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(spotify_id) DO NOTHING",
-            params![
-                row.spotify_id,
-                row.title,
-                artists_json,
-                row.album,
-                row.album_art_url,
-                row.duration_ms,
-                row.isrc,
-            ],
-        )?;
-        if inserted == 1 {
-            tracks_added += 1;
-        } else {
-            tracks_existing += 1;
-        }
+        // ISRC first, `spotify_id` second — the same rule `upsert_track` uses.
+        // An ISRC identifies a RECORDING; `spotify_id` only identifies one
+        // catalog's row for it (and for catalog rows it's the synthetic
+        // "deezer:123"). Keying the insert on `spotify_id` alone meant the same
+        // song imported from a CSV and later resolved from Deezer became TWO
+        // library rows — which then split its play history and showed up twice
+        // on Home. Reuse the existing row instead.
+        let existing: Option<i64> = row
+            .isrc
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .and_then(|isrc| {
+                tx.query_row(
+                    "SELECT id FROM tracks WHERE isrc = ?1",
+                    params![isrc],
+                    |r| r.get::<_, i64>(0),
+                )
+                .ok()
+            });
 
-        let track_id: i64 = tx.query_row(
-            "SELECT id FROM tracks WHERE spotify_id = ?1",
-            params![row.spotify_id],
-            |r| r.get(0),
-        )?;
+        let track_id: i64 = match existing {
+            Some(tid) => {
+                tracks_existing += 1;
+                tid
+            }
+            None => {
+                let inserted = tx.execute(
+                    "INSERT INTO tracks (spotify_id, title, artists, album, album_art_url, duration_ms, isrc)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     ON CONFLICT(spotify_id) DO NOTHING",
+                    params![
+                        row.spotify_id,
+                        row.title,
+                        artists_json,
+                        row.album,
+                        row.album_art_url,
+                        row.duration_ms,
+                        row.isrc,
+                    ],
+                )?;
+                if inserted == 1 {
+                    tracks_added += 1;
+                } else {
+                    tracks_existing += 1;
+                }
+                tx.query_row(
+                    "SELECT id FROM tracks WHERE spotify_id = ?1",
+                    params![row.spotify_id],
+                    |r| r.get(0),
+                )?
+            }
+        };
 
         tx.execute(
             "INSERT INTO playlist_tracks (playlist_id, track_id, position, added_at)
@@ -281,19 +307,17 @@ pub fn insert_apple_music_playlist(
         playlist.title.trim().to_string()
     };
     let synthetic_spotify_id = format!("apple:{}", slug(source_url));
-    let snapshot = format!("apple-import:{}", chrono::Utc::now().timestamp());
 
     let tx = conn.transaction()?;
 
     tx.execute(
         "INSERT INTO playlists
-             (spotify_id, name, snapshot_id, track_count, last_synced_at, profile_id)
-         VALUES (?1, ?2, ?3, 0, strftime('%s','now'), ?4)
+             (spotify_id, name, track_count, last_synced_at, profile_id)
+         VALUES (?1, ?2, 0, strftime('%s','now'), ?3)
          ON CONFLICT(spotify_id) DO UPDATE SET
              name = excluded.name,
-             snapshot_id = excluded.snapshot_id,
              last_synced_at = excluded.last_synced_at",
-        params![synthetic_spotify_id, name, snapshot, profile_id],
+        params![synthetic_spotify_id, name, profile_id],
     )?;
     let playlist_id: i64 = tx.query_row(
         "SELECT id FROM playlists WHERE spotify_id = ?1",
@@ -413,19 +437,17 @@ pub fn insert_soundcloud_playlist(
         playlist.title.trim().to_string()
     };
     let synthetic_spotify_id = format!("soundcloud:{}", slug(source_url));
-    let snapshot = format!("soundcloud-import:{}", chrono::Utc::now().timestamp());
 
     let tx = conn.transaction()?;
 
     tx.execute(
         "INSERT INTO playlists
-             (spotify_id, name, snapshot_id, track_count, last_synced_at, profile_id)
-         VALUES (?1, ?2, ?3, 0, strftime('%s','now'), ?4)
+             (spotify_id, name, track_count, last_synced_at, profile_id)
+         VALUES (?1, ?2, 0, strftime('%s','now'), ?3)
          ON CONFLICT(spotify_id) DO UPDATE SET
              name = excluded.name,
-             snapshot_id = excluded.snapshot_id,
              last_synced_at = excluded.last_synced_at",
-        params![synthetic_spotify_id, name, snapshot, profile_id],
+        params![synthetic_spotify_id, name, profile_id],
     )?;
     let playlist_id: i64 = tx.query_row(
         "SELECT id FROM playlists WHERE spotify_id = ?1",
@@ -756,6 +778,58 @@ spotify:track:6habFhsOp2NvshLv26DqMb,Despacito,spotify:artist:4V8Sr092TqfHkfAA5f
             )
             .unwrap();
         assert_eq!(artists, r#"["Luis Fonsi","Daddy Yankee"]"#);
+    }
+
+    /// A CSV row must reuse an existing track that shares its ISRC, even when
+    /// the `spotify_id` differs — the exact case that used to fork one
+    /// recording into two library rows (a Spotify-imported copy plus a
+    /// Deezer-resolved copy), splitting its play history and showing the song
+    /// twice on Home.
+    #[test]
+    fn csv_import_dedupes_against_an_existing_isrc_under_a_different_id() {
+        let (mut conn, _tmp) = fresh_db();
+        // Pre-seed the row a catalog resolve would have created: same ISRC as
+        // the first CSV row, different (synthetic) id.
+        conn.execute(
+            "INSERT INTO tracks (spotify_id, title, artists, album, duration_ms, isrc)
+             VALUES ('deezer:999', 'The Less I Know The Better', '[\"Tame Impala\"]',
+                     'Currents', 216320, 'AUUM71500379')",
+            [],
+        )
+        .unwrap();
+
+        let summary = import_from_str(&mut conn, SAMPLE_CSV, "My Mix").unwrap();
+        // Only Despacito is genuinely new; the Tame Impala row is reused.
+        assert_eq!(summary.tracks_added, 1);
+        assert_eq!(summary.tracks_existing, 1);
+
+        // Exactly one row for that ISRC — no fork.
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tracks WHERE isrc = 'AUUM71500379'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "ISRC must not fork into two library rows");
+
+        // And the playlist points at the pre-existing row, not a new one.
+        let linked: i64 = conn
+            .query_row(
+                "SELECT t.id FROM playlist_tracks pt JOIN tracks t ON t.id = pt.track_id
+                 WHERE t.isrc = 'AUUM71500379'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let seeded: i64 = conn
+            .query_row(
+                "SELECT id FROM tracks WHERE spotify_id = 'deezer:999'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(linked, seeded);
     }
 
     #[test]

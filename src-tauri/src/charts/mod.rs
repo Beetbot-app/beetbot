@@ -16,7 +16,7 @@ pub type ChartPair = (String, String);
 
 fn client() -> reqwest::Client {
     reqwest::Client::builder()
-        .user_agent("Beetbot/1.0")
+        .user_agent("Beetbot/0.2")
         .timeout(std::time::Duration::from_secs(12))
         .build()
         .expect("reqwest client builds")
@@ -217,18 +217,22 @@ fn billboard_client() -> reqwest::Client {
 }
 
 /// Map a Deezer genre name to a Billboard chart slug (the `/charts/{slug}/`
-/// path). `None` for genres Billboard doesn't chart well (Pop, K-Pop, Jazz,
-/// Classical, …) — the caller then falls back to the iTunes genre feed.
+/// path). `None` for genres Billboard doesn't chart as *songs* (K-Pop, Jazz,
+/// Classical, Reggae, Folk, world music, …) — the caller then falls back to the
+/// iTunes genre feed / Last.fm tag.
 pub fn deezer_genre_to_billboard_chart(name: &str) -> Option<&'static str> {
     Some(match name.trim().to_ascii_lowercase().as_str() {
-        "rap/hip hop" => "rap-song",                  // Hot Rap Songs
-        "r&b" | "soul & funk" => "r-b-hip-hop-songs", // Hot R&B/Hip-Hop Songs
-        "country" => "country-songs",                 // Hot Country Songs
-        "rock" => "rock-songs",                       // Hot Rock & Alternative Songs
-        "alternative" => "hot-alternative-songs",     // Hot Alternative Songs
-        "latin music" | "reggaeton" => "latin-songs", // Hot Latin Songs
+        "pop" => "pop-songs",                            // Pop Airplay
+        "rap/hip hop" => "rap-song",                     // Hot Rap Songs
+        "r&b" | "soul & funk" => "r-b-hip-hop-songs",    // Hot R&B/Hip-Hop Songs
+        "country" => "country-songs",                    // Hot Country Songs
+        "rock" => "rock-songs",                          // Hot Rock & Alternative Songs
+        "alternative" => "hot-alternative-songs",        // Hot Alternative Songs
+        "metal" => "hot-hard-rock-songs",                // Hot Hard Rock Songs
+        "reggaeton" => "latin-rhythm-airplay",           // Latin Rhythm Airplay
+        "latin music" => "latin-songs",                  // Hot Latin Songs
         "dance" | "electro" => "dance-electronic-songs", // Hot Dance/Electronic
-        "christian" => "christian-songs",             // Hot Christian Songs
+        "christian" => "christian-songs",                // Hot Christian Songs
         _ => return None,
     })
 }

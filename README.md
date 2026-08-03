@@ -17,8 +17,9 @@ No subscriptions. No third-party streaming. Just the music you actually own — 
 beautifully, playing instantly on your Mac, and streaming to any phone, tablet, or TV on
 your Wi‑Fi. Cast it to AirPlay or Chromecast. Reach it from the road when you want to.
 
-> **Bring your own audio.** Beetbot never downloads or streams from a third‑party service.
-> Every track plays from a file you added yourself.
+> **Bring your own audio.** Full tracks always play from a file you added yourself — Beetbot
+> never streams them from a third‑party service. (Optional 30‑second preview clips are the
+> only audio that comes from outside.)
 
 ## Download
 
@@ -58,10 +59,10 @@ xattr -dr com.apple.quarantine /Applications/Beetbot.app
   `aac`, and more); Beetbot cleans it up, tags it, and dresses it in cover art.
 - **Bring your own audio** — a track with no file? Hit **Add audio file**, point it at the
   one you own, and play.
-- **Playlists, your way** — build them locally, or import track lists from Spotify, an
-  [Exportify](https://exportify.net) CSV, or an Apple Music link, then attach your files.
-- **Smart metadata** — album art, genres, and release info filled in automatically
-  (optional Spotify / Last.fm for even more).
+- **Playlists, your way** — build them locally, or import track lists from Spotify (via
+  [Exportify](https://exportify.net)), Apple Music, or SoundCloud, then attach your files.
+- **Smart metadata** — album art, genres, and release info filled in automatically, no
+  account needed.
 - **Play it anywhere at home** — a built‑in web player streams your library to any phone or
   tablet on your Wi‑Fi; pairing codes keep it yours.
 - **Cast it** — send playback to Chromecast and AirPlay.
@@ -75,7 +76,6 @@ xattr -dr com.apple.quarantine /Applications/Beetbot.app
 
 Everything below stays **off until you add your own credentials**, which never leave your Mac:
 
-- **Spotify** — import and sync playlist metadata.
 - **Last.fm** — power browse charts and tag‑based radio.
 
 ## Build it yourself

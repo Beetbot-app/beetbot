@@ -20,6 +20,9 @@
 //! peer that passes the IP guard can request a token. Pairing toggle in
 //! settings is wired so it's available for that follow-up.
 
+mod identity;
+mod sharing_routes;
+
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -155,16 +158,35 @@ fn build_router(state: AppState, web_dir: Option<PathBuf>) -> Router {
             axum::routing::post(bind_session_profile),
         )
         .route("/api/profiles", get(list_profiles_handler))
+        .route(
+            "/api/profiles/{id}",
+            axum::routing::delete(delete_profile_handler),
+        )
         .route("/api/profiles/{id}/avatar", get(profile_avatar_handler))
         .route(
             "/api/profiles/{id}/verify",
             axum::routing::post(verify_profile_pin_handler),
         )
         .route("/api/pair", get(pair_status).post(pair_submit))
+        // Sharing this server with other people. Owner-only, where "owner" has to
+        // mean more than loopback — see sharing_routes.rs.
+        .route("/api/sharing/status", get(sharing_routes::sharing_status))
+        .route("/api/sharing/people", get(sharing_routes::sharing_people))
+        .route(
+            "/api/sharing/invite",
+            axum::routing::post(sharing_routes::sharing_invite),
+        )
+        .route(
+            "/api/sharing/revoke",
+            axum::routing::post(sharing_routes::sharing_revoke),
+        )
         .route(
             "/api/playlists",
             get(list_playlists).post(create_playlist),
         )
+        // Flat "all my songs" list for the phone's Library › Songs tab (the
+        // desktop reads the same set via Tauri IPC).
+        .route("/api/library/songs", get(get_library_songs))
         .route(
             "/api/playlists/import",
             axum::routing::post(import_playlist),
@@ -210,6 +232,7 @@ fn build_router(state: AppState, web_dir: Option<PathBuf>) -> Router {
         .route("/api/browse", get(browse))
         .route("/api/home", get(home_handler))
         .route("/api/genres", get(list_genres))
+        .route("/api/genres/{id}/artists", get(genre_artists))
         .route("/api/catalog/playlists/{id}", get(get_catalog_playlist))
         .route("/api/albums/{id}/tracks", get(get_album_tracks))
         .route(
@@ -221,6 +244,7 @@ fn build_router(state: AppState, web_dir: Option<PathBuf>) -> Router {
         .route("/api/artists/{id}/related", get(get_artist_related))
         .route("/api/radio/similar", get(get_radio_similar))
         .route("/api/artists/bio", get(artist_bio))
+        .route("/api/artists/appears-on", get(artist_appears_on))
         .route("/api/lyrics", get(get_lyrics))
         .route("/api/cast/devices", get(list_cast_devices))
         .route("/api/cast/status", get(cast_status))
@@ -289,12 +313,12 @@ fn build_router(state: AppState, web_dir: Option<PathBuf>) -> Router {
         .with_state(state)
 }
 
-/// Plain-text build identifier. Bump `BUILD_TAG` each release so opening
-/// `/version` in any browser instantly reveals whether that origin is
-/// serving the current build (vs. a cached shell or a different machine
-/// behind a port-forward). No-cache so it's never served stale.
+/// Plain-text build identifier. Derived at compile time from the crate
+/// version so opening `/version` in any browser instantly reveals whether that
+/// origin is serving the current build (vs. a cached shell or a different
+/// machine behind a port-forward). No-cache so it's never served stale.
 async fn version_probe() -> Response {
-    const BUILD_TAG: &str = "build-2026-05-31-newhero-shellv33";
+    const BUILD_TAG: &str = concat!("beetbot v", env!("CARGO_PKG_VERSION"));
     (
         [
             (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
@@ -712,13 +736,22 @@ async fn pair_status(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
-    let required = {
+    // Loopback is either the desktop webview OR a trusted local reverse proxy that
+    // authenticates the visitor upstream before forwarding (it connects from
+    // loopback and, unlike a tunnel, sets no `X-Forwarded-For`). `session_handler`
+    // already exempts such peers from the pairing gate, so report pairing as NOT
+    // required to them here too — otherwise a proxied, already-authenticated remote
+    // visitor is shown a code prompt for a gate that will never actually apply.
+    let is_loopback = effective_client_ip(&addr, &headers).is_loopback();
+    let required = if is_loopback {
+        false
+    } else {
         let conn = state.db.lock().expect("db mutex poisoned");
         read_bool_setting(&conn, "require_pairing_code").unwrap_or(false)
             || read_bool_setting(&conn, "remote_streaming_enabled").unwrap_or(false)
     };
     let mut secs = None;
-    if effective_client_ip(&addr, &headers).is_loopback() {
+    if is_loopback {
         let pairing = state.pairing.lock().expect("pairing mutex poisoned");
         secs = Some(pairing.seconds_until_rotation());
     }
@@ -812,22 +845,10 @@ fn issue_session_for(state: &AppState, ip: IpAddr, headers: &HeaderMap) -> Sessi
         ) {
             tracing::error!(?e, "failed to persist streaming session");
         }
-        // Loopback is the desktop app itself, which caches a single token per
-        // launch. Prune *dead* prior-launch loopback sessions so the table
-        // doesn't grow one row per launch — but ONLY stale ones. The desktop
-        // heartbeats `last_seen_at` on every request, so a running app's session
-        // stays fresh and is spared. Without the staleness guard, any second
-        // loopback `/api/session` (a second launch, or a local probe like curl)
-        // revoked the *running* app's token, 401ing its catalog fetches — which
-        // broke Discover/Browse (it has no Deezer-direct fallback) until restart.
+        // Collapse the desktop webview's per-launch session churn (see the
+        // helper's doc for why it's scoped by user_agent, not just loopback).
         if ip.is_loopback() {
-            let _ = conn.execute(
-                "DELETE FROM streaming_sessions
-                 WHERE id <> ?1
-                   AND (ip_address LIKE '127.%' OR ip_address = '::1')
-                   AND last_seen_at < strftime('%s','now') - 120",
-                params![id],
-            );
+            prune_own_stale_loopback_sessions(&conn, &id, &user_agent);
         }
     }
     SessionResponse {
@@ -838,6 +859,36 @@ fn issue_session_for(state: &AppState, ip: IpAddr, headers: &HeaderMap) -> Sessi
         // non-downloaded tracks; the open build leaves this false.
         live_stream: crate::acquisition::active_provider().auto_acquires(),
     }
+}
+
+/// How long a loopback session may sit idle before a fresh mint may prune it.
+/// The desktop webview heartbeats `last_seen_at` on every request, so a running
+/// app's session stays well inside this window and is never swept.
+const LOOPBACK_PRUNE_IDLE_SECS: i64 = 120;
+
+/// Prune the *desktop webview's own* dead prior-launch sessions when it mints a
+/// fresh one, so the table doesn't grow one row per launch. Only stale rows are
+/// touched — without the staleness guard, any second loopback `/api/session` (a
+/// second launch, or a local probe like curl) revoked the *running* app's token,
+/// 401ing its catalog fetches and breaking Discover/Browse until restart.
+///
+/// Scoped by `user_agent`, not merely by loopback, and here's why: a local
+/// reverse-proxy tunnel that authenticates the visitor upstream then forwards
+/// from loopback with no `X-Forwarded-For` (see `effective_client_ip`) also
+/// reaches us as loopback, so a paired *phone* served that way has its session
+/// stored under 127.0.0.1 too. It carries a phone UA, not the Mac webview's, so
+/// matching the minting row's UA spares it. Before this, every desktop mint
+/// deleted such a phone's token the moment it had been idle > the window,
+/// bouncing the phone to the pairing screen mid-session.
+fn prune_own_stale_loopback_sessions(conn: &Connection, keep_id: &str, user_agent: &str) {
+    let _ = conn.execute(
+        "DELETE FROM streaming_sessions
+         WHERE id <> ?1
+           AND (ip_address LIKE '127.%' OR ip_address = '::1')
+           AND user_agent = ?2
+           AND last_seen_at < strftime('%s','now') - ?3",
+        params![keep_id, user_agent, LOOPBACK_PRUNE_IDLE_SECS],
+    );
 }
 
 #[derive(Serialize)]
@@ -862,16 +913,56 @@ struct PlaylistRow {
 /// GET /api/profiles — list user profiles for the "who's using Beetbot?"
 /// picker. Session-gated like everything else (the phone has a token before
 /// it picks a profile). Never exposes PIN hashes — only a `has_pin` flag.
+/// Which profiles a caller may be shown in the "who's using Beetbot?" picker.
+///
+/// Not everybody sees the same list, and the reason is the whole point of 4.3:
+/// once somebody the owner shared with has an account here, a list of accounts
+/// is a list of other people, and handing it to the wrong caller turns a picker
+/// into a way to open somebody else's library.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProfileView {
+    /// The desktop. The owner runs this machine and sees every account on it.
+    All,
+    /// A guest signed in by a provider: their own account, and no sign that
+    /// anybody else's exists.
+    JustTheirs(i64),
+    /// A device paired over the local network: the profiles that live on this
+    /// machine. Pairing proves somebody typed a code that was on the screen, not
+    /// who they are, so remote people's accounts are not theirs to see.
+    LocalOnly,
+}
+
+fn profile_view(this_machine: bool, guest_profile: Option<i64>) -> ProfileView {
+    if this_machine {
+        return ProfileView::All;
+    }
+    match guest_profile {
+        Some(id) => ProfileView::JustTheirs(id),
+        None => ProfileView::LocalOnly,
+    }
+}
+
 async fn list_profiles_handler(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Query(q): Query<TokenQuery>,
 ) -> Response {
     if let Err(r) = require_token(&state, &headers, &q) {
         return r;
     }
+    // Resolved before the lock: it takes the lock itself.
+    let view = profile_view(
+        is_this_machine(&headers, &addr),
+        guest_profile_id(&state, &headers),
+    );
     let conn = state.db.lock().expect("db mutex poisoned");
-    match crate::profiles::list(&conn) {
+    let listed = match view {
+        ProfileView::All => crate::profiles::list(&conn),
+        ProfileView::LocalOnly => crate::profiles::list_local(&conn),
+        ProfileView::JustTheirs(id) => crate::profiles::get(&conn, id).map(|p| vec![p]),
+    };
+    match listed {
         Ok(list) => Json(list).into_response(),
         Err(e) => {
             tracing::error!(?e, "list_profiles");
@@ -1006,12 +1097,23 @@ async fn bind_session_profile(
     }
     {
         let conn = state.db.lock().expect("db mutex poisoned");
-        match crate::profiles::verify_pin(&conn, body.profile_id, &body.pin) {
+        // An account belonging to somebody signed in elsewhere is not selectable
+        // here, whatever else the caller can prove. These accounts carry no PIN —
+        // they were never meant to be picked from a list — so without this check
+        // `verify_pin` would wave through an empty PIN and hand a device on the
+        // local network a remote person's library.
+        if crate::profiles::is_identity_bound(&conn, body.profile_id).unwrap_or(true) { // scope-exempt: this endpoint IS the binding
+            state
+                .security_log
+                .append(ip, "bind_refused_identity_profile", &format!("profile={}", body.profile_id)); // scope-exempt: this endpoint IS the binding
+            return (StatusCode::FORBIDDEN, "that profile belongs to someone else").into_response();
+        }
+        match crate::profiles::verify_pin(&conn, body.profile_id, &body.pin) { // scope-exempt: this endpoint IS the binding; the PIN above is the check
             Ok(true) => {}
             Ok(false) => {
                 state
                     .security_log
-                    .append(ip, "pin_failed", &format!("profile={}", body.profile_id));
+                    .append(ip, "pin_failed", &format!("profile={}", body.profile_id)); // scope-exempt: this endpoint IS the binding; the PIN above is the check
                 return (StatusCode::FORBIDDEN, "wrong PIN").into_response();
             }
             Err(_) => return StatusCode::NOT_FOUND.into_response(),
@@ -1025,19 +1127,82 @@ async fn bind_session_profile(
             return (StatusCode::UNAUTHORIZED, "missing session token").into_response()
         }
     };
-    if state.set_session_profile(&token, body.profile_id) {
+    if state.set_session_profile(&token, body.profile_id) { // scope-exempt: this endpoint IS the binding; the PIN above is the check
         StatusCode::NO_CONTENT.into_response()
     } else {
         (StatusCode::UNAUTHORIZED, "no live session").into_response()
     }
 }
 
+/// DELETE /api/profiles/{id} — a user deletes THEIR OWN profile from a paired
+/// device. Authorization is the session binding (set via POST
+/// /api/session/profile after PIN verification): a phone may delete exactly
+/// the profile its session is bound to, never another one — while the
+/// owner (the desktop, which already manages every profile from
+/// Settings → Account) may delete any. The last remaining profile can't be
+/// deleted; the "who's listening?" gate needs an answer to exist. Sessions
+/// bound to the deleted profile unbind automatically (FK ON DELETE SET NULL),
+/// dropping those devices back to the profile picker.
+async fn delete_profile_handler(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Query(q): Query<TokenQuery>,
+) -> Response {
+    if let Err(r) = require_token(&state, &headers, &q) {
+        return r;
+    }
+    let ip = effective_client_ip(&addr, &headers);
+    // `is_this_machine`, not `ip.is_loopback()`: behind the tunnel every paired
+    // phone arrives from loopback, and "may delete any profile" is the single
+    // most destructive thing on the other side of this branch. `ip` is still the
+    // right thing to write to the audit log below — it just can't authorize.
+    if !is_this_machine(&headers, &addr) {
+        let Some(token) = extract_token(&headers, &q) else {
+            return (StatusCode::UNAUTHORIZED, "missing session token").into_response();
+        };
+        if state.session_profile(&token) != Some(id) {
+            // 404, not 403 — matching enforce_playlist_owner, so a paired
+            // device can't probe which profile ids exist.
+            return StatusCode::NOT_FOUND.into_response();
+        }
+    }
+    let avatar;
+    {
+        let mut conn = state.db.lock().expect("db mutex poisoned");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM profiles", [], |r| r.get(0))
+            .unwrap_or(0);
+        if count <= 1 {
+            return (StatusCode::CONFLICT, "the last profile can't be deleted").into_response();
+        }
+        avatar = crate::profiles::avatar_path(&conn, id).ok().flatten();
+        if let Err(e) = crate::profiles::delete(&mut conn, id) {
+            tracing::error!(?e, "delete_profile");
+            return StatusCode::NOT_FOUND.into_response();
+        }
+    }
+    // Same cleanup as the desktop's delete command: the avatar file is ours.
+    if let Some(p) = avatar {
+        let _ = std::fs::remove_file(p);
+    }
+    state
+        .security_log
+        .append(ip, "profile_deleted", &format!("profile={id}"));
+    StatusCode::NO_CONTENT.into_response()
+}
+
 /// Reject a per-profile playlist mutation when the caller doesn't own the
-/// playlist. The loopback owner (the desktop — its shared screens reach these
-/// HTTP routes over loopback) is trusted and always allowed. A paired device
+/// playlist. The owner (the desktop — its shared screens reach these HTTP
+/// routes over loopback) is trusted and always allowed. A paired device
 /// (phone) acts as the profile BOUND to its session, never a client-supplied
 /// one: it must have a bound profile AND own the playlist, else 404 (which also
 /// hides that another profile's playlist exists).
+///
+/// "Owner" is [`is_this_machine`], not loopback. Loopback alone let anything
+/// through the Meradomo tunnel take this early return and mutate — rename, or
+/// delete outright — a playlist belonging to any profile on the machine.
 fn enforce_playlist_owner(
     state: &AppState,
     headers: &HeaderMap,
@@ -1045,7 +1210,7 @@ fn enforce_playlist_owner(
     q: &TokenQuery,
     playlist_id: i64,
 ) -> Result<(), Response> {
-    if effective_client_ip(addr, headers).is_loopback() {
+    if is_this_machine(headers, addr) {
         return Ok(());
     }
     let acting = extract_token(headers, q).and_then(|t| state.session_profile(&t));
@@ -1071,9 +1236,10 @@ fn enforce_playlist_owner(
 /// The profile a per-profile READ endpoint (library list, Home feed) should be
 /// scoped to. Same trust model as `enforce_playlist_owner`:
 ///
-/// - **Loopback** is the desktop webview, which switches profiles in-app
+/// - **This machine** is the desktop webview, which switches profiles in-app
 ///   without re-pairing, so its client-supplied `profile_id` is authoritative
-///   (falling back to the default profile when absent).
+///   (falling back to the default profile when absent). The test is
+///   [`is_this_machine`], not loopback — see `scoped_profile_id`.
 /// - A **paired device** (phone) is scoped to the profile BOUND to its session
 ///   and CANNOT widen that by passing a `profile_id` — so a stale or crafted
 ///   client can never read another profile's library.
@@ -1087,25 +1253,80 @@ fn read_scope_profile(
     q: &TokenQuery,
     client_profile_id: Option<i64>,
 ) -> Option<i64> {
-    if effective_client_ip(addr, headers).is_loopback() {
+    let this_machine = is_this_machine(headers, addr);
+    // Both lookups take the db lock, and each branch needs only one of them —
+    // hence the closures.
+    let default_profile = || {
         let conn = state.db.lock().expect("db mutex poisoned");
-        return Some(
-            client_profile_id.unwrap_or_else(|| crate::profiles::default_id(&conn).unwrap_or(1)),
-        );
+        crate::profiles::default_id(&conn).unwrap_or(1)
+    };
+    let guest_profile = || guest_profile_id(state, headers);
+    let session_profile = || extract_token(headers, q).and_then(|t| state.session_profile(&t));
+    read_scope_decision(
+        this_machine,
+        client_profile_id,
+        default_profile,
+        guest_profile,
+        session_profile,
+    )
+}
+
+/// The read-scoping rule, with the plumbing lifted out — the sibling of
+/// [`scope_decision`], and pure for the same reason: `AppState` owns a
+/// `tauri::AppHandle` and can't be built in a test, so the policy has to be
+/// separable from it to ever be exercised directly.
+///
+/// It differs from `scope_decision` in one way, deliberately: for the owner an
+/// absent claim resolves to the DEFAULT profile rather than to "no profile",
+/// because these endpoints (a library list, a Home feed) have no sensible
+/// no-profile answer — where `scope_decision`'s callers (KV, bans, stats) do.
+///
+/// `this_machine` carries the same warning as `scope_decision`'s: it must come
+/// from [`is_this_machine`]. Loopback alone would make every tunnelled phone the
+/// owner, and the owner branch here resolves to a REAL profile — so an unbound
+/// phone would be handed the default profile's whole library.
+fn read_scope_decision(
+    this_machine: bool,
+    client_profile_id: Option<i64>,
+    default_profile: impl FnOnce() -> i64,
+    guest_profile: impl FnOnce() -> Option<i64>,
+    session_profile: impl FnOnce() -> Option<i64>,
+) -> Option<i64> {
+    if this_machine {
+        // The trusted owner: its claim stands, and no claim means "whoever the
+        // app opens as".
+        return Some(client_profile_id.unwrap_or_else(default_profile));
     }
-    extract_token(headers, q).and_then(|t| state.session_profile(&t))
+    // A guest a provider signed in reads their own account and nobody else's.
+    // Note what does NOT happen here: no fallback to the default profile. A guest
+    // whose account cannot be resolved reads nothing, exactly like an unbound
+    // paired device, because the alternative is handing them the owner's library.
+    if let Some(theirs) = guest_profile() {
+        return Some(theirs);
+    }
+    // A paired device is its session, full stop — the claim is never consulted.
+    // Unbound stays None: callers return an empty result rather than fall back
+    // to the owner's data, which is exactly the leak this closes.
+    session_profile()
 }
 
 /// The profile id a per-profile READ or WRITE endpoint must act on, hardened
 /// against a paired device passing a crafted `profile_id` to reach ANOTHER
 /// profile's personalization (favorites, play history, stats, KV, artist bans).
 ///
-/// - **Loopback** (the desktop webview, the trusted owner) keeps its
+/// - **This machine** (the desktop webview, the trusted owner) keeps its
 ///   client-supplied value verbatim — its UI legitimately switches profiles
 ///   in-app, so behaviour is unchanged (including a `None`/no-profile scope).
 /// - A **paired device** is FORCED onto the profile bound to its session and
 ///   cannot widen that with a `profile_id` param; a paired-but-unbound session
 ///   is rejected (the client must bind a profile first).
+///
+/// The owner test is [`is_this_machine`], NOT loopback: with the Meradomo tunnel
+/// in front, the agent proxies to `127.0.0.1` and sends no `X-Forwarded-For`, so
+/// a phone anywhere in the world also arrives from loopback. Trusting loopback
+/// here handed every paired device the owner's powers — it could POST itself
+/// into any profile's device list and read that list (`now_playing` included)
+/// straight back, which is the exact leak the rule below is for.
 ///
 /// Call this BEFORE taking the db lock — it locks internally via
 /// `session_profile`, so a held `state.db` lock here would deadlock.
@@ -1116,13 +1337,69 @@ fn scoped_profile_id(
     q: &TokenQuery,
     client_profile_id: Option<i64>,
 ) -> Result<Option<i64>, Response> {
-    if effective_client_ip(addr, headers).is_loopback() {
-        return Ok(client_profile_id);
+    let this_machine = is_this_machine(headers, addr);
+    // Lazy on purpose: each lookup takes the db lock, and no single branch needs
+    // more than one of them.
+    let guest_profile = || guest_profile_id(state, headers);
+    let session_profile = || extract_token(headers, q).and_then(|t| state.session_profile(&t));
+    scope_decision(this_machine, client_profile_id, guest_profile, session_profile)
+        .ok_or_else(|| (StatusCode::FORBIDDEN, "no profile selected").into_response())
+}
+
+/// The profile belonging to the guest this request came from, creating it the
+/// first time they arrive.
+///
+/// Returns `None` for anybody who is not a guest — the desktop, the owner, a
+/// phone paired over the local network — so every other path is untouched.
+fn guest_profile_id(state: &AppState, headers: &HeaderMap) -> Option<i64> {
+    let guest = identity::guest_of(headers)?;
+    let conn = state.db.lock().expect("db mutex poisoned");
+    crate::profiles::ensure_for_identity(
+        &conn,
+        identity::IDENTITY_PROVIDER,
+        &guest.sub,
+        &guest.email,
+    )
+    .ok()
+    .map(|p| p.id)
+}
+
+/// Who a request is allowed to read, with the plumbing lifted out: `this_machine`
+/// is the trust classification, `client_profile_id` the CLAIM off the query
+/// string, `guest_profile` the account of a visitor a provider has signed in, and
+/// `session_profile` the profile the caller's token is actually bound to.
+/// `None` = refuse.
+///
+/// `this_machine` must come from [`is_this_machine`] and not from loopback alone.
+/// Loopback stopped meaning "the owner" the moment the tunnel arrived, and this
+/// function cannot tell the difference — it believes whatever the shell hands it.
+///
+/// Pure so the rule that decides who reads whose data is unit-testable —
+/// `scoped_profile_id` is a thin shell that gathers these inputs, and `AppState`
+/// (which owns a `tauri::AppHandle`) can't be built in a test. Everything above
+/// this line is I/O; everything in it is the actual policy.
+fn scope_decision(
+    this_machine: bool,
+    client_profile_id: Option<i64>,
+    guest_profile: impl FnOnce() -> Option<i64>,
+    session_profile: impl FnOnce() -> Option<i64>,
+) -> Option<Option<i64>> {
+    if this_machine {
+        // The desktop webview — the trusted owner, whose UI legitimately
+        // switches profiles in-app. Its claim stands, `None` (no-profile scope)
+        // included.
+        return Some(client_profile_id);
     }
-    match extract_token(headers, q).and_then(|t| state.session_profile(&t)) {
-        Some(p) => Ok(Some(p)),
-        None => Err((StatusCode::FORBIDDEN, "no profile selected").into_response()),
+    // Somebody the owner shared with, signed in by a provider. They are their own
+    // account and cannot be anybody else's: the claim is not consulted, so a
+    // crafted `profile_id` cannot reach into a stranger's playlists.
+    if let Some(theirs) = guest_profile() {
+        return Some(Some(theirs));
     }
+    // A paired device is whoever its session says it is. The claim is discarded
+    // rather than checked-against: there is no request it could make that would
+    // widen its scope. Unbound (paired, no profile chosen) reads nothing.
+    session_profile().map(Some)
 }
 
 /// `/api/playlists?t=...&profile_id=N`. `profile_id` scopes the list to one
@@ -1179,7 +1456,12 @@ async fn list_playlists(
                     ))
              FROM playlists p
              WHERE p.profile_id = ?1
-               AND EXISTS (SELECT 1 FROM playlist_tracks pt2 WHERE pt2.playlist_id = p.id)
+               AND (
+                 EXISTS (SELECT 1 FROM playlist_tracks pt2 WHERE pt2.playlist_id = p.id)
+                 -- ...but a user-created (`local:`) playlist shows even when
+                 -- empty; only empty IMPORTS stay hidden as ghosts.
+                 OR p.spotify_id LIKE 'local:%'
+             )
              ORDER BY p.name COLLATE NOCASE",
         ) {
             Ok(s) => s,
@@ -1265,8 +1547,8 @@ struct PlaylistDetail {
     /// Edit-details sheet reads and writes it, mirroring desktop.
     description: Option<String>,
     cover_url: Option<String>,
-    /// Where the playlist came from (local/spotify/liked/album/csv/...). The
-    /// rename UI uses this to warn that a synced playlist's name reverts.
+    /// Where the playlist came from (local/spotify/liked/album/csv/...). Imported
+    /// playlists carry a synthetic import id.
     source: &'static str,
     tracks: Vec<StreamTrack>,
 }
@@ -1361,6 +1643,67 @@ async fn get_playlist(
     .into_response()
 }
 
+/// GET /api/library/songs — every track reachable through the acting profile's
+/// playlists (regular + Liked + saved albums), title-sorted. Mirrors the
+/// desktop's `list_library_songs` IPC so the phone can offer a flat Songs tab.
+async fn get_library_songs(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(q): Query<PlaylistsQuery>,
+) -> Response {
+    let tq = TokenQuery { t: q.t.clone() };
+    if let Err(r) = require_token(&state, &headers, &tq) {
+        return r;
+    }
+    let Some(profile_id) =
+        read_scope_profile(&state, &headers, &addr, &tq, q.profile_id)
+    else {
+        return Json(Vec::<StreamTrack>::new()).into_response();
+    };
+    let conn = state.db.lock().expect("db mutex poisoned");
+    let mut stmt = match conn.prepare(
+        "SELECT t.id, t.title, t.artists, t.album, t.album_art_url, t.duration_ms,
+                t.local_path, t.status
+         FROM tracks t
+         WHERE t.id IN (
+             SELECT pt.track_id FROM playlist_tracks pt
+             JOIN playlists p ON p.id = pt.playlist_id
+             WHERE p.profile_id IS ?1
+         )
+           AND TRIM(t.title) <> ''
+         ORDER BY t.title COLLATE NOCASE",
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(?e, "library songs prepare");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let tracks: Vec<StreamTrack> = stmt
+        .query_map(params![profile_id], |r| {
+            let artists_json: String = r.get(2)?;
+            let artists: Vec<String> =
+                serde_json::from_str(&artists_json).unwrap_or_default();
+            let local_path: Option<String> = r.get(6)?;
+            Ok(StreamTrack {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                artists,
+                album: r.get(3)?,
+                album_art_url: r.get(4)?,
+                duration_ms: r.get(5)?,
+                position: 0,
+                has_audio: local_path.is_some(),
+                status: r.get(7)?,
+            })
+        })
+        .ok()
+        .and_then(|i| i.collect::<Result<Vec<_>, _>>().ok())
+        .unwrap_or_default();
+    Json(tracks).into_response()
+}
+
 /// DELETE /api/playlists/:id
 ///
 /// Removes the playlist row. `playlist_tracks` rows are removed
@@ -1415,9 +1758,9 @@ struct RenamePlaylistBody {
 ///
 /// Renames the playlist and, when `description` is present, sets it too.
 /// Phone-only entry point; the desktop uses the `rename_playlist` Tauri IPC
-/// command, which calls the same `rename_playlist_row` helper. Note: a
-/// Spotify-mirrored playlist's name reverts on the next sync — the local
-/// rename isn't pushed upstream.
+/// command, which calls the same `rename_playlist_row` helper. Note:
+/// re-importing an imported playlist would restore its original name (the
+/// local rename isn't written back to the source archive).
 async fn rename_playlist_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1503,10 +1846,11 @@ struct CastStartOut {
 
 /// POST /api/cast/start  body { device_id, track_id }
 ///
-/// Looks up the local track by id (must be downloaded), constructs a
-/// LAN stream URL the Chromecast can fetch, and spins up a Cast
-/// session that LAUNCHes the Default Media Receiver and LOADs the
-/// URL. Replaces any previously active cast session.
+/// Looks up the track by id, constructs a LAN stream URL the Chromecast can
+/// fetch (`/stream/{id}` for a downloaded file, `/stream/{id}/live` for a
+/// streamed track — prepared/warmed here first so the receiver never times
+/// out), and spins up a Cast session that LAUNCHes the Default Media Receiver
+/// and LOADs the URL. Replaces any previously active cast session.
 async fn cast_start(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1534,8 +1878,8 @@ async fn cast_start(
             .into_response();
     };
 
-    // Pull track metadata + local_path. Chromecast can't play tracks
-    // that haven't been downloaded yet.
+    // Pull track metadata + local_path. `local_path.is_none()` means it's a
+    // streamed (not-downloaded) track — cast it via the warmed /live URL below.
     let track_row = {
         let conn = state.db.lock().expect("db mutex poisoned");
         conn.query_row(
@@ -1563,12 +1907,27 @@ async fn cast_start(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    if local_path.is_none() {
-        return (
-            StatusCode::CONFLICT,
-            "track is not downloaded yet; can't cast",
-        )
-            .into_response();
+    // Downloaded → serve the file by id (`/stream/{id}`). Not downloaded →
+    // prepare the live stream NOW: this call blocks until the engine has
+    // de-fragmented it into the temp cache. Once warm, `/stream/{id}/live`
+    // serves a seekable, Content-Length'd audio/mp4 that's indistinguishable
+    // from a downloaded file to the receiver — so the Chromecast never
+    // cold-starts and times out; the (bounded) wait happens here instead, and
+    // the client shows a "Preparing…" state around this request. Belt-and-
+    // suspenders: the client usually warms it first, in which case this
+    // returns instantly.
+    let is_live = local_path.is_none();
+    if is_live {
+        match crate::acquisition::active_provider()
+            .live_path(&state.app, &state.db, body.track_id)
+            .await
+        {
+            Ok(Some(_)) => {} // warmed — the /live URL will serve instantly
+            Ok(None) | Err(_) => {
+                return (StatusCode::CONFLICT, "couldn't prepare this track to cast")
+                    .into_response();
+            }
+        }
     }
     let artists: Vec<String> =
         serde_json::from_str(&artists_json).unwrap_or_default();
@@ -1584,10 +1943,17 @@ async fn cast_start(
         )
             .into_response();
     };
-    let stream_url = format!(
-        "http://{}:{}/stream/{}",
-        our_ip, state.streaming_port, body.track_id
-    );
+    let stream_url = if is_live {
+        format!(
+            "http://{}:{}/stream/{}/live",
+            our_ip, state.streaming_port, body.track_id
+        )
+    } else {
+        format!(
+            "http://{}:{}/stream/{}",
+            our_ip, state.streaming_port, body.track_id
+        )
+    };
 
     // Inspect any prior session.
     let prev_handle: Option<crate::cast::CastHandle> = {
@@ -1912,7 +2278,7 @@ async fn get_track_art(
         .ok()
         .flatten()
     };
-    proxy_art_response("get_track_art", url).await
+    proxy_art_response("get_track_art", url, &state).await
 }
 
 async fn get_playlist_art(
@@ -1922,13 +2288,24 @@ async fn get_playlist_art(
     Query(q): Query<TokenQuery>,
     Path(id): Path<i64>,
 ) -> Response {
-    // Same-origin endpoint for the playlist cover so the service
-    // worker can cache it (cross-origin Spotify CDN images can't be
-    // intercepted cleanly). LAN-bypass token same as track art.
-    if !is_private_addr(&effective_client_ip(&addr, &headers)) {
-        if let Err(r) = require_token(&state, &headers, &q) {
-            return r;
-        }
+    // Same-origin endpoint for the playlist cover so the service worker can
+    // cache it (cross-origin CDN images can't be intercepted cleanly).
+    //
+    // This used to skip the token on the LAN, "same as track art" — but nothing
+    // casts a PLAYLIST cover. A Chromecast is handed the track's own CDN url
+    // (`MediaPayload::image_url`, straight off `tracks.album_art_url`) and never
+    // calls this route; the only callers are `playlistArtUrl()`, which always
+    // carries a token. So the bypass bought nothing and meant any device on the
+    // Wi-Fi could pull any household member's playlist cover while completely
+    // unpaired, and probe which playlist ids existed via 404-vs-200. Caching is
+    // unaffected: the service worker strips the token from its cache key.
+    if let Err(r) = require_token(&state, &headers, &q) {
+        return r;
+    }
+    // And a playlist belongs to a profile — a paired device may only fetch its
+    // own covers, the same rule every other playlist endpoint already enforces.
+    if let Err(r) = enforce_playlist_owner(&state, &headers, &addr, &q, id) {
+        return r;
     }
     let url: Option<String> = {
         let conn = state.db.lock().expect("db mutex poisoned");
@@ -1948,7 +2325,7 @@ async fn get_playlist_art(
         .ok()
         .flatten()
     };
-    proxy_art_response("get_playlist_art", url).await
+    proxy_art_response("get_playlist_art", url, &state).await
 }
 
 /// Shared implementation for track / playlist art proxy endpoints.
@@ -1958,9 +2335,39 @@ async fn get_playlist_art(
 /// stale-while-revalidate cache flow handle a direct 200 better),
 /// with a 7-day immutable cache header so browsers don't re-fetch
 /// every page load.
+/// Forget art that turned out to be Deezer's "no artwork" placeholder, so the
+/// next cover pick falls through to another track instead of serving a grey
+/// disc forever. Cheap self-heal: we only learn a cover is a dud by fetching it,
+/// and we just did. Best-effort — a failed write only means we retry next time.
+fn forget_dud_art(state: &AppState, art_url: &str, label: &'static str) {
+    let Ok(conn) = state.db.lock() else { return };
+    let tracks = conn
+        .execute(
+            "UPDATE tracks SET album_art_url = NULL WHERE album_art_url = ?1",
+            params![art_url],
+        )
+        .unwrap_or(0);
+    let playlists = conn
+        .execute(
+            "UPDATE playlists SET cover_url = NULL WHERE cover_url = ?1",
+            params![art_url],
+        )
+        .unwrap_or(0);
+    if tracks + playlists > 0 {
+        tracing::info!(
+            label,
+            %art_url,
+            tracks,
+            playlists,
+            "art proxy: dropped Deezer no-cover placeholder"
+        );
+    }
+}
+
 async fn proxy_art_response(
     label: &'static str,
     upstream_url: Option<String>,
+    state: &AppState,
 ) -> Response {
     let Some(art_url) = upstream_url else {
         return StatusCode::NOT_FOUND.into_response();
@@ -1984,6 +2391,15 @@ async fn proxy_art_response(
     };
     if !upstream.status().is_success() {
         return StatusCode::BAD_GATEWAY.into_response();
+    }
+    // Deezer answers "this album has no artwork" with a 302 to its placeholder
+    // rather than a 404, so a dud is only visible in where we LANDED — the
+    // stored url keeps a real-looking hash. reqwest followed the redirects, so
+    // this costs nothing: forget the dud and 404, and the client shows its own
+    // neutral placeholder while the next request picks another track's cover.
+    if upstream.url().as_str().contains(crate::deezer::NO_COVER_MD5) {
+        forget_dud_art(state, &art_url, label);
+        return StatusCode::NOT_FOUND.into_response();
     }
     let content_type = upstream
         .headers()
@@ -2229,9 +2645,8 @@ async fn cover_scrub(Path(md5): Path<String>) -> Response {
 // quotas behind unreachable enterprise criteria. Deezer's public API
 // has comparable coverage, returns ISRC directly, and needs no auth.
 //
-// The additions are still local-only — we don't write back to Spotify.
-// Migration 005 + spotify::sync's snapshot/reinsert hooks keep the
-// rows alive across syncs of Spotify-mirrored playlists.
+// The additions are local-only. Migration 005's `locally_added` flag marks
+// them so a future re-import of the source archive doesn't wipe them.
 
 /// Track shape returned from /api/search and album-tracks endpoints, and
 /// also the shape the client posts back to /api/playlists/:id/tracks.
@@ -2436,6 +2851,7 @@ struct ProfileQuery {
 /// LAN/internet posture stays consistent.
 async fn spotify_search(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Query(q): Query<SearchQuery>,
 ) -> Response {
@@ -2448,6 +2864,14 @@ async fn spotify_search(
     }
     let Some(query) = q.q.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
         return (StatusCode::BAD_REQUEST, "missing q").into_response();
+    };
+    // The ✓ marks (and `in_playlist_ids` / `in_saved_album_ids` behind them) are
+    // per-profile library state, so annotate for the CALLER's profile only —
+    // otherwise a paired device could search with someone else's id and learn
+    // which of their playlists hold a track.
+    let scoped_pid = match scoped_profile_id(&state, &headers, &addr, &tq, q.profile_id) {
+        Ok(p) => p,
+        Err(r) => return r,
     };
     // Pick which Deezer endpoints to hit based on the requested types.
     // The wire format mirrors the old Spotify-flavored API for backward
@@ -2470,7 +2894,7 @@ async fn spotify_search(
         let cache = search_cache().lock().expect("search cache poisoned");
         if let Some(entry) = cache.get(&cache_key) {
             if entry.fetched_at.elapsed() < SEARCH_TTL {
-                return entry.to_response(&state, q.profile_id);
+                return entry.to_response(&state, scoped_pid);
             }
         }
     }
@@ -2645,7 +3069,7 @@ async fn spotify_search(
     // Annotate with library state so the UI can render ✓ vs + per row.
     {
         let conn = state.db.lock().expect("db mutex poisoned");
-        if let Err(e) = annotate_with_library_state(&conn, &mut tracks, q.profile_id) {
+        if let Err(e) = annotate_with_library_state(&conn, &mut tracks, scoped_pid) {
             tracing::warn!(?e, "search: library annotation failed; rendering without ✓ marks");
         }
     }
@@ -2795,6 +3219,50 @@ fn mb_limiter() -> &'static tokio::sync::Semaphore {
 /// concurrently (bounded by the shared `sem`), so an Apple/Last.fm list gets
 /// cover art, a preview clip, and the add/download flow. Unresolved pairs are
 /// dropped; order is preserved.
+/// Karaoke / tribute / cover markers that flag a Deezer search hit as an
+/// impostor of the charted recording (e.g. "… (Karaoke Version Originally
+/// Performed by …)" by a label like "Singer's Best").
+const CHART_JUNK_MARKERS: &[&str] = &[
+    "karaoke",
+    "originally performed",
+    "made famous",
+    "in the style of",
+    "as made famous",
+    "a cappella",
+    "acappella",
+    "backing track",
+];
+
+/// Pick the Deezer hit that best matches a chart `(title, artist)`: skip
+/// karaoke/tribute/cover impostors (unless the chart entry itself asked for one)
+/// and prefer a hit whose artist actually matches the charted artist. Falls back
+/// to the first hit so a fuzzy chart still resolves to *something* rather than
+/// dropping the row. Fixes the resolver blindly taking Deezer's #1 result, which
+/// surfaced karaoke covers for catalog songs.
+fn pick_chart_match(
+    title: &str,
+    artist: &str,
+    hits: &[crate::deezer::TrackHit],
+) -> Option<crate::deezer::TrackHit> {
+    let chart_ctx = format!("{title} {artist}").to_lowercase();
+    let chart_artist = artist.to_lowercase();
+    let is_junk = |h: &crate::deezer::TrackHit| {
+        let hay = format!("{} {}", h.title, h.artist.name).to_lowercase();
+        CHART_JUNK_MARKERS
+            .iter()
+            .any(|m| hay.contains(m) && !chart_ctx.contains(m))
+    };
+    let artist_ok = |h: &crate::deezer::TrackHit| {
+        let a = h.artist.name.to_lowercase();
+        !chart_artist.is_empty() && (a.contains(&chart_artist) || chart_artist.contains(&a))
+    };
+    hits.iter()
+        .find(|&h| !is_junk(h) && artist_ok(h))
+        .or_else(|| hits.iter().find(|&h| !is_junk(h)))
+        .or_else(|| hits.first())
+        .cloned()
+}
+
 async fn resolve_chart_pairs(
     client: &crate::deezer::DeezerClient,
     sem: &ResolveLimiter,
@@ -2807,11 +3275,10 @@ async fn resolve_chart_pairs(
         set.spawn(async move {
             let _permit = sem.acquire_owned().await;
             let q = format!("{artist} {title}");
-            let hit = client
-                .search_tracks(&q, 1)
-                .await
-                .ok()
-                .and_then(|v| v.into_iter().next());
+            // Pull several candidates (still one search per pair — no extra API
+            // calls) and choose the real recording rather than Deezer's #1 hit.
+            let hits = client.search_tracks(&q, 8).await.ok().unwrap_or_default();
+            let hit = pick_chart_match(&title, &artist, &hits);
             (idx, hit)
         });
     }
@@ -2979,6 +3446,34 @@ fn search_cache() -> &'static Mutex<std::collections::HashMap<String, SearchCach
     CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
+/// How long an artist page's sections (albums / top tracks / related) stay
+/// fresh. A discography changes at most on a release day, so a generous TTL
+/// makes the artist page instant on revisit — the desktop show-all drill-in
+/// (which unmounts + remounts the artist page) and Back-from-album both hit
+/// this instead of a fresh Deezer round-trip through the 110ms pacer.
+const ARTIST_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// One artist's cached sections, keyed by Deezer artist id. Each section is
+/// cached independently (they're fetched by separate endpoints, at separate
+/// times) with its own freshness stamp. Top tracks are stored UN-annotated —
+/// the per-profile ✓/+ marks are re-applied on each hit, exactly like the
+/// search cache, so the marks stay live even when the Deezer call is skipped.
+#[derive(Default)]
+struct ArtistCacheEntry {
+    albums: Option<(std::time::Instant, Vec<SearchAlbumOut>)>,
+    top: Option<(std::time::Instant, Vec<CatalogTrackOut>)>,
+    related: Option<(std::time::Instant, Vec<SearchArtistOut>)>,
+}
+
+/// Process-wide artist-section cache, keyed by artist id. A plain global static
+/// (like `search_cache` / `browse_cache`) keeps the AppState constructors — and
+/// the unit tests — untouched.
+fn artist_cache() -> &'static Mutex<std::collections::HashMap<u64, ArtistCacheEntry>> {
+    static CACHE: std::sync::OnceLock<Mutex<std::collections::HashMap<u64, ArtistCacheEntry>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
 // ---- Playback handoff ("Beetbot Connect"-lite) -----------------------
 //
 // A tiny hub-relayed "mailbox" that lets one device hand its now-playing queue
@@ -3003,8 +3498,8 @@ struct PresenceEntry {
 
 /// Pending remote-control actions (play/pause/next/prev) addressed to a device,
 /// drained on its next poll. Keyed by target device id.
-fn remote_cmd_map() -> &'static Mutex<std::collections::HashMap<String, Vec<String>>> {
-    static M: std::sync::OnceLock<Mutex<std::collections::HashMap<String, Vec<String>>>> =
+fn remote_cmd_map() -> &'static Mutex<std::collections::HashMap<String, RemoteCmdEntry>> {
+    static M: std::sync::OnceLock<Mutex<std::collections::HashMap<String, RemoteCmdEntry>>> =
         std::sync::OnceLock::new();
     M.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
@@ -3013,6 +3508,18 @@ fn remote_cmd_map() -> &'static Mutex<std::collections::HashMap<String, Vec<Stri
 struct HandoffEntry {
     created_at: std::time::Instant,
     payload: serde_json::Value,
+    /// The sender's scoped profile. A device id is client-supplied and
+    /// unauthenticated, so it addresses but doesn't authorize — this is what
+    /// decides who may claim the snapshot.
+    profile_id: Option<i64>,
+}
+
+/// Pending transport verbs for one device, filed under the profile that queued
+/// them (same reasoning as [`HandoffEntry::profile_id`]).
+#[derive(Default)]
+struct RemoteCmdEntry {
+    profile_id: Option<i64>,
+    actions: Vec<String>,
 }
 
 const PRESENCE_TTL: std::time::Duration = std::time::Duration::from_secs(15);
@@ -3043,9 +3550,71 @@ struct HeartbeatBody {
     now_playing: Option<serde_json::Value>,
 }
 
+/// True when the request really came from THIS machine, rather than from a
+/// device on the far side of the Meradomo tunnel.
+///
+/// Loopback alone stopped meaning "local" once a tunnel sat in front: the agent
+/// proxies to `127.0.0.1`, so a phone anywhere in the world arrives from
+/// loopback. That named every remote device after this Mac — three devices, one
+/// name, told apart only by the list's "(1)" / "(2)" suffixes.
+///
+/// The agent injects `X-Meradomo-*` identity headers on every proxied request,
+/// *after* stripping any inbound copies, so their presence is proof the request
+/// came through the tunnel. It deliberately sends no `X-Forwarded-For` — the
+/// blind pipe genuinely doesn't know the visitor's address — which makes this
+/// the signal that is actually available.
+fn is_this_machine(headers: &HeaderMap, addr: &SocketAddr) -> bool {
+    if headers
+        .keys()
+        .any(|k| k.as_str().starts_with("x-meradomo-"))
+    {
+        return false;
+    }
+    effective_client_ip(addr, headers).is_loopback()
+}
+
+/// Name a device for the device list, best source first:
+///   1. This machine's hostname, for the desktop app itself (genuinely local) —
+///      the only name that tells two Macs apart, and what the owner actually
+///      calls the thing. Hyphens become spaces: `Kamrans-MacBook-Pro` reads
+///      badly in a list next to "iPhone".
+///   2. The session's User-Agent-derived label (iPhone / iPad / Mac / Windows)
+///      for anything paired — including anything arriving via the tunnel.
+///   3. "Device", if the session vanished mid-heartbeat.
+fn server_side_device_label(
+    state: &AppState,
+    headers: &HeaderMap,
+    addr: &SocketAddr,
+    q: &TokenQuery,
+) -> String {
+    if is_this_machine(headers, addr) {
+        if let Some(h) = state.hostname_bare.as_ref() {
+            let pretty = h.replace('-', " ");
+            if !pretty.trim().is_empty() {
+                return pretty;
+            }
+        }
+    }
+    extract_token(headers, q)
+        .and_then(|t| {
+            let hash = sha256_hex(&t);
+            let conn = state.db.lock().expect("db mutex poisoned");
+            conn.query_row(
+                "SELECT device_label FROM streaming_sessions
+                 WHERE token_sha256 = ?1 AND revoked_at IS NULL",
+                params![hash],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+        })
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "Device".into())
+}
+
 /// POST /api/devices/heartbeat — announce this device is online + controllable.
 async fn devices_heartbeat(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Query(q): Query<TokenQuery>,
     Json(body): Json<HeartbeatBody>,
@@ -3056,13 +3625,32 @@ async fn devices_heartbeat(
     if body.device_id.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "missing device_id").into_response();
     }
+    // Scope the announced profile to the caller's own. Presence is the other
+    // direction of the same trust question: `devices_list` only shows devices on
+    // your profile, so an unchecked claim here would let a paired device post
+    // itself INTO someone else's device list — and then receive the handoff
+    // (their queue and now-playing) they meant for a device of their own.
+    let scoped_pid = match scoped_profile_id(&state, &headers, &addr, &q, body.profile_id) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    // Name the device HERE rather than trusting a client constant. Both apps
+    // used to hardcode "Computer" / "Phone", so two Macs (or two phones) were
+    // indistinguishable in the device list. The hub knows better: it has this
+    // machine's hostname, and every session already carries a User-Agent-derived
+    // label. A client may still pass one to override.
+    let label = body
+        .label
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| server_side_device_label(&state, &headers, &addr, &q));
     let mut map = presence_map().lock().expect("presence poisoned");
     map.insert(
         body.device_id,
         PresenceEntry {
-            label: body.label.unwrap_or_else(|| "Device".into()),
+            label,
             kind: body.kind.unwrap_or_else(|| "unknown".into()),
-            profile_id: body.profile_id,
+            profile_id: scoped_pid,
             last_seen: std::time::Instant::now(),
             now_playing: body.now_playing.unwrap_or(serde_json::Value::Null),
         },
@@ -3089,6 +3677,7 @@ struct DeviceQuery {
 /// GET /api/devices?device_id=<self> — the other devices online right now.
 async fn devices_list(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Query(q): Query<DeviceQuery>,
 ) -> Response {
@@ -3098,8 +3687,14 @@ async fn devices_list(
     }
     let self_id = q.device_id.unwrap_or_default();
     // Only surface devices on the SAME profile as the caller — accounts are
-    // isolated, so e.g. Kamran's desktop must not see Alia's phone.
-    let pid = q.profile_id;
+    // isolated, so e.g. the owner's desktop must not see the guest's phone. Scope the
+    // id rather than believing the query param: `DeviceOut` carries
+    // `now_playing`, so a device list for someone else's profile would hand a
+    // paired phone their live listening.
+    let pid = match scoped_profile_id(&state, &headers, &addr, &tq, q.profile_id) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
     let map = presence_map().lock().expect("presence poisoned");
     let out: Vec<DeviceOut> = map
         .iter()
@@ -3125,8 +3720,10 @@ struct RemoteCommandBody {
 /// POST /api/remote-command — queue a transport action for another device.
 async fn remote_command_post(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Query(q): Query<TokenQuery>,
+    Query(pq): Query<ProfileQuery>,
     Json(body): Json<RemoteCommandBody>,
 ) -> Response {
     if let Err(r) = require_token(&state, &headers, &q) {
@@ -3142,11 +3739,24 @@ async fn remote_command_post(
     if !action_ok {
         return (StatusCode::BAD_REQUEST, "unknown action").into_response();
     }
+    let scoped_pid = match scoped_profile_id(&state, &headers, &addr, &q, pq.profile_id) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
     let mut map = remote_cmd_map().lock().expect("remote cmd poisoned");
-    let q = map.entry(body.target_device_id).or_default();
+    let entry = map.entry(body.target_device_id).or_insert_with(|| RemoteCmdEntry {
+        profile_id: scoped_pid,
+        actions: Vec::new(),
+    });
+    // A device id is client-supplied and unauthenticated, so the profile is what
+    // actually addresses this: refuse to queue onto a device filed under someone
+    // else's account rather than take over its queue.
+    if entry.profile_id != scoped_pid {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     // Cap the backlog so a device that polls slowly can't accumulate forever.
-    if q.len() < 16 {
-        q.push(body.action);
+    if entry.actions.len() < 16 {
+        entry.actions.push(body.action);
     }
     StatusCode::NO_CONTENT.into_response()
 }
@@ -3154,6 +3764,7 @@ async fn remote_command_post(
 /// GET /api/remote-command?device_id=<self> — drain pending actions for self.
 async fn remote_command_get(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Query(q): Query<DeviceQuery>,
 ) -> Response {
@@ -3161,9 +3772,22 @@ async fn remote_command_get(
     if let Err(r) = require_token(&state, &headers, &tq) {
         return r;
     }
+    let scoped_pid = match scoped_profile_id(&state, &headers, &addr, &tq, q.profile_id) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
     let self_id = q.device_id.unwrap_or_default();
     let mut map = remote_cmd_map().lock().expect("remote cmd poisoned");
-    let actions: Vec<String> = map.remove(&self_id).unwrap_or_default();
+    // Check BEFORE removing: draining is destructive, so an unscoped remove
+    // would let anyone who names a device id swallow its commands.
+    let mine = map
+        .get(&self_id)
+        .is_some_and(|e| e.profile_id == scoped_pid);
+    let actions: Vec<String> = if mine {
+        map.remove(&self_id).map(|e| e.actions).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     Json(actions).into_response()
 }
 
@@ -3176,8 +3800,10 @@ struct HandoffPostBody {
 /// POST /api/handoff — drop a now-playing snapshot for `target_device_id`.
 async fn handoff_post(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Query(q): Query<TokenQuery>,
+    Query(pq): Query<ProfileQuery>,
     Json(body): Json<HandoffPostBody>,
 ) -> Response {
     if let Err(r) = require_token(&state, &headers, &q) {
@@ -3186,6 +3812,12 @@ async fn handoff_post(
     if body.target_device_id.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "missing target_device_id").into_response();
     }
+    // File it under the sender's profile. The payload is a queue + now-playing
+    // snapshot; only a device on the same account may take it.
+    let scoped_pid = match scoped_profile_id(&state, &headers, &addr, &q, pq.profile_id) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
     let mut map = handoff_map().lock().expect("handoff poisoned");
     map.retain(|_, e| e.created_at.elapsed() < HANDOFF_TTL);
     map.insert(
@@ -3193,6 +3825,7 @@ async fn handoff_post(
         HandoffEntry {
             created_at: std::time::Instant::now(),
             payload: body.payload,
+            profile_id: scoped_pid,
         },
     );
     StatusCode::NO_CONTENT.into_response()
@@ -3202,6 +3835,7 @@ async fn handoff_post(
 /// Returns the stored payload JSON, or `null` when nothing is waiting.
 async fn handoff_get(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Query(q): Query<DeviceQuery>,
 ) -> Response {
@@ -3209,11 +3843,23 @@ async fn handoff_get(
     if let Err(r) = require_token(&state, &headers, &tq) {
         return r;
     }
+    let scoped_pid = match scoped_profile_id(&state, &headers, &addr, &tq, q.profile_id) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
     let self_id = q.device_id.unwrap_or_default();
     let mut map = handoff_map().lock().expect("handoff poisoned");
-    let claimed = match map.remove(&self_id) {
-        Some(e) if e.created_at.elapsed() < HANDOFF_TTL => Some(e.payload),
-        _ => None,
+    // Look before removing. A device id is client-supplied and unauthenticated,
+    // and claiming CONSUMES the entry — so an unscoped remove would let anyone
+    // naming a device id both read someone's queue and delete it out from under
+    // the device it was meant for.
+    let claimable = map
+        .get(&self_id)
+        .is_some_and(|e| e.profile_id == scoped_pid && e.created_at.elapsed() < HANDOFF_TTL);
+    let claimed = if claimable {
+        map.remove(&self_id).map(|e| e.payload)
+    } else {
+        None
     };
     Json(claimed).into_response()
 }
@@ -3241,6 +3887,7 @@ struct BrowseQuery {
 
 async fn browse(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Query(q): Query<BrowseQuery>,
 ) -> Response {
@@ -3248,6 +3895,11 @@ async fn browse(
     if let Err(r) = require_token(&state, &headers, &tq) {
         return r;
     }
+    // Same reasoning as search: the ✓ marks are per-profile library state.
+    let scoped_pid = match scoped_profile_id(&state, &headers, &addr, &tq, q.profile_id) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
     let genre = q.genre.filter(|g| *g != 0);
     let cache_key = genre.unwrap_or(0);
 
@@ -3258,7 +3910,7 @@ async fn browse(
         let cache = browse_cache().lock().expect("browse cache poisoned");
         if let Some(entry) = cache.get(&cache_key) {
             if entry.fetched_at.elapsed() < BROWSE_TTL {
-                return entry.to_response(&state, q.profile_id);
+                return entry.to_response(&state, scoped_pid);
             }
         }
     }
@@ -3269,7 +3921,7 @@ async fn browse(
     // slowest single source rather than the sum of them all.
     let lastfm_key = read_lastfm_key(&state);
     let entry = assemble_browse(genre, q.genre_name.clone(), lastfm_key).await;
-    let response = entry.to_response(&state, q.profile_id);
+    let response = entry.to_response(&state, scoped_pid);
     // Only cache an assembly that actually produced a top-songs row. An empty
     // one usually means every upstream source was rate-limited/unreachable on
     // this pass — caching that would freeze a blank feed for the whole TTL, so
@@ -3628,6 +4280,7 @@ pub fn spawn_browse_prewarm(db: Arc<Mutex<Connection>>) {
 /// cover-less library rows.
 async fn get_album_tracks(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Query(q): Query<TokenQuery>,
     Query(pq): Query<ProfileQuery>,
@@ -3636,6 +4289,11 @@ async fn get_album_tracks(
     if let Err(r) = require_token(&state, &headers, &q) {
         return r;
     }
+    // Per-profile ✓ marks — scope to the caller (see `spotify_search`).
+    let scoped_pid = match scoped_profile_id(&state, &headers, &addr, &q, pq.profile_id) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
     let Ok(album_id) = id.parse::<u64>() else {
         return (StatusCode::BAD_REQUEST, "album id must be numeric").into_response();
     };
@@ -3690,7 +4348,7 @@ async fn get_album_tracks(
         .collect();
     {
         let conn = state.db.lock().expect("db mutex poisoned");
-        if let Err(e) = annotate_with_library_state(&conn, &mut out, pq.profile_id) {
+        if let Err(e) = annotate_with_library_state(&conn, &mut out, scoped_pid) {
             tracing::warn!(?e, "album tracks: library annotation failed");
         }
     }
@@ -3715,6 +4373,17 @@ async fn get_artist_albums(
     let Ok(artist_id) = id.parse::<u64>() else {
         return (StatusCode::BAD_REQUEST, "artist id must be numeric").into_response();
     };
+    // Fast path: serve a recent identical response from the artist cache.
+    {
+        let cache = artist_cache().lock().expect("artist cache poisoned");
+        if let Some(entry) = cache.get(&artist_id) {
+            if let Some((at, albums)) = &entry.albums {
+                if at.elapsed() < ARTIST_TTL {
+                    return Json(albums.clone()).into_response();
+                }
+            }
+        }
+    }
     let client = crate::deezer::DeezerClient::new();
     let albums = match client.get_artist_albums(artist_id).await {
         Ok(a) => a,
@@ -3749,6 +4418,11 @@ async fn get_artist_albums(
             }
         })
         .collect();
+    {
+        let mut cache = artist_cache().lock().expect("artist cache poisoned");
+        cache.entry(artist_id).or_default().albums =
+            Some((std::time::Instant::now(), out.clone()));
+    }
     Json(out).into_response()
 }
 
@@ -3760,6 +4434,7 @@ async fn get_artist_albums(
 /// track list (previews + add-to-playlist) verbatim.
 async fn get_artist_top_tracks(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Query(q): Query<TokenQuery>,
     Query(pq): Query<ProfileQuery>,
@@ -3768,9 +4443,33 @@ async fn get_artist_top_tracks(
     if let Err(r) = require_token(&state, &headers, &q) {
         return r;
     }
+    // Per-profile ✓ marks — scope to the caller (see `spotify_search`).
+    let scoped_pid = match scoped_profile_id(&state, &headers, &addr, &q, pq.profile_id) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
     let Ok(artist_id) = id.parse::<u64>() else {
         return (StatusCode::BAD_REQUEST, "artist id must be numeric").into_response();
     };
+    // Fast path: reuse the recent UN-annotated rows and re-apply this profile's
+    // ✓/+ marks (they're per-caller, so we never cache the annotated form).
+    {
+        let cached = {
+            let cache = artist_cache().lock().expect("artist cache poisoned");
+            cache.get(&artist_id).and_then(|e| {
+                e.top.as_ref().and_then(|(at, rows)| {
+                    (at.elapsed() < ARTIST_TTL).then(|| rows.clone())
+                })
+            })
+        };
+        if let Some(mut out) = cached {
+            let conn = state.db.lock().expect("db mutex poisoned");
+            if let Err(e) = annotate_with_library_state(&conn, &mut out, scoped_pid) {
+                tracing::warn!(?e, "artist top (cached): annotation failed");
+            }
+            return Json(out).into_response();
+        }
+    }
     let client = crate::deezer::DeezerClient::new();
     let tracks = match client.get_artist_top(artist_id, 10).await {
         Ok(t) => t,
@@ -3783,7 +4482,7 @@ async fn get_artist_top_tracks(
                 .into_response();
         }
     };
-    let mut out: Vec<CatalogTrackOut> = tracks
+    let out: Vec<CatalogTrackOut> = tracks
         .into_iter()
         .map(|t| CatalogTrackOut {
             source: "deezer".into(),
@@ -3802,12 +4501,68 @@ async fn get_artist_top_tracks(
             explicit: t.explicit_lyrics,
         })
         .collect();
+    // Cache the un-annotated rows before we mark them up for this caller.
+    {
+        let mut cache = artist_cache().lock().expect("artist cache poisoned");
+        cache.entry(artist_id).or_default().top =
+            Some((std::time::Instant::now(), out.clone()));
+    }
+    let mut out = out;
     {
         let conn = state.db.lock().expect("db mutex poisoned");
-        if let Err(e) = annotate_with_library_state(&conn, &mut out, pq.profile_id) {
+        if let Err(e) = annotate_with_library_state(&conn, &mut out, scoped_pid) {
             tracing::warn!(?e, "artist top: library annotation failed; rendering without ✓ marks");
         }
     }
+    Json(out).into_response()
+}
+
+/// GET /api/genres/:id/artists
+///
+/// The genre's top artists (Deezer `/genre/{id}/artists`) — genuinely
+/// genre-filtered (unlike the chart) and already carrying portraits, in the
+/// same `SearchArtistOut` shape as /api/search. This is the LIGHT path the
+/// onboarding taste grid uses: one Deezer call per genre, no chart-track
+/// resolution and no per-name re-search — the two things that funneled ~100
+/// throttled Deezer calls through one gate and made the artist step take 30-45s.
+async fn genre_artists(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(r) = require_token(&state, &headers, &q) {
+        return r;
+    }
+    let Ok(genre_id) = id.parse::<i64>() else {
+        return (StatusCode::BAD_REQUEST, "genre id must be numeric").into_response();
+    };
+    let client = crate::deezer::DeezerClient::new();
+    let artists = match client.get_genre_artists(genre_id).await {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!(?e, genre_id, "deezer genre artists failed");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error":"genre_artists_failed","message":format!("{e}")})),
+            )
+                .into_response();
+        }
+    };
+    let out: Vec<SearchArtistOut> = artists
+        .into_iter()
+        .map(|a| {
+            let pic = a.best_picture();
+            SearchArtistOut {
+                source: "deezer".into(),
+                source_id: a.id.to_string(),
+                name: a.name,
+                picture_url: pic,
+                total_albums: a.nb_album,
+                total_fans: a.nb_fan,
+            }
+        })
+        .collect();
     Json(out).into_response()
 }
 
@@ -3828,6 +4583,17 @@ async fn get_artist_related(
     let Ok(artist_id) = id.parse::<u64>() else {
         return (StatusCode::BAD_REQUEST, "artist id must be numeric").into_response();
     };
+    // Fast path: serve a recent identical response from the artist cache.
+    {
+        let cache = artist_cache().lock().expect("artist cache poisoned");
+        if let Some(entry) = cache.get(&artist_id) {
+            if let Some((at, related)) = &entry.related {
+                if at.elapsed() < ARTIST_TTL {
+                    return Json(related.clone()).into_response();
+                }
+            }
+        }
+    }
     let client = crate::deezer::DeezerClient::new();
     let artists = match client.get_artist_related(artist_id).await {
         Ok(a) => a,
@@ -3854,6 +4620,11 @@ async fn get_artist_related(
             }
         })
         .collect();
+    {
+        let mut cache = artist_cache().lock().expect("artist cache poisoned");
+        cache.entry(artist_id).or_default().related =
+            Some((std::time::Instant::now(), out.clone()));
+    }
     Json(out).into_response()
 }
 
@@ -3870,6 +4641,19 @@ struct ArtistBioOut {
     extract: String,
     title: String,
     url: String,
+    /// Apple-style About facts, best-effort from Wikidata (via the article's
+    /// linked entity). Absent when the entity has no such claim — the client
+    /// renders only the rows it gets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    born: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    from: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    genre: Option<String>,
+    /// Wikidata entity id (e.g. "Q1239933") — internal handle for the facts
+    /// fetch, never sent to the client.
+    #[serde(skip)]
+    qid: Option<String>,
 }
 
 static BIO_CACHE: std::sync::OnceLock<
@@ -3924,6 +4708,21 @@ async fn wiki_summary(client: &reqwest::Client, title: &str) -> Option<ArtistBio
         return None;
     }
     let desc = v.get("description").and_then(|x| x.as_str()).unwrap_or("");
+    // Disambiguation-in-disguise: anthroponymy ("Name list" / given-name /
+    // surname) articles are typed "standard", so the type check above doesn't
+    // catch them — and their referent list can name-drop enough musical terms
+    // to pass the keyword guard (e.g. "Masego", whose list includes the
+    // musician alongside grim unrelated entries). Reject list-style pages by
+    // their description and the canonical "may refer to" lead-in, so the
+    // "<name> musician" search fallback resolves the real artist page instead.
+    let desc_lc = desc.to_lowercase();
+    if ["disambiguation", "name list", "given name", "surname", "family name"]
+        .iter()
+        .any(|m| desc_lc.contains(m))
+        || extract.to_lowercase().contains("may refer to")
+    {
+        return None;
+    }
     if !looks_musical(&format!("{desc} {extract}")) {
         return None;
     }
@@ -3943,7 +4742,153 @@ async fn wiki_summary(client: &reqwest::Client, title: &str) -> Option<ArtistBio
         extract,
         title: page_title,
         url,
+        born: None,
+        from: None,
+        genre: None,
+        qid: v
+            .get("wikibase_item")
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
     })
+}
+
+/// "+1983-09-25T00:00:00Z" (+ precision) → "September 25, 1983". Wikidata's
+/// precision says how much of the timestamp is real: 11 = day, 10 = month,
+/// 9 = year; below that (decade, century) we skip the fact entirely.
+fn format_wikidata_date(time: &str, precision: i64) -> Option<String> {
+    let t = time.strip_prefix('+').unwrap_or(time);
+    let (date, _) = t.split_once('T')?;
+    let mut it = date.splitn(3, '-');
+    let year = it.next()?.to_string();
+    let month: usize = it.next()?.parse().ok()?;
+    let day: usize = it.next()?.trim_start_matches('0').parse().unwrap_or(0);
+    const MONTHS: [&str; 12] = [
+        "January", "February", "March", "April", "May", "June", "July",
+        "August", "September", "October", "November", "December",
+    ];
+    match precision {
+        p if p >= 11 && (1..=12).contains(&month) && day > 0 => {
+            Some(format!("{} {}, {}", MONTHS[month - 1], day, year))
+        }
+        10 if (1..=12).contains(&month) => Some(format!("{} {}", MONTHS[month - 1], year)),
+        9 | 10 | 11 => Some(year),
+        _ => None,
+    }
+}
+
+/// Tidy a Wikidata genre label for display: "hip hop music" → "Hip Hop".
+fn tidy_genre_label(label: &str) -> String {
+    let base = label.strip_suffix(" music").unwrap_or(label);
+    base.split_whitespace()
+        .map(|w| {
+            let mut c = w.chars();
+            match c.next() {
+                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Fetch Apple-style About facts (born / from / genre) for a Wikidata entity.
+/// Two requests: the entity's claims, then one batched label lookup for the
+/// place + genre entities those claims point at. Any miss → that fact is None.
+async fn fetch_wikidata_facts(
+    client: &reqwest::Client,
+    qid: &str,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let claims: serde_json::Value = match client
+        .get("https://www.wikidata.org/w/api.php")
+        .query(&[
+            ("action", "wbgetentities"),
+            ("ids", qid),
+            ("props", "claims"),
+            ("format", "json"),
+            ("formatversion", "2"),
+        ])
+        .send()
+        .await
+        .ok()
+        .filter(|r| r.status().is_success())
+    {
+        Some(r) => match r.json().await {
+            Ok(v) => v,
+            Err(_) => return (None, None, None),
+        },
+        None => return (None, None, None),
+    };
+    let entity = &claims["entities"][qid]["claims"];
+    let snak_value = |prop: &str, idx: usize| -> Option<serde_json::Value> {
+        entity
+            .get(prop)?
+            .get(idx)?
+            .get("mainsnak")?
+            .get("datavalue")?
+            .get("value")
+            .cloned()
+    };
+    // Born: birth date (P569) — PEOPLE ONLY. Band inception (P571) proved
+    // unreliable (Wikidata dates Coldplay 1999 while the article says formed
+    // 1997 — likely dating the band's rename), and a wrong "BORN" fact reads
+    // worse than no row. Bands still get FROM / GENRE / LISTENERS.
+    let born = snak_value("P569", 0).and_then(|v| {
+        format_wikidata_date(v.get("time")?.as_str()?, v.get("precision")?.as_i64()?)
+    });
+    // From: birthplace, else formation location, else country of origin.
+    let place_qid = ["P19", "P740", "P495"].iter().find_map(|p| {
+        snak_value(p, 0)?.get("id")?.as_str().map(str::to_string)
+    });
+    // Genre: first two P136 entries.
+    let genre_qids: Vec<String> = (0..2)
+        .filter_map(|i| snak_value("P136", i)?.get("id")?.as_str().map(str::to_string))
+        .collect();
+
+    // Batched label lookup for whatever entities we found.
+    let mut want: Vec<String> = Vec::new();
+    if let Some(p) = &place_qid {
+        want.push(p.clone());
+    }
+    want.extend(genre_qids.iter().cloned());
+    let mut labels: std::collections::HashMap<String, String> = Default::default();
+    if !want.is_empty() {
+        if let Some(resp) = client
+            .get("https://www.wikidata.org/w/api.php")
+            .query(&[
+                ("action", "wbgetentities"),
+                ("ids", want.join("|").as_str()),
+                ("props", "labels"),
+                ("languages", "en"),
+                ("format", "json"),
+                ("formatversion", "2"),
+            ])
+            .send()
+            .await
+            .ok()
+            .filter(|r| r.status().is_success())
+        {
+            if let Ok(v) = resp.json::<serde_json::Value>().await {
+                for id in &want {
+                    if let Some(l) = v["entities"][id.as_str()]["labels"]["en"]["value"].as_str()
+                    {
+                        labels.insert(id.clone(), l.to_string());
+                    }
+                }
+            }
+        }
+    }
+    let from = place_qid.and_then(|p| labels.get(&p).cloned());
+    let genres: Vec<String> = genre_qids
+        .iter()
+        .filter_map(|g| labels.get(g))
+        .map(|l| tidy_genre_label(l))
+        .collect();
+    let genre = if genres.is_empty() {
+        None
+    } else {
+        Some(genres.join(", "))
+    };
+    (born, from, genre)
 }
 
 async fn wiki_search_top(client: &reqwest::Client, query: &str) -> Option<String> {
@@ -3984,25 +4929,33 @@ fn title_matches(name: &str, title: &str) -> bool {
 async fn fetch_artist_bio(name: &str) -> Option<ArtistBioOut> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(8))
-        .user_agent("Beetbot/0.0 (personal music library)")
+        .user_agent("Beetbot/0.2 (personal music library)")
         .build()
         .ok()?;
     // 1. Direct page by name (handles the common case + redirects).
-    if let Some(b) = wiki_summary(&client, name).await {
-        return Some(b);
-    }
-    // 2. Disambiguate via a "<name> musician" search — but only accept a
-    //    result whose title actually resembles the artist, so a bare word
-    //    like "Air" doesn't pull in an unrelated musician's page. A wrong
-    //    match here becomes "no bio", which is the safer failure.
-    if let Some(title) = wiki_search_top(&client, &format!("{name} musician")).await {
-        if let Some(b) = wiki_summary(&client, &title).await {
-            if title_matches(name, &b.title) {
-                return Some(b);
-            }
+    let mut bio = if let Some(b) = wiki_summary(&client, name).await {
+        b
+    } else {
+        // 2. Disambiguate via a "<name> musician" search — but only accept a
+        //    result whose title actually resembles the artist, so a bare word
+        //    like "Air" doesn't pull in an unrelated musician's page. A wrong
+        //    match here becomes "no bio", which is the safer failure.
+        let title = wiki_search_top(&client, &format!("{name} musician")).await?;
+        let b = wiki_summary(&client, &title).await?;
+        if !title_matches(name, &b.title) {
+            return None;
         }
+        b
+    };
+    // Enrich with the About facts via the article's Wikidata entity. Purely
+    // additive: a facts failure still returns the plain bio.
+    if let Some(qid) = bio.qid.clone() {
+        let (born, from, genre) = fetch_wikidata_facts(&client, &qid).await;
+        bio.born = born;
+        bio.from = from;
+        bio.genre = genre;
     }
-    None
+    Some(bio)
 }
 
 #[derive(Deserialize)]
@@ -4040,6 +4993,65 @@ async fn artist_bio(
         map.insert(key, bio.clone());
     }
     Json(bio).into_response()
+}
+
+/// GET /api/artists/appears-on?name=...
+///
+/// Albums by OTHER artists that feature this one (Apple Music's "Appears On").
+/// Deezer has no direct endpoint, so this is a search heuristic: search tracks
+/// by the artist and keep albums whose main artist is someone else — those are
+/// the features/collabs. Grouped by album, capped, best-effort (empty on any
+/// failure, the client just hides the rail).
+async fn artist_appears_on(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<BioQuery>,
+) -> Response {
+    let tq = TokenQuery { t: q.t.clone() };
+    if let Err(r) = require_token(&state, &headers, &tq) {
+        return r;
+    }
+    let Some(name) = q.name.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return (StatusCode::BAD_REQUEST, "missing name").into_response();
+    };
+    let client = crate::deezer::DeezerClient::new();
+    let tracks = match client
+        .search_tracks(&format!("artist:\"{name}\""), 50)
+        .await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(?e, name, "appears-on search failed");
+            return Json(Vec::<SearchAlbumOut>::new()).into_response();
+        }
+    };
+    let lc = name.to_lowercase();
+    let mut seen = std::collections::HashSet::new();
+    let out: Vec<SearchAlbumOut> = tracks
+        .into_iter()
+        // A track whose MAIN artist differs is a feature on someone else's
+        // record — exactly the "Appears On" set.
+        .filter(|t| t.artist.name.to_lowercase() != lc)
+        // Quality guard: Deezer's artist: search fuzzy-matches, so a stray
+        // result set can be pure noise (classical albums for "Masego").
+        // A real feature credits the guest in the track title — "… (feat.
+        // <name>)" — so require the name there. Legit collabs credited only
+        // in the artist list get dropped too; an empty rail beats a wrong one.
+        .filter(|t| t.title.to_lowercase().contains(&lc))
+        .filter(|t| seen.insert(t.album.id))
+        .take(12)
+        .map(|t| SearchAlbumOut {
+            source: "deezer".into(),
+            source_id: t.album.id.to_string(),
+            name: t.album.title.clone(),
+            artists: vec![t.artist.name.clone()],
+            cover_url: t.album.best_cover(),
+            album_type: None,
+            release_date: None,
+            total_tracks: None,
+        })
+        .collect();
+    Json(out).into_response()
 }
 
 // ---- Lyrics (LRCLIB) -------------------------------------------------
@@ -4113,7 +5125,7 @@ fn lyrics_client() -> &'static reqwest::Client {
     LYRICS_CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
-            .user_agent("Beetbot/0.0 (personal music library; https://github.com/beetbot-app/beetbot)")
+            .user_agent("Beetbot/0.2 (personal music library; https://github.com/beetbot-app/beetbot)")
             .build()
             .unwrap_or_default()
     })
@@ -4274,12 +5286,19 @@ struct NeteaseResult {
     songs: Option<Vec<NeteaseSong>>,
 }
 #[derive(Deserialize)]
+struct NeteaseArtist {
+    #[serde(default)]
+    name: String,
+}
+#[derive(Deserialize)]
 struct NeteaseSong {
     id: i64,
     #[serde(default)]
     name: String,
     #[serde(default)]
     duration: i64,
+    #[serde(default)]
+    artists: Vec<NeteaseArtist>,
 }
 #[derive(Deserialize)]
 struct NeteaseLyricResp {
@@ -4297,6 +5316,31 @@ fn norm_title(s: &str) -> String {
         .filter(|c| c.is_alphanumeric())
         .flat_map(char::to_lowercase)
         .collect()
+}
+
+/// True when a NetEase search hit's artist overlaps the artist we asked for.
+/// NetEase's fuzzy search returns *other* artists' songs of the same title, and
+/// those often share the duration too — so title+duration alone let a different
+/// act's lyrics through (the "Foreplay" bug: 汉堡黄's song beat Jalen Santoy's on
+/// a one-second duration tiebreak). Confirming the artist keeps a same-title
+/// stranger out; a genuine no-match falls through to LRCLIB, which is itself
+/// artist-scoped, so we get correct-or-nothing rather than a wrong song.
+fn netease_artist_matches(query_artist: &str, song: &NeteaseSong) -> bool {
+    let q = norm_title(query_artist); // same alphanumeric-lowercase normaliser
+    if q.is_empty() {
+        return true; // nothing to check against → don't block
+    }
+    song.artists.iter().any(|a| {
+        let s = norm_title(&a.name);
+        if s.is_empty() {
+            return false;
+        }
+        // Substring either way handles "feat." / multi-artist joins ("Anyma &
+        // Chris Avantgarde" vs the two listed separately). Exact matches pass at
+        // any length; a substring needs the shorter side to be 3+ chars so a
+        // 1–2 char fragment can't spuriously match a longer name.
+        s == q || (s.len().min(q.len()) >= 3 && (q.contains(&s) || s.contains(&q)))
+    })
 }
 
 /// Drop NetEase's CJK credit lines ("作词 : …", "作曲 : …") that head Western LRCs
@@ -4355,6 +5399,9 @@ async fn fetch_netease(title: &str, artist: &str, duration_s: u32) -> Option<Lyr
     //    "(… Remix)" with brand-new verses over the same beat). Fix:
     //    (a) drop alternate renditions (remix/cover/…) unless the queried title is
     //        itself one;
+    //    (a2) require the ARTIST to match — NetEase returns a different act's
+    //        same-title song (see netease_artist_matches: the "Foreplay" bug,
+    //        where a stranger's track was one second closer in length);
     //    (b) prefer an EXACT normalized-title match over a loose overlap;
     //    (c) within a tier, take the duration-closest hit (or the first, if we
     //        don't know the length).
@@ -4373,7 +5420,7 @@ async fn fetch_netease(title: &str, artist: &str, duration_s: u32) -> Option<Lyr
     };
     let eligible: Vec<NeteaseSong> = songs
         .into_iter()
-        .filter(|s| dur_ok(s.duration) && !is_alt_version(&s.name))
+        .filter(|s| dur_ok(s.duration) && !is_alt_version(&s.name) && netease_artist_matches(artist, s))
         .collect();
     let mut exact: Vec<&NeteaseSong> = eligible
         .iter()
@@ -4813,9 +5860,9 @@ fn insert_local_playlist(
     let spotify_id = format!("local:{}", Uuid::new_v4());
     conn.execute(
         "INSERT INTO playlists
-             (spotify_id, name, owner, description, cover_url, snapshot_id,
+             (spotify_id, name, owner, description, cover_url,
               track_count, last_synced_at, profile_id)
-         VALUES (?1, ?2, 'You', ?3, NULL, 'local-v1', 0, NULL, ?4)",
+         VALUES (?1, ?2, 'You', ?3, NULL, 0, NULL, ?4)",
         params![spotify_id, name, description, profile_id],
     )?;
     let id = conn.query_row(
@@ -4839,9 +5886,9 @@ fn insert_album_playlist(
     let spotify_id = format!("album:{}", Uuid::new_v4());
     conn.execute(
         "INSERT INTO playlists
-             (spotify_id, name, owner, description, cover_url, snapshot_id,
+             (spotify_id, name, owner, description, cover_url,
               track_count, last_synced_at, profile_id)
-         VALUES (?1, ?2, ?3, NULL, NULL, 'local-v1', 0, NULL, ?4)",
+         VALUES (?1, ?2, ?3, NULL, NULL, 0, NULL, ?4)",
         params![spotify_id, name, artist, profile_id],
     )?;
     let id = conn.query_row(
@@ -4859,7 +5906,7 @@ fn insert_album_playlist(
 ///
 /// Dedup priority for the track row itself:
 ///   (a) Existing row with matching ISRC — typical when the same
-///       recording is already in a Spotify-mirrored playlist.
+///       recording is already in an imported playlist.
 ///   (b) Existing row with matching synthetic spotify_id like
 ///       `deezer:12345` — repeat add of the same Deezer track.
 ///   (c) Otherwise insert a fresh row.
@@ -5089,80 +6136,10 @@ fn upsert_track_and_link(
     playlist_id: i64,
     track: &CatalogTrackOut,
 ) -> Result<(i64, bool), rusqlite::Error> {
-    let synthetic_id = format!("{}:{}", track.source.trim(), track.source_id.trim());
-    let artists_json = serde_json::to_string(&track.artists).map_err(|e| {
-        rusqlite::Error::ToSqlConversionFailure(Box::new(e))
-    })?;
-
-    let by_isrc: Option<i64> = track.isrc.as_deref().and_then(|isrc| {
-        let trimmed = isrc.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            conn.query_row(
-                "SELECT id FROM tracks WHERE isrc = ?1",
-                params![trimmed],
-                |r| r.get::<_, i64>(0),
-            )
-            .ok()
-        }
-    });
-    let by_synth: Option<i64> = if by_isrc.is_none() {
-        conn.query_row(
-            "SELECT id FROM tracks WHERE spotify_id = ?1",
-            params![synthetic_id],
-            |r| r.get::<_, i64>(0),
-        )
-        .ok()
-    } else {
-        None
-    };
-
-    let track_id = if let Some(tid) = by_isrc.or(by_synth) {
-        // Refresh metadata in case the catalog has a better cover or
-        // newer title than what we have stored.
-        conn.execute(
-            "UPDATE tracks SET
-                 title = ?2,
-                 artists = ?3,
-                 album = COALESCE(?4, album),
-                 album_art_url = COALESCE(?5, album_art_url),
-                 duration_ms = ?6,
-                 isrc = COALESCE(?7, isrc),
-                 updated_at = strftime('%s','now')
-             WHERE id = ?1",
-            params![
-                tid,
-                track.title,
-                artists_json,
-                track.album,
-                track.album_art_url,
-                track.duration_ms,
-                track.isrc,
-            ],
-        )?;
-        tid
-    } else {
-        conn.execute(
-            "INSERT INTO tracks
-                 (spotify_id, title, artists, album, album_art_url, duration_ms, isrc)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                synthetic_id,
-                track.title,
-                artists_json,
-                track.album,
-                track.album_art_url,
-                track.duration_ms,
-                track.isrc,
-            ],
-        )?;
-        conn.query_row(
-            "SELECT id FROM tracks WHERE spotify_id = ?1",
-            params![synthetic_id],
-            |r| r.get::<_, i64>(0),
-        )?
-    };
+    // Find-or-refresh-or-insert the track row (ISRC-first dedup, metadata
+    // refresh on hit); the bool is "new track row", which we don't need here —
+    // this fn's own bool means "new playlist LINK".
+    let (track_id, _) = upsert_track(conn, track)?;
 
     // Append to playlist_tracks unless already linked.
     let already = conn
@@ -5186,8 +6163,8 @@ fn upsert_track_and_link(
         .unwrap_or(0);
     conn.execute(
         "INSERT INTO playlist_tracks
-             (playlist_id, track_id, position, added_at, locally_added)
-         VALUES (?1, ?2, ?3, strftime('%s','now'), 1)",
+             (playlist_id, track_id, position, added_at)
+         VALUES (?1, ?2, ?3, strftime('%s','now'))",
         params![playlist_id, track_id, next_pos],
     )?;
     conn.execute(
@@ -5224,8 +6201,8 @@ fn liked_playlist_id(conn: &Connection, profile_id: Option<i64>) -> rusqlite::Re
         None => "liked:default".to_string(),
     };
     conn.execute(
-        "INSERT INTO playlists (spotify_id, name, snapshot_id, track_count, profile_id)
-         VALUES (?1, 'Favorites', 'local', 0, ?2)",
+        "INSERT INTO playlists (spotify_id, name, track_count, profile_id)
+         VALUES (?1, 'Favorites', 0, ?2)",
         params![sid, profile_id],
     )?;
     conn.query_row(
@@ -5290,8 +6267,8 @@ async fn like_track(
             )
             .unwrap_or(0);
         let _ = conn.execute(
-            "INSERT INTO playlist_tracks (playlist_id, track_id, position, added_at, locally_added)
-             VALUES (?1, ?2, ?3, strftime('%s','now'), 1)",
+            "INSERT INTO playlist_tracks (playlist_id, track_id, position, added_at)
+             VALUES (?1, ?2, ?3, strftime('%s','now'))",
             params![pid, id, next_pos],
         );
         let _ = conn.execute(
@@ -5499,6 +6476,37 @@ struct StatArtist {
     count: i64,
 }
 
+/// The Stats screen's "Top songs": your most-played tracks within the `since`
+/// window, **skips excluded** (ranked and counted by [`REAL_PLAY`], so a song
+/// you kept skipping past can't outrank one you actually finished). Extracted
+/// from `get_stats` so it's unit-testable against a seeded DB.
+fn stat_top_tracks(conn: &Connection, pid: Option<i64>, since: i64, limit: i64) -> Vec<StatTrack> {
+    conn.prepare(&format!(
+        "SELECT t.id, t.title, t.artists, t.album, t.album_art_url, t.duration_ms,
+                (t.local_path IS NOT NULL AND t.local_path <> '') AS has_audio, SUM({REAL_PLAY}) c
+         FROM play_events pe JOIN tracks t ON t.id = pe.track_id
+         WHERE (pe.profile_id IS ?1) AND pe.played_at >= ?2
+         GROUP BY t.id HAVING c > 0 ORDER BY c DESC, MAX(pe.played_at) DESC LIMIT ?3"
+    ))
+    .and_then(|mut stmt| {
+        stmt.query_map(params![pid, since, limit], |r| {
+            let artists_json: String = r.get(2)?;
+            Ok(StatTrack {
+                track_id: r.get(0)?,
+                title: r.get(1)?,
+                artists: serde_json::from_str(&artists_json).unwrap_or_default(),
+                album: r.get(3)?,
+                album_art_url: r.get(4)?,
+                duration_ms: r.get(5)?,
+                has_audio: r.get(6)?,
+                count: r.get(7)?,
+            })
+        })
+        .map(|rows| rows.filter_map(|x| x.ok()).collect())
+    })
+    .unwrap_or_default()
+}
+
 /// GET /api/stats — listening totals + top tracks/artists for a profile over
 /// an optional time window. All computed locally from play_events.
 async fn get_stats(
@@ -5520,11 +6528,16 @@ async fn get_stats(
     let since = q.since.unwrap_or(0);
     let conn = state.db.lock().expect("db mutex poisoned");
 
+    // Skips don't count anywhere on this screen: a play (and the minutes it
+    // adds) only lands if it wasn't skipped — the same discount Home applies.
     let (total_plays, total_ms): (i64, i64) = conn
         .query_row(
-            "SELECT COUNT(*), COALESCE(SUM(t.duration_ms), 0)
-             FROM play_events pe JOIN tracks t ON t.id = pe.track_id
-             WHERE (pe.profile_id IS ?1) AND pe.played_at >= ?2",
+            &format!(
+                "SELECT COALESCE(SUM({REAL_PLAY}), 0),
+                        COALESCE(SUM({REAL_PLAY} * t.duration_ms), 0)
+                 FROM play_events pe JOIN tracks t ON t.id = pe.track_id
+                 WHERE (pe.profile_id IS ?1) AND pe.played_at >= ?2"
+            ),
             params![pid, since],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
@@ -5532,46 +6545,26 @@ async fn get_stats(
 
     let unique_artists: i64 = conn
         .query_row(
-            "SELECT COUNT(DISTINCT je.value)
-             FROM play_events pe JOIN tracks t ON t.id = pe.track_id, json_each(t.artists) je
-             WHERE (pe.profile_id IS ?1) AND pe.played_at >= ?2",
+            &format!(
+                "SELECT COUNT(DISTINCT je.value)
+                 FROM play_events pe JOIN tracks t ON t.id = pe.track_id, json_each(t.artists) je
+                 WHERE (pe.profile_id IS ?1) AND pe.played_at >= ?2 AND {REAL_PLAY} = 1"
+            ),
             params![pid, since],
             |r| r.get(0),
         )
         .unwrap_or(0);
 
-    let top_tracks: Vec<StatTrack> = conn
-        .prepare(
-            "SELECT t.id, t.title, t.artists, t.album, t.album_art_url, t.duration_ms,
-                    (t.local_path IS NOT NULL AND t.local_path <> '') AS has_audio, COUNT(*) c
-             FROM play_events pe JOIN tracks t ON t.id = pe.track_id
-             WHERE (pe.profile_id IS ?1) AND pe.played_at >= ?2
-             GROUP BY t.id ORDER BY c DESC, MAX(pe.played_at) DESC LIMIT 25",
-        )
-        .and_then(|mut stmt| {
-            stmt.query_map(params![pid, since], |r| {
-                let artists_json: String = r.get(2)?;
-                Ok(StatTrack {
-                    track_id: r.get(0)?,
-                    title: r.get(1)?,
-                    artists: serde_json::from_str(&artists_json).unwrap_or_default(),
-                    album: r.get(3)?,
-                    album_art_url: r.get(4)?,
-                    duration_ms: r.get(5)?,
-                    has_audio: r.get(6)?,
-                    count: r.get(7)?,
-                })
-            })
-            .map(|rows| rows.filter_map(|x| x.ok()).collect())
-        })
-        .unwrap_or_default();
+    let top_tracks = stat_top_tracks(&conn, pid, since, 25);
 
     let top_artists: Vec<StatArtist> = conn
         .prepare(
-            "SELECT je.value AS artist, COUNT(*) c
+            &format!(
+            "SELECT je.value AS artist, SUM({REAL_PLAY}) c
              FROM play_events pe JOIN tracks t ON t.id = pe.track_id, json_each(t.artists) je
              WHERE (pe.profile_id IS ?1) AND pe.played_at >= ?2
-             GROUP BY je.value ORDER BY c DESC, artist ASC LIMIT 25",
+             GROUP BY je.value HAVING c > 0 ORDER BY c DESC, artist ASC LIMIT 25"
+            ),
         )
         .and_then(|mut stmt| {
             stmt.query_map(params![pid, since], |r| {
@@ -5683,6 +6676,18 @@ enum ShelfIntent {
     Editorial,
 }
 
+/// One card in a heterogeneous `mixed_row` shelf. Wrapper-tagged so serde emits
+/// e.g. `{"type":"artist","artist":{…}}` — a shape the client maps straight onto
+/// its existing artist / album / playlist cards. Reuses the homogeneous output
+/// structs verbatim (all already `Serialize + Clone`).
+#[derive(Serialize, Clone)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum MixedItem {
+    Artist { artist: SearchArtistOut },
+    Album { album: SearchAlbumOut },
+    Playlist { playlist: PlaylistOut },
+}
+
 #[derive(Serialize, Clone)]
 struct HomeShelf {
     /// Render hint for the client. One of:
@@ -5691,6 +6696,7 @@ struct HomeShelf {
     /// - "stat_row"     -> `stat_tracks` (LOCAL library tracks, play locally)
     /// - "artist_row"   -> `artists` (resolved catalog artists, tap opens artist)
     /// - "playlist_row" -> `playlists` (catalog editorial playlists, tap opens)
+    /// - "mixed_row"    -> `items` (ordered heterogeneous artist/album/playlist)
     kind: String,
     title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5705,6 +6711,15 @@ struct HomeShelf {
     artists: Vec<SearchArtistOut>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     playlists: Vec<PlaylistOut>,
+    /// "mixed_row" payload — an ordered, heterogeneous list of artist/album/
+    /// playlist cards (Spotify's "More like {X}" blend). Empty (omitted) for every
+    /// other kind, so an older bundled client never sees an unexpected field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    items: Vec<MixedItem>,
+    /// Optional round thumbnail for the shelf HEADER (the seed artist's photo on a
+    /// "More like {X}" mixed row, matching Spotify). Omitted for normal shelves.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed_art: Option<String>,
     /// Client display hint. `Some("rail")` → render as a "Made for you" portrait
     /// tile in the rail instead of a shelf row (the mixes); `Some("spotlight")` →
     /// render as the mid-feed full-width band. Omitted for normal rows — so an
@@ -5750,6 +6765,8 @@ impl HomeShelf {
             stat_tracks: vec![],
             artists: vec![],
             playlists: vec![],
+            items: vec![],
+            seed_art: None,
             display: None,
             cadence: None,
             select: SelectPolicy::Ranked,
@@ -5773,6 +6790,8 @@ impl HomeShelf {
             stat_tracks: vec![],
             artists: vec![],
             playlists: vec![],
+            items: vec![],
+            seed_art: None,
             display: None,
             cadence: None,
             select: SelectPolicy::Ranked,
@@ -5796,6 +6815,8 @@ impl HomeShelf {
             stat_tracks,
             artists: vec![],
             playlists: vec![],
+            items: vec![],
+            seed_art: None,
             display: None,
             cadence: None,
             select: SelectPolicy::Ranked,
@@ -5819,6 +6840,8 @@ impl HomeShelf {
             stat_tracks: vec![],
             artists,
             playlists: vec![],
+            items: vec![],
+            seed_art: None,
             display: None,
             cadence: None,
             select: SelectPolicy::Ranked,
@@ -5842,6 +6865,37 @@ impl HomeShelf {
             stat_tracks: vec![],
             artists: vec![],
             playlists,
+            items: vec![],
+            seed_art: None,
+            display: None,
+            cadence: None,
+            select: SelectPolicy::Ranked,
+            discovery: false,
+            intent: ShelfIntent::Familiar,
+            release_rank: 0,
+        }
+    }
+
+    /// A heterogeneous row (Spotify's "More like {X}"): an ordered blend of
+    /// artist / album / playlist cards carried in `items` rather than one of the
+    /// homogeneous vecs. `Ranked` (no per-visit rotation) — the builder already
+    /// picks the interleave; the daily seed rotates the whole row's seed artist.
+    fn mixed_row(
+        title: impl Into<String>,
+        eyebrow: Option<String>,
+        items: Vec<MixedItem>,
+    ) -> Self {
+        Self {
+            kind: "mixed_row".into(),
+            title: title.into(),
+            eyebrow,
+            tracks: vec![],
+            albums: vec![],
+            stat_tracks: vec![],
+            artists: vec![],
+            playlists: vec![],
+            items,
+            seed_art: None,
             display: None,
             cadence: None,
             select: SelectPolicy::Ranked,
@@ -5877,6 +6931,13 @@ impl HomeShelf {
     /// Set the rail tile's refresh-cadence caption (e.g. "New every Monday").
     fn cadence(mut self, c: &'static str) -> Self {
         self.cadence = Some(c);
+        self
+    }
+
+    /// Attach a round header thumbnail (the seed artist's photo on a mixed
+    /// "More like {X}" row).
+    fn seed_art(mut self, url: Option<String>) -> Self {
+        self.seed_art = url;
         self
     }
 }
@@ -6162,7 +7223,23 @@ fn arrange_shelves(external: Vec<HomeShelf>, seed: u64, weekday: chrono::Weekday
     } else {
         None
     };
-    let budget = TOTAL_MAX - usize::from(friday_lead.is_some());
+    // Guarantee Release Radar a slot on non-Fridays too (Fridays already promote
+    // it as the lead). Pull it out of the lane rotation so a busy per-visit
+    // rotation can never push it off the page when it has content; it keeps its
+    // "Release Radar" title and is dropped a couple of rows in below.
+    let radar_lead: Option<HomeShelf> = if friday_lead.is_some() {
+        None
+    } else {
+        external
+            .iter()
+            // release_rank 3 is Release Radar's rank (see build_external_shelves;
+            // new-for-you is 2, global new-releases is 1).
+            .position(|s| s.release_rank == 3)
+            .map(|i| external.remove(i))
+    };
+    let budget = TOTAL_MAX
+        - usize::from(friday_lead.is_some())
+        - usize::from(radar_lead.is_some());
 
     // Bucket by intent (preserving builder order — already quality/fatigue
     // ranked). Anything outside the known lanes passes through untouched.
@@ -6215,6 +7292,13 @@ fn arrange_shelves(external: Vec<HomeShelf>, seed: u64, weekday: chrono::Weekday
     if let Some(lead) = friday_lead {
         out.insert(0, lead);
     }
+    // Non-Friday: drop the guaranteed Release Radar a couple of rows in — below
+    // the lead personalized shelves, still well above the fold. Also before the
+    // spotlight pass so indices stay final.
+    if let Some(radar) = radar_lead {
+        let pos = out.len().min(2);
+        out.insert(pos, radar);
+    }
 
     // Spotlight (mid-feed band): promote exactly ONE eligible discovery track_row
     // per visit, chosen by the visit seed (salted so it doesn't lock-step with the
@@ -6254,6 +7338,19 @@ struct HomeOut {
     /// arrangement is always fresh. Omitted on older servers (client falls back).
     #[serde(skip_serializing_if = "Option::is_none")]
     discovery_age_secs: Option<u64>,
+    /// False when this profile has no play history yet, so the endless stations
+    /// have nothing to seed from (`station_seeds` would come back empty and the
+    /// station would build zero tracks). The client HIDES the station tiles
+    /// rather than offering a button that can only disappoint. Older clients
+    /// ignore the field and keep showing the tiles — their pre-existing
+    /// behaviour, not a regression.
+    station_ready: bool,
+    /// False only on a `fast=1` response: this feed is the cheap subset, painted
+    /// while the expensive shelves are still resolving. The client shows it
+    /// immediately and APPENDS the rest when the full response lands. Absent on
+    /// older servers → clients treat the feed as complete, which it is for them.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    partial: bool,
 }
 
 struct HomeCacheEntry {
@@ -6277,7 +7374,7 @@ fn home_cache()
 }
 
 /// MusicBrainz + ListenBrainz both require a descriptive User-Agent.
-const MB_LB_UA: &str = "Beetbot/1.0 ( personal-use music app )";
+const MB_LB_UA: &str = "Beetbot/0.2 ( personal-use music app )";
 /// The ListenBrainz Labs similar-artists algorithm enum (session-based,
 /// 5-year window). Validated against the live endpoint.
 const LB_SIMILAR_ALGO: &str =
@@ -6400,7 +7497,7 @@ async fn deezer_deep_cuts_parallel(
         set.spawn(async move {
             let _permit = sem.acquire_owned().await.ok()?;
             let client = crate::deezer::DeezerClient::new();
-            let a = client.search_artists(&name, 1).await.ok()?.into_iter().next()?;
+            let a = resolve_best_artist(&client, &name).await?;
             let top = client.get_artist_top(a.id, 5).await.ok()?;
             let pick = if top.len() >= 2 {
                 top.into_iter().nth(1)
@@ -6486,6 +7583,81 @@ fn top_played_artists(conn: &Connection, profile_id: Option<i64>, limit: i64) ->
     .unwrap_or_default()
 }
 
+/// Artist NAMES the user saved/followed (incl. onboarding picks), newest-first,
+/// from the `saved_artists` profile-KV the client writes (see src/lib/saved.ts).
+/// Best-effort: empty on missing / legacy / malformed JSON.
+fn saved_artist_names(conn: &Connection, profile_id: Option<i64>) -> Vec<String> {
+    let pid = profile_id.unwrap_or(0);
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT value FROM profile_kv WHERE profile_id = ?1 AND key = 'saved_artists'",
+            params![pid],
+            |r| r.get(0),
+        )
+        .ok();
+    let Some(raw) = raw else {
+        return Vec::new();
+    };
+    #[derive(Deserialize)]
+    struct Pick {
+        name: String,
+    }
+    serde_json::from_str::<Vec<Pick>>(&raw)
+        .map(|v| {
+            v.into_iter()
+                .map(|p| p.name)
+                .filter(|n| !n.trim().is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Coarse genre BUCKETS the user picked at onboarding (e.g. "Electronic"), from
+/// the `saved_genres` profile-KV the client writes (see src/lib/saved.ts). A flat
+/// JSON string array — no wrapper object, unlike `saved_artists`. Best-effort:
+/// empty on missing / legacy / malformed JSON. Labels are the same `GENRE_BUCKETS`
+/// vocabulary `top_genre_profile` and `bucket_to_deezer_genre` speak.
+fn saved_genre_buckets(conn: &Connection, profile_id: Option<i64>) -> Vec<String> {
+    let pid = profile_id.unwrap_or(0);
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT value FROM profile_kv WHERE profile_id = ?1 AND key = 'saved_genres'",
+            params![pid],
+            |r| r.get(0),
+        )
+        .ok();
+    let Some(raw) = raw else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Vec<String>>(&raw)
+        .map(|v| v.into_iter().filter(|g| !g.trim().is_empty()).collect())
+        .unwrap_or_default()
+}
+
+/// Onboarding-aware seed pool: the profile's top-played artists, topped up with
+/// their saved/onboarding picks while play history is too thin to fill a shelf.
+/// Same shape as `top_played_artists`, so discovery builders swap 1:1. The picks
+/// fade on their own once ≥ `MIN_SEEDS` real plays exist — established profiles
+/// take the early return and are seeded purely by what they play (no change).
+fn seed_artists(conn: &Connection, profile_id: Option<i64>, limit: i64) -> Vec<String> {
+    const MIN_SEEDS: usize = 3;
+    let mut pool = top_played_artists(conn, profile_id, limit);
+    if pool.len() >= MIN_SEEDS || pool.len() as i64 >= limit {
+        return pool;
+    }
+    let mut seen: std::collections::HashSet<String> =
+        pool.iter().map(|s| s.to_lowercase()).collect();
+    for name in saved_artist_names(conn, profile_id) {
+        if pool.len() as i64 >= limit {
+            break;
+        }
+        if seen.insert(name.to_lowercase()) {
+            pool.push(name);
+        }
+    }
+    pool
+}
+
 /// "Release Radar" — recent releases (last ~120 days) from the artists you
 /// actually PLAY (falling back to library footprint for thin-history users),
 /// as an album shelf. Parallel per-artist Deezer fan-out.
@@ -6494,26 +7666,30 @@ async fn build_release_radar(
     profile_id: Option<i64>,
     sem: ResolveLimiter,
 ) -> Option<HomeShelf> {
-    // Seed from play history first; only fall back to library footprint when the
-    // profile has no plays yet (so we surface new music from what you listen to,
-    // not what you saved-but-never-play).
+    // Seed from play history + onboarding picks (seed_artists), falling back to
+    // the library footprint only when even those are empty — so a fresh profile
+    // gets new releases from the artists it picked, not a generic global radar.
     let artists = {
-        let played = {
+        let seeds = {
             let conn = state.db.lock().expect("db mutex poisoned");
-            top_played_artists(&conn, profile_id, 12)
+            seed_artists(&conn, profile_id, 12)
         };
-        if played.is_empty() {
+        if seeds.is_empty() {
             top_library_artists(state, profile_id, 12)
         } else {
-            played
+            seeds
         }
     };
     if artists.is_empty() {
         return None;
     }
+    // Recency window for "new" releases. Widened from 120 → 180 days so a radar
+    // still fills for artists who release less often than weekly — the 120-day
+    // cut left profiles whose picks had nothing out in the last four months with
+    // an empty (hidden) radar.
     let cutoff: String = {
         let conn = state.db.lock().expect("db mutex poisoned");
-        conn.query_row("SELECT date('now','-120 days')", [], |r| r.get(0))
+        conn.query_row("SELECT date('now','-180 days')", [], |r| r.get(0))
             .unwrap_or_default()
     };
     let mut set = tokio::task::JoinSet::new();
@@ -6522,7 +7698,7 @@ async fn build_release_radar(
         set.spawn(async move {
             let _permit = sem.acquire_owned().await.ok()?;
             let client = crate::deezer::DeezerClient::new();
-            let a = client.search_artists(&name, 1).await.ok()?.into_iter().next()?;
+            let a = resolve_best_artist(&client, &name).await?;
             let albums = client.get_artist_albums(a.id).await.ok()?;
             Some((name, albums))
         });
@@ -6551,6 +7727,23 @@ async fn build_release_radar(
         return None;
     }
     albums.sort_by(|x, y| y.release_date.cmp(&x.release_date));
+    // Cap per artist BEFORE truncating to 15, or a prolific act crowds everyone
+    // out: an artist who releases a radio-show episode every week (A State of
+    // Trance ASOT 1286, 1285, 1284, …) has ~17 albums inside the 120-day window,
+    // and newest-first they fill all 15 slots. Keep the 2 newest per artist so the
+    // radar stays spread across the seed artists.
+    const PER_ARTIST: usize = 2;
+    let mut per_artist: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    albums.retain(|a| {
+        let akey = norm_artist(a.artists.first().map(String::as_str).unwrap_or(""));
+        let c = per_artist.entry(akey).or_insert(0);
+        if *c >= PER_ARTIST {
+            return false;
+        }
+        *c += 1;
+        true
+    });
     albums.truncate(15);
     // Ranked (newest-first is the point) but still a recommendation surface —
     // log impressions so fatigue (N3) can apply later.
@@ -6577,7 +7770,7 @@ async fn build_artist_mix(
     // your all-time #1, so "X Mix" changes day to day (and is stable within a day).
     let seed: String = {
         let conn = state.db.lock().expect("db mutex poisoned");
-        let pool = top_played_artists(&conn, profile_id, 16);
+        let pool = seed_artists(&conn, profile_id, 16);
         if pool.is_empty() {
             return None;
         }
@@ -6639,10 +7832,18 @@ async fn build_because_you_played(
             })
             .unwrap_or_default();
         // Recompute build_artist_mix's day seed so we don't collide with it.
-        let pool = top_played_artists(&conn, profile_id, 16);
+        let pool = seed_artists(&conn, profile_id, 16);
         let mix_seed = (!pool.is_empty()).then(|| pool[(day_seed % pool.len() as u64) as usize].clone());
         (recent, mix_seed)
     };
+    // Don't theme the whole feed around a single song: require at least two
+    // distinct recently-finished artists before this shelf appears. (A brand-new
+    // profile whose only play is the one track onboarding auto-starts would
+    // otherwise get a "Because you played {that artist}" row that crowds out the
+    // picks.)
+    if recent.len() < 2 {
+        return None;
+    }
     let candidates: Vec<String> = recent
         .into_iter()
         .filter(|a| Some(a) != mix_seed.as_ref())
@@ -6793,16 +7994,29 @@ async fn profile_kv_put_handler(
         return (StatusCode::BAD_REQUEST, "value must be JSON").into_response();
     }
     // A paired device writes only its own profile's KV, never another's.
-    let pid = match scoped_profile_id(&state, &headers, &addr, &q, pq.profile_id) {
-        Ok(p) => p.unwrap_or(0),
+    let scoped = match scoped_profile_id(&state, &headers, &addr, &q, pq.profile_id) {
+        Ok(p) => p,
         Err(r) => return r,
     };
-    let conn = state.db.lock().expect("db mutex poisoned");
-    let _ = conn.execute(
-        "INSERT INTO profile_kv (profile_id, key, value) VALUES (?1, ?2, ?3)
-         ON CONFLICT(profile_id, key) DO UPDATE SET value = excluded.value",
-        params![pid, kq.key, body],
-    );
+    let pid = scoped.unwrap_or(0);
+    {
+        let conn = state.db.lock().expect("db mutex poisoned");
+        let _ = conn.execute(
+            "INSERT INTO profile_kv (profile_id, key, value) VALUES (?1, ?2, ?3)
+             ON CONFLICT(profile_id, key) DO UPDATE SET value = excluded.value",
+            params![pid, kq.key, body],
+        );
+    }
+    // Onboarding picks change the Home seed pool, so drop this profile's cached
+    // feed — otherwise the (often empty/thin) build cached at first launch would
+    // keep serving for up to HOME_TTL and the picks wouldn't show until the next
+    // calendar day. The cache key's `.0` is the same scoped profile Option the
+    // home_handler keys on, so this targets exactly this profile's entries.
+    if kq.key == "saved_artists" || kq.key == "saved_genres" {
+        if let Ok(mut cache) = home_cache().lock() {
+            cache.retain(|(cache_pid, _), _| *cache_pid != scoped);
+        }
+    }
     (StatusCode::OK, "saved").into_response()
 }
 
@@ -6841,7 +8055,7 @@ async fn ban_artist_handler(
 /// to 5, so the station rotates day to day but is stable within a day. Pure so
 /// it's unit-testable.
 fn station_seeds(conn: &Connection, pid: Option<i64>, seed: u64) -> Vec<String> {
-    let top = top_played_artists(conn, pid, 8);
+    let top = seed_artists(conn, pid, 8);
     seeded_shuffle_take(top, seed, 5)
 }
 
@@ -6885,7 +8099,7 @@ fn station_cache() -> &'static Mutex<
 }
 
 /// Canonical cache key for a station mode. Derived from the RESOLVED
-/// (popularity, discovery-only) pair so any alias — including an unknown mode,
+/// (popularity, discovery-only) pair so any guests — including an unknown mode,
 /// which `station_mode` folds into the default — shares the correct cached list.
 fn station_cache_key(pop: PopMode, discovery_only: bool) -> &'static str {
     match (pop, discovery_only) {
@@ -6951,6 +8165,7 @@ async fn build_station(
 /// refill path.
 async fn station_handler(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Query(q): Query<TokenQuery>,
     Query(pq): Query<ProfileQuery>,
@@ -6959,7 +8174,14 @@ async fn station_handler(
     if let Err(r) = require_token(&state, &headers, &q) {
         return r;
     }
-    let pid = pq.profile_id;
+    // A station is built from play history and artist bans — the most personal
+    // signal there is. Scope it to the caller's OWN profile: a paired device
+    // asking for someone else's id would otherwise get a station derived from
+    // that person's listening.
+    let pid = match scoped_profile_id(&state, &headers, &addr, &q, pq.profile_id) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
     let (pop, discovery_only) = station_mode(sq.mode.as_deref());
     let mkey = station_cache_key(pop, discovery_only);
     let date = local_date_string();
@@ -7113,6 +8335,52 @@ fn fuse_rank(
     tracks
 }
 
+/// Weekly per-artist candidate cache (migration 023). Memoises the expensive
+/// `gather_candidates` fan-out per (normalised artist, ISO-week) so repeat builds
+/// within a week skip it; the ISO-week key turns the cache over every Monday.
+/// Returns the 4 source lists on a hit, or None on a miss / corrupt row.
+fn candidate_cache_get(
+    conn: &Connection,
+    artist_norm: &str,
+    iso_week: &str,
+) -> Option<[Vec<crate::deezer::TrackHit>; 4]> {
+    let json: String = conn
+        .query_row(
+            "SELECT candidates FROM artist_candidate_cache WHERE artist_norm = ?1 AND iso_week = ?2",
+            params![artist_norm, iso_week],
+            |r| r.get(0),
+        )
+        .ok()?;
+    serde_json::from_str(&json).ok()
+}
+
+/// Store a candidate set for (artist, ISO-week) and prune prior weeks so the
+/// table stays bounded to the current week. Best-effort: a serialise or write
+/// failure just means the next build refetches.
+fn candidate_cache_put(
+    conn: &Connection,
+    artist_norm: &str,
+    iso_week: &str,
+    candidates: &[Vec<crate::deezer::TrackHit>; 4],
+) {
+    let json = match serde_json::to_string(candidates) {
+        Ok(j) => j,
+        Err(_) => return,
+    };
+    let _ = conn.execute(
+        "INSERT OR REPLACE INTO artist_candidate_cache \
+         (artist_norm, iso_week, candidates, fetched_at) \
+         VALUES (?1, ?2, ?3, strftime('%s','now'))",
+        params![artist_norm, iso_week, json],
+    );
+    // Prior ISO-weeks are dead weight. Lexical compare is valid: "%G-W%V" is
+    // year-first and zero-padded, so "2026-W07" < "2026-W28" < "2027-W01".
+    let _ = conn.execute(
+        "DELETE FROM artist_candidate_cache WHERE iso_week < ?1",
+        params![iso_week],
+    );
+}
+
 /// Generate the four candidate SOURCE lists for ONE seed artist (song→song
 /// similars, Deezer smart-radio, artist-graph deep cuts, the seed's own top
 /// tracks). Mirrors `build_radio_similar`'s candidate generation, factored out so
@@ -7129,6 +8397,24 @@ async fn gather_candidates(
     Vec<crate::deezer::TrackHit>,
     Vec<crate::deezer::TrackHit>,
 ) {
+    // Weekly candidate cache (migration 023): only the exclude_title-less path
+    // (station + Home discovery) is memoisable — the radio-from-current-track
+    // path is per-track and skips the cache. Serve a fresh weekly hit; otherwise
+    // fall through to the fan-out and store the result for the rest of the week.
+    let cache_key: Option<(String, String)> = if exclude_title.is_none() {
+        Some((norm_artist(artist), local_iso_week()))
+    } else {
+        None
+    };
+    if let Some((an, wk)) = &cache_key {
+        let hit = {
+            let conn = state.db.lock().expect("db mutex poisoned");
+            candidate_cache_get(&conn, an, wk)
+        };
+        if let Some([a, b, c, d]) = hit {
+            return (a, b, c, d);
+        }
+    }
     let lastfm_key = read_lastfm_key(state);
     let lastfm_artist_key = lastfm_key.clone();
     let lastfm_fut = async move {
@@ -7162,12 +8448,7 @@ async fn gather_candidates(
     let seed_fut = async move {
         let _permit = seed_sem.acquire_owned().await.ok()?;
         let client = crate::deezer::DeezerClient::new();
-        let a = client
-            .search_artists(&seed_for_top, 1)
-            .await
-            .ok()?
-            .into_iter()
-            .next()?;
+        let a = resolve_best_artist(&client, &seed_for_top).await?;
         let (own_top, radio, related) = tokio::join!(
             client.get_artist_top(a.id, 6),
             client.get_artist_radio(a.id),
@@ -7206,6 +8487,18 @@ async fn gather_candidates(
         deezer_deep_cuts_parallel(sim_names, sem),
     );
     let deep: Vec<crate::deezer::TrackHit> = sim_picks.into_iter().flatten().collect();
+    // Store for the rest of the ISO-week — but only a NON-EMPTY result, so a
+    // transient all-miss (rate-limit / network blip) isn't frozen as this
+    // artist's answer for the week (mirrors the MBID cache's "only cache a
+    // definitive result" rule). Prior weeks are pruned inside the put.
+    let out = [track_hits, radio_tracks, deep, own_top];
+    if let Some((an, wk)) = &cache_key {
+        if out.iter().any(|v| !v.is_empty()) {
+            let conn = state.db.lock().expect("db mutex poisoned");
+            candidate_cache_put(&conn, an, wk, &out);
+        }
+    }
+    let [track_hits, radio_tracks, deep, own_top] = out;
     (track_hits, radio_tracks, deep, own_top)
 }
 
@@ -7342,12 +8635,7 @@ async fn build_radio_similar(
     let seed_fut = async move {
         let _permit = seed_sem.acquire_owned().await.ok()?;
         let client = crate::deezer::DeezerClient::new();
-        let a = client
-            .search_artists(&seed_for_top, 1)
-            .await
-            .ok()?
-            .into_iter()
-            .next()?;
+        let a = resolve_best_artist(&client, &seed_for_top).await?;
         let (own_top, radio, related) = tokio::join!(
             client.get_artist_top(a.id, 6),
             client.get_artist_radio(a.id),
@@ -7483,8 +8771,40 @@ async fn build_radio_similar(
     {
         let conn = state.db.lock().expect("db mutex poisoned");
         let _ = annotate_with_library_state(&conn, &mut tracks, profile_id);
+        // Autoplay shouldn't queue a track a prior match already found no source
+        // for — it would only 404-skip when it comes up. annotate_with_library_state
+        // just linked each candidate to its local row (if any); drop the ones
+        // recorded as `failed`.
+        drop_unavailable(&conn, &mut tracks);
     }
     tracks
+}
+
+/// Remove radio/autoplay candidates whose already-known local row is `failed`:
+/// a match previously found no streamable source, so queueing it again only
+/// produces a silent skip. Best-effort — relies on `annotate_with_library_state`
+/// having populated `local_track_id`; an un-linked candidate is left in.
+fn drop_unavailable(conn: &Connection, tracks: &mut Vec<CatalogTrackOut>) {
+    let ids: Vec<i64> = tracks.iter().filter_map(|t| t.local_track_id).collect();
+    if ids.is_empty() {
+        return;
+    }
+    let placeholders = std::iter::repeat("?")
+        .take(ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!("SELECT id FROM tracks WHERE status = 'failed' AND id IN ({placeholders})");
+    let failed: std::collections::HashSet<i64> = conn
+        .prepare(&sql)
+        .and_then(|mut s| {
+            s.query_map(rusqlite::params_from_iter(ids.iter()), |r| r.get::<_, i64>(0))
+                .map(|rows| rows.filter_map(Result::ok).collect())
+        })
+        .unwrap_or_default();
+    if failed.is_empty() {
+        return;
+    }
+    tracks.retain(|t| t.local_track_id.map_or(true, |id| !failed.contains(&id)));
 }
 
 /// GET /api/radio/similar?artist=<name>&title=<current>&limit=30
@@ -7493,6 +8813,7 @@ async fn build_radio_similar(
 /// the player can keep the queue flowing when it runs dry (and repeat is off).
 async fn get_radio_similar(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Query(q): Query<TokenQuery>,
     Query(pq): Query<ProfileQuery>,
@@ -7501,6 +8822,12 @@ async fn get_radio_similar(
     if let Err(r) = require_token(&state, &headers, &q) {
         return r;
     }
+    // The radio filters against the caller's own library/bans — scope it, or a
+    // paired device could shape a radio around someone else's profile.
+    let scoped_pid = match scoped_profile_id(&state, &headers, &addr, &q, pq.profile_id) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
     let artist = rp.artist.trim();
     if artist.is_empty() {
         return (StatusCode::BAD_REQUEST, "artist is required").into_response();
@@ -7508,7 +8835,7 @@ async fn get_radio_similar(
     let limit = rp.limit.unwrap_or(30).clamp(1, 50);
     let sem = resolve_limiter();
     let tracks =
-        build_radio_similar(&state, artist, rp.title.as_deref(), limit, pq.profile_id, sem).await;
+        build_radio_similar(&state, artist, rp.title.as_deref(), limit, scoped_pid, sem).await;
     Json(tracks).into_response()
 }
 
@@ -7528,7 +8855,7 @@ async fn build_more_like_favorites(
     // a broader, more current slice of your taste instead of the frozen top-8.
     let seeds = {
         let conn = state.db.lock().expect("db mutex poisoned");
-        top_played_artists(&conn, profile_id, 16)
+        seed_artists(&conn, profile_id, 16)
     };
     if seeds.is_empty() {
         return None;
@@ -7601,7 +8928,7 @@ async fn build_weekly_finds(
     }
     let mut seeds = {
         let conn = state.db.lock().expect("db mutex poisoned");
-        top_played_artists(&conn, profile_id, 16)
+        seed_artists(&conn, profile_id, 16)
     };
     if seeds.len() < 3 {
         return None;
@@ -7689,10 +9016,19 @@ const STAT_COLS: &str = "t.id, t.title, t.artists, t.album, t.album_art_url, t.d
 ///   • completed = 1 (heard ≥85%)          → 1.5  (strong positive)
 ///   • ms_played > 0 but not completed      → 0.25 (a real skip — you bailed early)
 ///   • ms_played = 0 (legacy / pre-Phase-0) → 1.0  (neutral; historical counts intact)
-/// Requires the play_events table aliased as `pe`. Used as `SUM(<PLAY_WEIGHT>)` in
+/// Requires the play_events table guestsed as `pe`. Used as `SUM(<PLAY_WEIGHT>)` in
 /// the ORDER BY of taste rankings; the displayed `COUNT(*)` is left untouched.
 const PLAY_WEIGHT: &str =
     "(CASE WHEN pe.completed = 1 THEN 1.5 WHEN pe.ms_played > 0 THEN 0.25 ELSE 1.0 END)";
+
+/// A "real" play for stats leaderboards (the Spotify model — a stream only
+/// counts once you're past the skip): a completed listen (`completed = 1`), OR
+/// a legacy untracked play (`ms_played = 0`, recorded before completion
+/// tracking existed). A SKIP — started but abandoned (`ms_played > 0` and NOT
+/// completed) — counts 0, matching how `PLAY_WEIGHT` discounts it. `SUM`ming
+/// this gives a play count you can trust: "songs you actually listened to".
+/// Usable in any query that joins play_events as `pe`.
+const REAL_PLAY: &str = "(CASE WHEN pe.completed = 1 OR pe.ms_played = 0 THEN 1 ELSE 0 END)";
 
 /// Recency multiplier on a play's weight (N2). All-time SUM(weight) ranking
 /// freezes the seed pool for established listeners — the same handful of
@@ -7701,7 +9037,7 @@ const PLAY_WEIGHT: &str =
 /// your taste as it moves, while long-tail history still contributes (older
 /// plays keep weight 1.0, so a long-time favorite doesn't fall out). Reads
 /// `pe.played_at` (epoch secs) against the SQLite clock, matching PLAY_WEIGHT's
-/// `pe` alias — usable in any query that joins play_events as `pe`.
+/// `pe` guests — usable in any query that joins play_events as `pe`.
 const RECENCY_BOOST: &str = "(CASE
     WHEN pe.played_at >= strftime('%s','now','-30 days') THEN 3.0
     WHEN pe.played_at >= strftime('%s','now','-90 days') THEN 1.5
@@ -8106,6 +9442,46 @@ fn artist_hit_to_out(a: crate::deezer::ArtistHit) -> SearchArtistOut {
     }
 }
 
+/// Pick the artist a name most likely refers to, from a Deezer search list.
+/// Deezer ranks `/search/artist` by RELEVANCE, not popularity, and its index is
+/// full of same-name impostors, tributes, and portrait-less phantom credits — so
+/// a search for "Drake" can return a 50-fan "Drake" (or "Marshmello & Omar LinX"
+/// for "Marshmello") ahead of the real act. Taking result [0] caches the wrong,
+/// often photo-less, entity. Prefer, in one pass: exact-name match WITH a photo
+/// and the most fans; then any exact-name match by fans; then any result with a
+/// photo by fans; finally the first. Mirrors `pickArtistForName` on the client.
+///
+/// Every name→artist resolution goes through this so the picked artist (and thus
+/// the portrait, id, radio, and related seeds) is consistent everywhere.
+fn pick_artist_for_name(
+    hits: Vec<crate::deezer::ArtistHit>,
+    name: &str,
+) -> Option<crate::deezer::ArtistHit> {
+    let want = name.trim().to_lowercase();
+    hits.into_iter().max_by_key(|a| {
+        let exact = a.name.trim().to_lowercase() == want;
+        let has_photo = a.best_picture().is_some();
+        // Tiers compare before fans (tuple order): exact+photo > exact > photo > none.
+        let tier: u8 = match (exact, has_photo) {
+            (true, true) => 3,
+            (true, false) => 2,
+            (false, true) => 1,
+            (false, false) => 0,
+        };
+        (tier, a.nb_fan.unwrap_or(0))
+    })
+}
+
+/// Resolve one artist name to its best-matching catalog artist (see
+/// `pick_artist_for_name`). Searches a WIDE window, not just the top hit.
+async fn resolve_best_artist(
+    client: &crate::deezer::DeezerClient,
+    name: &str,
+) -> Option<crate::deezer::ArtistHit> {
+    let hits = client.search_artists(name, 8).await.ok()?;
+    pick_artist_for_name(hits, name)
+}
+
 /// Resolve artist NAMES to catalog artists (photo + id) via Deezer, in PARALLEL
 /// (bounded by the shared limiter), preserving input order; drops unresolved.
 async fn deezer_resolve_artists_parallel(
@@ -8119,7 +9495,7 @@ async fn deezer_resolve_artists_parallel(
         set.spawn(async move {
             let _permit = sem.acquire_owned().await.ok()?;
             let client = crate::deezer::DeezerClient::new();
-            let a = client.search_artists(&name, 1).await.ok()?.into_iter().next()?;
+            let a = resolve_best_artist(&client, &name).await?;
             Some((i, artist_hit_to_out(a)))
         });
     }
@@ -8138,17 +9514,12 @@ async fn build_top_artists(
     pid: Option<i64>,
     sem: ResolveLimiter,
 ) -> Option<HomeShelf> {
+    // seed_artists = most-played artists, topped up with onboarding picks while
+    // history is thin — so a fresh profile shows the artists it just picked here
+    // instead of an empty (or lone auto-played) row.
     let names: Vec<String> = {
         let conn = state.db.lock().expect("db mutex poisoned");
-        conn.prepare(&format!(
-            "SELECT je.value FROM play_events pe JOIN tracks t ON t.id = pe.track_id, json_each(t.artists) je
-             WHERE (pe.profile_id IS ?1) GROUP BY je.value ORDER BY SUM({PLAY_WEIGHT}) DESC, je.value ASC LIMIT 12"
-        ))
-        .and_then(|mut s| {
-            s.query_map(params![pid], |r| r.get::<_, String>(0))
-                .map(|rows| rows.filter_map(|x| x.ok()).collect())
-        })
-        .unwrap_or_default()
+        seed_artists(&conn, pid, 12)
     };
     if names.is_empty() {
         return None;
@@ -8171,7 +9542,7 @@ async fn build_more_like_artist(
     // related list forever.
     let seed: String = {
         let conn = state.db.lock().expect("db mutex poisoned");
-        let pool = top_played_artists(&conn, pid, 6);
+        let pool = seed_artists(&conn, pid, 6);
         if pool.is_empty() {
             return None;
         }
@@ -8180,7 +9551,7 @@ async fn build_more_like_artist(
     };
     let _permit = sem.acquire_owned().await.ok()?;
     let client = crate::deezer::DeezerClient::new();
-    let a = client.search_artists(&seed, 1).await.ok()?.into_iter().next()?;
+    let a = resolve_best_artist(&client, &seed).await?;
     let related = client.get_artist_related(a.id).await.ok()?;
     // Filter out the seed itself AND artists already in the library — this is a
     // DISCOVERY shelf, so recommending names you already own defeats the point.
@@ -8201,6 +9572,191 @@ async fn build_more_like_artist(
             .rotating(3, 12)
             .discovery()
     })
+}
+
+/// "More like [artist]" as a MIXED row (Spotify-style): related artists blended
+/// with albums BY those neighbors and one on-seed playlist — genuine discovery,
+/// NOT the seed's own catalog (which the user, having played the seed, likely
+/// already owns). Seeded on a most-played artist DISTINCT from
+/// `build_more_like_artist`'s pick — they share the "More like {X}" title, so the
+/// same seed would render two near-identical rows. Keyless (Deezer).
+async fn build_more_like_mixed(
+    state: &AppState,
+    pid: Option<i64>,
+    sem: ResolveLimiter,
+    day_seed: u64,
+) -> Option<HomeShelf> {
+    // Salt distinct from build_more_like_artist (0x5DEECE66D) and build_artist_mix
+    // (unsalted). Recompute those two sibling picks and skip them, so we never
+    // emit a second "More like {same artist}" or clash with the "{Artist} Mix".
+    const MIXED_SALT: u64 = 0x9E3779B97F4A7C15;
+    let candidates: Vec<String> = {
+        let conn = state.db.lock().expect("db mutex poisoned");
+        let pool = seed_artists(&conn, pid, 8);
+        if pool.is_empty() {
+            return None;
+        }
+        let p6 = seed_artists(&conn, pid, 6);
+        let p16 = seed_artists(&conn, pid, 16);
+        let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if !p6.is_empty() {
+            taken.insert(norm_artist(&p6[((day_seed ^ 0x5DEECE66D) % p6.len() as u64) as usize]));
+        }
+        if !p16.is_empty() {
+            taken.insert(norm_artist(&p16[(day_seed % p16.len() as u64) as usize]));
+        }
+        let start = ((day_seed ^ MIXED_SALT) % pool.len() as u64) as usize;
+        (0..pool.len())
+            .map(|k| pool[(start + k) % pool.len()].clone())
+            .filter(|n| !taken.contains(&norm_artist(n)))
+            .collect()
+    };
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let _permit = sem.acquire_owned().await.ok()?;
+    let client = crate::deezer::DeezerClient::new();
+    let lib = library_artist_names(state, pid);
+
+    // Walk the day's candidate seeds until one yields a genuinely mixed row. Its
+    // gates (≥3 related AND ≥1 non-artist card) are stricter than
+    // build_more_like_artist's, so a single seed no-shows more often; retrying
+    // avoids a day-locked empty slot. Bounded so a barren pool doesn't fan out.
+    for seed in candidates.into_iter().take(4) {
+        if let Some(shelf) = more_like_mixed_for_seed(&client, &seed, &lib).await {
+            return Some(shelf);
+        }
+    }
+    None
+}
+
+/// One seed attempt for `build_more_like_mixed`: related artists + the newest
+/// album from each of the top two neighbors + one title-matched on-seed playlist,
+/// interleaved. `None` unless it can be a genuine mixed row (≥3 related AND ≥1
+/// non-artist card).
+async fn more_like_mixed_for_seed(
+    client: &crate::deezer::DeezerClient,
+    seed: &str,
+    lib: &std::collections::HashSet<String>,
+) -> Option<HomeShelf> {
+    let a = resolve_best_artist(client, seed).await?;
+    let seed_norm = norm_artist(&a.name);
+    // Related artists, minus the seed + anything already owned — the backbone.
+    let related: Vec<crate::deezer::ArtistHit> = client
+        .get_artist_related(a.id)
+        .await
+        .ok()?
+        .into_iter()
+        .filter(|h| {
+            let n = norm_artist(&h.name);
+            n != seed_norm && !lib.contains(&n)
+        })
+        .collect();
+    if related.len() < 3 {
+        return None;
+    }
+    // Neighbor ids + names for the album slots (captured before `related` is
+    // consumed). Deezer's /artist/{id}/albums omits the per-album artist, so we
+    // stamp the neighbor's name back on for the album card's subtitle.
+    let n0 = related[0].id;
+    let name0 = related[0].name.clone();
+    let n1 = related.get(1).map(|h| h.id);
+    let name1 = related.get(1).map(|h| h.name.clone());
+    let artists: Vec<SearchArtistOut> =
+        related.into_iter().take(6).map(artist_hit_to_out).collect();
+
+    // Albums BY the top neighbors (real discovery, not the seed's own catalog)
+    // plus one on-seed playlist. Concurrent under the held permit.
+    let (a0, a1, pls) = tokio::join!(
+        client.get_artist_albums(n0),
+        async {
+            match n1 {
+                Some(id) => client.get_artist_albums(id).await.ok().unwrap_or_default(),
+                None => Vec::new(),
+            }
+        },
+        client.search_playlists(&a.name, 3),
+    );
+    // Each neighbor's newest full-length album, with the neighbor stamped as the
+    // artist when the artist-scoped album list left it blank.
+    let newest = |hits: Vec<crate::deezer::AlbumHit>, who: &str| -> Option<SearchAlbumOut> {
+        let mut v: Vec<crate::deezer::AlbumHit> = hits
+            .into_iter()
+            .filter(|al| al.record_type.as_deref() == Some("album"))
+            .collect();
+        v.sort_by(|x, y| y.release_date.cmp(&x.release_date));
+        v.into_iter().next().map(|al| {
+            let mut out = album_hit_to_out(al);
+            if out.artists.is_empty() {
+                out.artists = vec![who.to_string()];
+            }
+            out
+        })
+    };
+    let alb0 = newest(a0.ok().unwrap_or_default(), &name0);
+    let alb1 = match name1 {
+        Some(n) => newest(a1, &n),
+        None => None,
+    };
+    let mut albums: Vec<SearchAlbumOut> = Vec::new();
+    let mut seen_alb: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for al in [alb0, alb1].into_iter().flatten() {
+        if seen_alb.insert(al.source_id.clone()) {
+            albums.push(al);
+        }
+    }
+
+    // One playlist whose title actually references the seed (drops junk name
+    // hits, e.g. "Air" → "Fresh Air").
+    let seed_lc = a.name.to_lowercase();
+    let playlist: Option<PlaylistOut> = pls
+        .unwrap_or_default()
+        .into_iter()
+        .find(|p| p.title.to_lowercase().contains(&seed_lc))
+        .map(playlist_hit_to_out);
+
+    // Must have ≥1 non-artist card, else it's just an artist row (which
+    // build_more_like_artist already covers).
+    if albums.is_empty() && playlist.is_none() {
+        return None;
+    }
+
+    // Front-loaded on the strongest signal (related artists), matching Spotify's
+    // "More like" ratio: [artist, artist, album, artist, playlist, artist, album,
+    // artist], skipping any slot whose source ran dry.
+    let mut ai = artists.into_iter();
+    let mut li = albums.into_iter();
+    let mut pi = playlist.into_iter();
+    let mut items: Vec<MixedItem> = Vec::new();
+    for slot in [b'A', b'A', b'L', b'A', b'P', b'A', b'L', b'A'] {
+        match slot {
+            b'A' => {
+                if let Some(x) = ai.next() {
+                    items.push(MixedItem::Artist { artist: x });
+                }
+            }
+            b'L' => {
+                if let Some(x) = li.next() {
+                    items.push(MixedItem::Album { album: x });
+                }
+            }
+            _ => {
+                if let Some(x) = pi.next() {
+                    items.push(MixedItem::Playlist { playlist: x });
+                }
+            }
+        }
+    }
+    items.extend(ai.map(|x| MixedItem::Artist { artist: x })); // any leftover artists
+
+    // Title = just the artist; "More like" rides the eyebrow so the header reads
+    // as Spotify's does (small "More like" over the big name, beside the photo).
+    Some(
+        HomeShelf::mixed_row(a.name.clone(), Some("More like".into()), items)
+            .seed_art(a.best_picture())
+            .discovery(),
+    )
 }
 
 /// "New releases" — Deezer's editorial album feed (global, not personalized).
@@ -8241,7 +9797,7 @@ const GENERIC_TAGS: &[&str] = &[
 /// most-dominant first, skipping over-generic tags. Pure (`&Connection`) so it's
 /// unit-testable.
 fn dominant_tags(conn: &Connection, profile_id: Option<i64>, n_artists: i64) -> Vec<String> {
-    let artists = top_played_artists(conn, profile_id, n_artists);
+    let artists = seed_artists(conn, profile_id, n_artists);
     let mut weights: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     for name in &artists {
         let key = crate::tags::artist_key(name);
@@ -8343,22 +9899,40 @@ async fn build_tag_shelf(
 }
 
 /// The profile's top genre buckets by completion-weighted play history (the same
-/// coarse buckets the genre mixes use). Deterministic — the `genre` tie-break
-/// gives a total order when weighted sums tie. Picks which editorial content to
-/// surface on Home.
+/// coarse buckets the genre mixes use), topped up with the profile's onboarding
+/// GENRE picks while history is too thin to fill the editorial shelves. Mirrors
+/// `seed_artists`: the picks fade on their own once ≥ `MIN_GENRE_SEEDS` real
+/// history buckets exist, so an established profile is unaffected. Deterministic —
+/// the `genre` tie-break gives a total order when weighted sums tie.
 fn top_genre_profile(conn: &Connection, pid: Option<i64>, limit: i64) -> Vec<String> {
-    conn.prepare(&format!(
-        "SELECT t.genre
-         FROM play_events pe JOIN tracks t ON t.id = pe.track_id
-         WHERE (pe.profile_id IS ?1) AND t.genre IS NOT NULL AND t.genre <> 'Unknown'
-         GROUP BY t.genre HAVING COUNT(DISTINCT t.id) >= 8
-         ORDER BY SUM({PLAY_WEIGHT}) DESC, t.genre ASC LIMIT ?2"
-    ))
-    .and_then(|mut s| {
-        s.query_map(params![pid, limit], |r| r.get::<_, String>(0))
-            .map(|rows| rows.filter_map(|x| x.ok()).collect())
-    })
-    .unwrap_or_default()
+    const MIN_GENRE_SEEDS: usize = 2;
+    let mut played: Vec<String> = conn
+        .prepare(&format!(
+            "SELECT t.genre
+             FROM play_events pe JOIN tracks t ON t.id = pe.track_id
+             WHERE (pe.profile_id IS ?1) AND t.genre IS NOT NULL AND t.genre <> 'Unknown'
+             GROUP BY t.genre HAVING COUNT(DISTINCT t.id) >= 8
+             ORDER BY SUM({PLAY_WEIGHT}) DESC, t.genre ASC LIMIT ?2"
+        ))
+        .and_then(|mut s| {
+            s.query_map(params![pid, limit], |r| r.get::<_, String>(0))
+                .map(|rows| rows.filter_map(|x| x.ok()).collect())
+        })
+        .unwrap_or_default();
+    if played.len() >= MIN_GENRE_SEEDS || played.len() as i64 >= limit {
+        return played;
+    }
+    let mut seen: std::collections::HashSet<String> =
+        played.iter().map(|g| g.to_lowercase()).collect();
+    for bucket in saved_genre_buckets(conn, pid) {
+        if played.len() as i64 >= limit {
+            break;
+        }
+        if seen.insert(bucket.to_lowercase()) {
+            played.push(bucket);
+        }
+    }
+    played
 }
 
 /// Map one of our coarse genre buckets to a stable catalog editorial-genre id.
@@ -8379,6 +9953,59 @@ fn bucket_to_deezer_genre(bucket: &str) -> Option<i64> {
         "Electronic" => 113,
         _ => return None, // Folk + anything unmapped → skip
     })
+}
+
+/// Cold-start Home (a profile that skipped onboarding): shelves built from the
+/// cached global Browse feed — what's trending generally — so a no-taste
+/// profile gets a full page instead of a single shelf. Every personalized
+/// builder no-ops without seed artists, and the empty-shelf guard hides the
+/// rest; without this, a skipper's Home is one "Popular playlists" row deep.
+/// Served straight from `browse_cache()` (pre-warmed at startup) so it costs
+/// zero catalog calls and adds no latency; in the first seconds of a cold
+/// launch, before the pre-warm lands, it simply contributes nothing and the
+/// next visit fills in. Gated on `station_ready` at the call site: the moment
+/// the profile has any seed artist, the personalized feed takes over and these
+/// shelves never appear again.
+fn build_cold_start_shelves() -> Vec<HomeShelf> {
+    // Match curate_home_shelves' floor so these survive curation intact.
+    const MIN_SHELF: usize = 5;
+    let cached = {
+        let cache = browse_cache().lock().expect("browse cache poisoned");
+        cache.get(&0).map(|e| {
+            (
+                e.chart_tracks.clone(),
+                e.chart_artists.clone(),
+                e.new_releases.clone(),
+                e.chart_albums.clone(),
+            )
+        })
+    };
+    let Some((chart_tracks, chart_artists, new_releases, chart_albums)) = cached else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if chart_tracks.len() >= MIN_SHELF {
+        out.push(HomeShelf::track_row(
+            "Trending now",
+            Some("What everyone's playing".into()),
+            chart_tracks,
+        ));
+    }
+    if chart_artists.len() >= MIN_SHELF {
+        out.push(HomeShelf::artist_row("Popular artists", None, chart_artists));
+    }
+    // Prefer the honest "New releases" shelf; fall back to the album chart when
+    // the releases row is thin — with a title that matches what it shows.
+    if new_releases.len() >= MIN_SHELF {
+        out.push(HomeShelf::album_row(
+            "New releases",
+            Some("Fresh this week".into()),
+            new_releases,
+        ));
+    } else if chart_albums.len() >= MIN_SHELF {
+        out.push(HomeShelf::album_row("Top albums", None, chart_albums));
+    }
+    out
 }
 
 /// Editorial playlists on Home (Discover→Home): for the profile's top ~3 genre
@@ -8446,7 +10073,7 @@ async fn build_under_the_radar(
     // N2: widened seed pool 8→16 (recency-weighted), matching more-like-favorites.
     let seeds = {
         let conn = state.db.lock().expect("db mutex poisoned");
-        top_played_artists(&conn, profile_id, 16)
+        seed_artists(&conn, profile_id, 16)
     };
     if seeds.is_empty() {
         return None;
@@ -8510,6 +10137,11 @@ fn filter_fresh_albums(
 /// "New for you" — fresh releases from artists you HAVEN'T played (the inverse of
 /// Release Radar, which is new music from artists you DO play). Excludes your
 /// played + owned artists so the two shelves never collide.
+///
+/// Unlike the other taste-flavoured shelves, this one still builds for a profile
+/// with no history: they all need play seeds and return None without them, while
+/// this one's exclusion simply has nothing to exclude. So it's the only shelf
+/// that can end up describing a filter that never ran — see the subtitle below.
 async fn build_new_for_you(state: &AppState, pid: Option<i64>) -> Option<HomeShelf> {
     let known: std::collections::HashSet<String> = {
         let played: Vec<String> = {
@@ -8527,18 +10159,36 @@ async fn build_new_for_you(state: &AppState, pid: Option<i64>) -> Option<HomeShe
     if albums.len() < 5 {
         return None;
     }
+    // An empty `known` means the filter above excluded nobody — there was no
+    // history to exclude. Claiming "artists you haven't played" would then be
+    // describing work that never happened, to someone who hasn't played anyone.
+    // These really are just fresh releases; say so.
+    let subtitle = if known.is_empty() {
+        "Fresh releases"
+    } else {
+        "Fresh releases from artists you haven't played"
+    };
     Some(
-        HomeShelf::album_row(
-            "New for you",
-            Some("Fresh releases from artists you haven't played".into()),
-            albums,
-        )
-        .rotating(3, 12)
-        .discovery(),
+        HomeShelf::album_row("New for you", Some(subtitle.into()), albums)
+            .rotating(3, 12)
+            .discovery(),
     )
 }
 
-async fn build_external_shelves(state: &AppState, pid: Option<i64>, seed: u64) -> Vec<HomeShelf> {
+/// The four shelves that own a cold build's wall clock. Measured on a real
+/// profile: the whole feed is 13 builders but they don't finish together —
+/// `new_for_you` lands at 1.1s, `top_artists` 1.8s, `editorial` 2.8s, then a gap,
+/// then `release_radar` 5.3s, `new_releases` 5.4s, `more_like_artist` 5.7s and
+/// `more_like_mixed` 6.3s. On a cold profile that tail stretches to ~40s. Skipping
+/// exactly these four yields a real, personalized page in the first few seconds;
+/// `fast` builds are a strict subset and are never cached, so the full feed still
+/// arrives (and caches) exactly as before.
+async fn build_external_shelves(
+    state: &AppState,
+    pid: Option<i64>,
+    seed: u64,
+    fast: bool,
+) -> Vec<HomeShelf> {
     let sem = resolve_limiter();
     // ISO week for the "Weekly finds" tile — it materializes per week (cached),
     // so it holds all week even as this daily pool rebuilds.
@@ -8556,19 +10206,33 @@ async fn build_external_shelves(state: &AppState, pid: Option<i64>, seed: u64) -
         new_for_you,
         because,
         weekly,
+        more_like_mixed,
     ) = tokio::join!(
         build_more_like_favorites(state, pid, sem.clone(), seed),
         build_top_artists(state, pid, sem.clone()),
-        build_release_radar(state, pid, sem.clone()),
+        async { if fast { None } else { build_release_radar(state, pid, sem.clone()).await } },
         build_artist_mix(state, pid, sem.clone(), seed),
-        build_more_like_artist(state, pid, sem.clone(), seed),
-        build_new_releases(sem.clone()),
+        async {
+            if fast {
+                None
+            } else {
+                build_more_like_artist(state, pid, sem.clone(), seed).await
+            }
+        },
+        async { if fast { None } else { build_new_releases(sem.clone()).await } },
         build_tag_shelf(state, pid, sem.clone(), seed),
         build_editorial_shelves(state, pid),
         build_under_the_radar(state, pid, sem.clone(), seed),
         build_new_for_you(state, pid),
         build_because_you_played(state, pid, sem.clone(), seed),
         build_weekly_finds(state, pid, sem.clone(), &iso_week),
+        async {
+            if fast {
+                None
+            } else {
+                build_more_like_mixed(state, pid, sem.clone(), seed).await
+            }
+        },
     );
     // Tag each shelf with its intent lane (N5) so arrange_shelves can pick a
     // balanced, rotating per-visit subset. `top_artists` is your ranked roster
@@ -8601,6 +10265,7 @@ async fn build_external_shelves(state: &AppState, pid: Option<i64>, seed: u64) -
         release(tag(new_for_you, ShelfIntent::Discover), 2),
         tag(because, ShelfIntent::Discover),
         tag(weekly, ShelfIntent::Discover), // rail shelf; intent unused (bypasses lanes)
+        tag(more_like_mixed, ShelfIntent::Discover),
     ]
     .into_iter()
     .flatten()
@@ -8679,7 +10344,9 @@ async fn prewarm_home_once(state: &AppState) {
             continue; // a live request already warmed today's key
         }
         let seed = daily_seed(*pid, &date);
-        let built = build_external_shelves(state, *pid, seed).await;
+        // Always the FULL build: the pre-warm exists to populate the cache, and a
+        // partial feed must never land there.
+        let built = build_external_shelves(state, *pid, seed, false).await;
         if !built.is_empty() {
             let mut cache = home_cache().lock().expect("home cache poisoned");
             cache.retain(|k, _| k.1 == date);
@@ -8859,20 +10526,33 @@ fn curate_home_shelves(
                 out.push(shelf);
             }
             "album_row" => {
-                // Navigational: de-dup by album id, drop only when empty (a short
-                // album shelf is fine — cap, don't nuke). De-dup via `contains` +
-                // a within-shelf set, then trim to `display` (N3), so only the
-                // VISIBLE albums claim cross-shelf identity — a backfill album
-                // that gets trimmed away doesn't suppress a later shelf.
+                // Navigational: de-dup by album id, CAP PER ARTIST (so a prolific
+                // act's serial releases can't crowd an album shelf — same
+                // 2-per-artist rule the track rows use), drop only when empty.
+                // De-dup via `contains` + a within-shelf set, then trim to
+                // `display` (N3), so only the VISIBLE albums claim cross-shelf
+                // identity — a backfill album trimmed away doesn't suppress a
+                // later shelf.
                 let mut local: std::collections::HashSet<String> =
                     std::collections::HashSet::new();
+                let mut per_artist: std::collections::HashMap<String, usize> =
+                    std::collections::HashMap::new();
                 let mut kept: Vec<SearchAlbumOut> = std::mem::take(&mut shelf.albums)
                     .into_iter()
                     .filter(|a| {
                         let ak = norm_artist(a.artists.first().map(String::as_str).unwrap_or(""));
-                        !banned.contains(&ak)
-                            && !seen_album.contains(&a.source_id)
-                            && local.insert(a.source_id.clone())
+                        if banned.contains(&ak)
+                            || seen_album.contains(&a.source_id)
+                            || !local.insert(a.source_id.clone())
+                        {
+                            return false;
+                        }
+                        let c = per_artist.entry(ak).or_insert(0);
+                        if *c >= PER_ARTIST {
+                            return false;
+                        }
+                        *c += 1;
+                        true
                     })
                     .collect();
                 kept.truncate(rotate_cap(&shelf.select));
@@ -8924,6 +10604,40 @@ fn curate_home_shelves(
                 shelf.playlists = kept;
                 out.push(shelf);
             }
+            "mixed_row" => {
+                // Heterogeneous cards: ban-strip + de-dup each item against the
+                // shared identity sets (so an album/artist shown here isn't
+                // repeated in a homogeneous shelf), preserving interleave order.
+                // Drop the shelf only if nothing survives.
+                let kept: Vec<MixedItem> = std::mem::take(&mut shelf.items)
+                    .into_iter()
+                    .filter(|it| match it {
+                        MixedItem::Artist { artist } => {
+                            let k = norm_artist(&artist.name);
+                            !banned.contains(&k) && seen_artist.insert(k)
+                        }
+                        MixedItem::Album { album } => {
+                            let ak =
+                                norm_artist(album.artists.first().map(String::as_str).unwrap_or(""));
+                            !banned.contains(&ak) && seen_album.insert(album.source_id.clone())
+                        }
+                        MixedItem::Playlist { playlist } => {
+                            seen_playlist.insert(playlist.source_id.clone())
+                        }
+                    })
+                    .collect();
+                // Drop the row unless a non-artist card survived — an artists-only
+                // mixed row is just build_more_like_artist's job (and defeats the
+                // build-time "≥1 non-artist" guarantee once cross-shelf de-dup runs).
+                let has_non_artist = kept
+                    .iter()
+                    .any(|it| !matches!(it, MixedItem::Artist { .. }));
+                if kept.is_empty() || !has_non_artist {
+                    continue;
+                }
+                shelf.items = kept;
+                out.push(shelf);
+            }
             _ => out.push(shelf),
         }
     }
@@ -8939,6 +10653,16 @@ fn curate_home_shelves(
 struct HomeQuery {
     #[serde(default)]
     v: Option<String>,
+    /// `fast=1` asks for only the shelves that can be built cheaply, so the page
+    /// can paint while the expensive half is still resolving. Every Deezer call
+    /// is spaced 110ms apart PROCESS-WIDE, so a build's wall clock is almost
+    /// exactly (calls × 110ms) — a cold profile needs ~360 calls and takes ~40s.
+    /// The cheap shelves land in ~3s; making the client wait for the other 37s
+    /// before it may show anything is the whole problem. A fast build is a
+    /// STRICT SUBSET of the full one and is never cached, so it can't shadow the
+    /// real feed.
+    #[serde(default)]
+    fast: Option<String>,
 }
 
 /// GET /api/home — the whole personalized Home feed for a profile, as one
@@ -9052,33 +10776,64 @@ async fn home_handler(
             .filter(|e| e.fetched_at.elapsed() < HOME_TTL)
             .map(|e| (e.shelves.clone(), e.fetched_at.elapsed().as_secs()))
     };
+    let want_fast = hq.fast.as_deref().is_some_and(|v| v == "1" || v == "true");
+    // Tracks whether the discovery shelves in THIS response are a partial (subset)
+    // feed, so the client knows to refetch for the full one. True for an explicit
+    // fast request and for the cold-cache path below (which serves a partial while
+    // the full build runs in the background).
+    let mut served_partial = want_fast;
     let (external, discovery_age_secs) = if let Some(c) = fresh(&cache_key) {
         c
+    } else if want_fast {
+        // A fast request deliberately takes NEITHER the cache nor the in-flight
+        // lock: it exists to paint while the full build runs, so queueing behind
+        // that build would defeat its whole purpose. Its result is a strict subset
+        // and is never written to the cache — a partial feed cached here would
+        // shadow the real one for the full 6h TTL.
+        (build_external_shelves(&state, pid, seed, true).await, 0)
     } else {
-        // Serialize concurrent cold builds for the same (profile, day) (each fans
-        // out to dozens of keyless calls; two at once would double the load). The
-        // waiter re-checks the cache after acquiring the guard.
+        // COLD cache (typically the first load after a date rollover). The full
+        // build fans out to dozens of external catalog calls and can take tens of
+        // seconds; blocking the request on it freezes the app on first open and
+        // stalls a remote visitor's first load, and running several handlers'
+        // worth of these at once saturates the async runtime. So do NOT block the
+        // request on the full build. Instead: kick it off in the BACKGROUND, held
+        // by the inflight lock so only one runs and it still fills the cache for
+        // the next load; and serve a fast PARTIAL now, bounded by a hard timeout so
+        // a slow or unreachable provider can never wedge the feed.
         let lock = inflight_lock(&format!("home:{cache_key:?}"));
-        let _guard = lock.lock().await;
-        if let Some(c) = fresh(&cache_key) {
-            c
-        } else {
-            let built = build_external_shelves(&state, pid, seed).await;
-            // Cache only a non-empty build, so a transient hiccup retries next load.
-            if !built.is_empty() {
-                let mut cache = home_cache().lock().expect("home cache poisoned");
-                // Drop other days' entries so the map stays ~one row per profile.
-                cache.retain(|k, _| k.1 == date);
-                cache.insert(
-                    cache_key,
-                    HomeCacheEntry {
-                        fetched_at: std::time::Instant::now(),
-                        shelves: built.clone(),
-                    },
-                );
-            }
-            (built, 0) // just built → age 0
+        if let Ok(guard) = lock.try_lock_owned() {
+            let state_bg = state.clone();
+            let key_bg = cache_key.clone();
+            let date_bg = date.clone();
+            tokio::spawn(async move {
+                let _guard = guard; // held for the build's duration; released on drop
+                let built = build_external_shelves(&state_bg, pid, seed, false).await;
+                // Cache only a non-empty build, so a transient hiccup retries next load.
+                if !built.is_empty() {
+                    let mut cache = home_cache().lock().expect("home cache poisoned");
+                    // Drop other days' entries so the map stays ~one row per profile.
+                    cache.retain(|k, _| k.1 == date_bg);
+                    cache.insert(
+                        key_bg,
+                        HomeCacheEntry {
+                            fetched_at: std::time::Instant::now(),
+                            shelves: built,
+                        },
+                    );
+                }
+            });
         }
+        served_partial = true;
+        // A hard ceiling on the cold response: past this, serve local shelves only
+        // (empty discovery) rather than making the user wait on a slow provider.
+        let partial = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            build_external_shelves(&state, pid, seed, true),
+        )
+        .await
+        .unwrap_or_default();
+        (partial, 0) // just built → age 0
     };
 
     // 2b. Per-visit selection (N1) + fatigue demotion (N3): reorder each cached
@@ -9109,10 +10864,25 @@ async fn home_handler(
     shelves.extend(lead_more);
     shelves.extend(trail);
     // Strip permanently-banned artists from every shelf kind (P15), then curate.
-    let banned = {
+    // Same lock also answers "can the stations build?" — they seed off
+    // `top_played_artists` (see `station_seeds`), so an empty pool means an empty
+    // station. Limit 1: we only need existence, and asking for 1 keeps this
+    // independent of whatever width `station_seeds` samples at.
+    let (banned, station_ready) = {
         let conn = state.db.lock().expect("db mutex poisoned");
-        load_ban_set(&conn, pid)
+        (
+            load_ban_set(&conn, pid),
+            !seed_artists(&conn, pid, 1).is_empty(),
+        )
     };
+    // Cold start (skipped onboarding): no seed artists means the discovery
+    // builders had nothing to work with and Home would be one shelf deep. Fill
+    // the page from the cached global charts until listening begins —
+    // `station_ready` flips with the first seed artist and these disappear.
+    let mut shelves = shelves;
+    if !station_ready {
+        shelves.extend(build_cold_start_shelves());
+    }
     let shelves = curate_home_shelves(shelves, &banned);
     // N0: remember what the discovery shelves actually SHOWED (post-curation, so
     // items dropped by dedup/bans don't count as impressions). Best-effort — a
@@ -9129,6 +10899,8 @@ async fn home_handler(
         greeting,
         welcome_back,
         discovery_age_secs: Some(discovery_age_secs),
+        station_ready,
+        partial: served_partial,
     };
     // T1 perf: Home cards render at ~128–160 CSS px, but Deezer art URLs carry
     // the 1000×1000 "xl" variant — ~4× the pixels (and bytes) of the 500
@@ -9218,6 +10990,32 @@ fn log_home_impressions(
                     date
                 ]);
             }
+            // mixed_row items carry their own kind; log each under the same key
+            // space as the homogeneous rows so fatigue reads back uniformly.
+            for it in &s.items {
+                match it {
+                    MixedItem::Artist { artist } => {
+                        let _ =
+                            stmt.execute(params![pid0, "artist", norm_artist(&artist.name), date]);
+                    }
+                    MixedItem::Album { album } => {
+                        let _ = stmt.execute(params![
+                            pid0,
+                            "album",
+                            format!("{}:{}", album.source, album.source_id),
+                            date
+                        ]);
+                    }
+                    MixedItem::Playlist { playlist } => {
+                        let _ = stmt.execute(params![
+                            pid0,
+                            "playlist",
+                            format!("{}:{}", playlist.source, playlist.source_id),
+                            date
+                        ]);
+                    }
+                }
+            }
         }
     }
     // N3: prune impressions we haven't served in ~6 months so the table stays
@@ -9248,10 +11046,10 @@ struct AddTrackOut {
 /// user's local playlists. Three things happen in sequence:
 ///   1. The track row gets upserted. ISRC is the dedup key when set:
 ///      if we already have a track with the same ISRC (typically from
-///      an earlier Spotify sync), we reuse that row instead of
-///      inserting a duplicate.
+///      an earlier import), we reuse that row instead of inserting a
+///      duplicate.
 ///   2. A playlist_tracks row is appended at the tail with
-///      locally_added=1 so future syncs don't wipe it.
+///      locally_added=1 so a re-import of the source archive doesn't wipe it.
 ///   3. The HTTP response returns immediately. The track is stored
 ///      metadata-only until the user attaches an audio file.
 async fn add_track_to_playlist(
@@ -9445,6 +11243,7 @@ struct CatalogPlaylistOut {
 /// and cherry-pick — or "Add all" via /api/playlists/import.
 async fn get_catalog_playlist(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Query(q): Query<TokenQuery>,
     Query(pq): Query<ProfileQuery>,
@@ -9453,6 +11252,11 @@ async fn get_catalog_playlist(
     if let Err(r) = require_token(&state, &headers, &q) {
         return r;
     }
+    // Per-profile ✓ marks — scope to the caller (see `spotify_search`).
+    let scoped_pid = match scoped_profile_id(&state, &headers, &addr, &q, pq.profile_id) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
     let Ok(pid) = id.parse::<i64>() else {
         return (StatusCode::BAD_REQUEST, "playlist id must be numeric").into_response();
     };
@@ -9483,7 +11287,7 @@ async fn get_catalog_playlist(
         track_hits.into_iter().map(track_hit_to_out).collect();
     {
         let conn = state.db.lock().expect("db mutex poisoned");
-        if let Err(e) = annotate_with_library_state(&conn, &mut tracks, pq.profile_id) {
+        if let Err(e) = annotate_with_library_state(&conn, &mut tracks, scoped_pid) {
             tracing::warn!(?e, "catalog playlist: library annotation failed");
         }
     }
@@ -9673,68 +11477,16 @@ async fn patch_track_playlists(
                 }
             }
         } else {
-            // We don't have a target playlist here -- the upsert logic
-            // expects one for the link side -- so do the lookup manually
-            // and only call the bigger helper inside the per-playlist add
-            // loop below.
-            let synthetic_id = format!("{source}:{source_id}");
-            let isrc = body
-                .track
-                .isrc
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
-            let existing: Option<i64> = conn
-                .query_row(
-                    "SELECT id FROM tracks
-                     WHERE spotify_id = ?1
-                        OR (?2 IS NOT NULL AND isrc = ?2)
-                     LIMIT 1",
-                    params![synthetic_id, isrc],
-                    |r| r.get(0),
-                )
-                .ok();
-            if let Some(tid) = existing {
-                (tid, false)
-            } else {
-                // Insert a fresh row. spotify_id is the source-prefixed
-                // synthetic.
-                let artists_json = match serde_json::to_string(&body.track.artists) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::error!(?e, "patch_track: artists encode");
-                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                    }
-                };
-                if let Err(e) = conn.execute(
-                    "INSERT INTO tracks
-                         (spotify_id, title, artists, album, album_art_url, duration_ms, isrc)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    params![
-                        synthetic_id,
-                        body.track.title,
-                        artists_json,
-                        body.track.album,
-                        body.track.album_art_url,
-                        body.track.duration_ms,
-                        body.track.isrc,
-                    ],
-                ) {
-                    tracing::error!(?e, "patch_track: insert");
+            // Find-or-refresh-or-insert via the canonical upsert (deterministic
+            // ISRC-first dedup + metadata refresh on hit) instead of the drifted
+            // inline copy this used to carry (a non-deterministic `OR ... LIMIT 1`
+            // lookup that never refreshed stale rows).
+            match upsert_track(&conn, &body.track) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::error!(?e, "patch_track: upsert");
                     return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                 }
-                let tid: i64 = match conn.query_row(
-                    "SELECT id FROM tracks WHERE spotify_id = ?1",
-                    params![synthetic_id],
-                    |r| r.get(0),
-                ) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        tracing::error!(?e, "patch_track: id lookup after insert");
-                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                    }
-                };
-                (tid, true)
             }
         }
     };
@@ -9784,8 +11536,8 @@ async fn patch_track_playlists(
                 .unwrap_or(0);
             if let Err(e) = tx.execute(
                 "INSERT INTO playlist_tracks
-                     (playlist_id, track_id, position, added_at, locally_added)
-                 VALUES (?1, ?2, ?3, strftime('%s','now'), 1)",
+                     (playlist_id, track_id, position, added_at)
+                 VALUES (?1, ?2, ?3, strftime('%s','now'))",
                 params![pid, track_id, next_pos],
             ) {
                 tracing::error!(?e, "patch_track: link insert");
@@ -10271,6 +12023,559 @@ fn label_from_user_agent(ua: &str) -> String {
 mod tests {
     use super::*;
 
+    /// This file's own source. Some invariants live in the SHAPE of the code
+    /// rather than in any value it computes, and this is the only way to assert
+    /// them.
+    const OWN_SOURCE: &str = include_str!("mod.rs");
+
+    /// A profile id arriving in a query string is a CLAIM, not an identity: a
+    /// paired device can put any number there. It only becomes an identity after
+    /// `scoped_profile_id` / `read_scope_profile` checks it against the profile
+    /// bound to that device's session.
+    ///
+    /// Five handlers once used the claim directly — `/api/station` served a
+    /// station built from another profile's play history and bans, `/api/devices`
+    /// listed their devices and what they were playing right now, and
+    /// search/browse/album/artist leaked which of their playlists held a track.
+    /// Each was a one-line read, and each looked completely ordinary.
+    ///
+    /// So: every client-supplied profile id must be handed to a gate, and to
+    /// nothing else. A handler that forgets is not subtly wrong — it doesn't
+    /// compile past this test.
+    ///
+    /// One line legitimately can't use a gate — `bind_session_profile`, where
+    /// the id IS the request ("let me become this profile") and the PIN is the
+    /// check. It says so with a `scope-exempt:` marker, which forces the next
+    /// person who needs one to write down why.
+    #[test]
+    fn a_client_supplied_profile_id_is_only_ever_passed_to_a_gate() {
+        // Bindings that hold a deserialized query/body — i.e. attacker-chosen.
+        // `e.profile_id`, `entry.profile_id` etc. are internal state, not claims.
+        const CLIENT_BINDINGS: [&str; 3] = ["q.profile_id", "pq.profile_id", "body.profile_id"];
+        // Only scan the real code: this test names the bindings in its own body.
+        let code_only = OWN_SOURCE.split("#[cfg(test)]").next().unwrap_or(OWN_SOURCE);
+        let mut ungated: Vec<(usize, String)> = Vec::new();
+        for (i, line) in code_only.lines().enumerate() {
+            let code = line.split("//").next().unwrap_or(line); // ignore comments
+            if !CLIENT_BINDINGS.iter().any(|b| code.contains(b)) {
+                continue;
+            }
+            let gated = code.contains("scoped_profile_id(")
+                || code.contains("read_scope_profile(")
+                || line.contains("scope-exempt:");
+            if !gated {
+                ungated.push((i + 1, line.trim().to_string()));
+            }
+        }
+        assert!(
+            ungated.is_empty(),
+            "a client-supplied profile_id is used without passing it through \
+             scoped_profile_id/read_scope_profile — that hands one profile's data to \
+             whoever asks for it:\n{}",
+            ungated
+                .iter()
+                .map(|(n, l)| format!("  mod.rs:{n}: {l}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+
+    /// The two `*_decision` functions take a `bool` for "is this the trusted
+    /// owner", and every test above hands them that bool directly — so the policy
+    /// can be flawless while the SHELL computes the bool wrongly, and not one
+    /// unit test moves. That is exactly what happened. Four authorization sites
+    /// asked `.is_loopback()`, which the Meradomo agent turns into `true` for
+    /// every phone on earth: it proxies to `127.0.0.1` and deliberately sends no
+    /// `X-Forwarded-For`, so "loopback" stopped being evidence of anything.
+    ///
+    /// What each one handed a paired phone, in one line of code each: any
+    /// profile's device list and `now_playing` (`scoped_profile_id`); any
+    /// profile's playlists, library and Home feed (`read_scope_profile`); the
+    /// right to rename or delete any profile's playlist
+    /// (`enforce_playlist_owner`); and the right to delete any profile outright
+    /// (`delete_profile_handler`).
+    ///
+    /// The predicate that means "the owner" is [`is_this_machine`] — loopback AND
+    /// no `X-Meradomo-*` headers. `.is_loopback()` still has honest uses in this
+    /// file (LAN gating, pairing bypass, rate-limit exemption, audit logging), so
+    /// don't ban it globally — pin the rule exactly where it broke: an
+    /// authorization site classifies the owner with `is_this_machine`, never with
+    /// loopback alone.
+    #[test]
+    fn every_authorization_site_asks_is_this_machine_not_merely_is_it_loopback() {
+        const AUTHORIZATION_SITES: [&str; 4] = [
+            "fn scoped_profile_id(",
+            "fn read_scope_profile(",
+            "fn enforce_playlist_owner(",
+            "async fn delete_profile_handler(",
+        ];
+        let code_only = OWN_SOURCE.split("#[cfg(test)]").next().unwrap_or(OWN_SOURCE);
+        for site in AUTHORIZATION_SITES {
+            let (_, rest) = code_only
+                .split_once(site)
+                .unwrap_or_else(|| panic!("{site} vanished — this test needs rewriting"));
+            // Function bodies here all end at the first column-zero `}`.
+            let body = rest.split_once("\n}\n").map_or(rest, |(b, _)| b);
+            let code: String = body
+                .lines()
+                .filter_map(|l| l.split("//").next())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !code.contains(".is_loopback()"),
+                "{site} decides authorization from bare loopback. Behind the Meradomo \
+                 tunnel that makes every paired device the owner. Use \
+                 is_this_machine(headers, addr).",
+            );
+            assert!(
+                code.contains("is_this_machine("),
+                "{site} no longer asks is_this_machine — whatever gate follows is only \
+                 as good as the bool it is handed.",
+            );
+        }
+    }
+
+    /// The gates need the peer address to tell the trusted owner from
+    /// a paired device. A handler that doesn't take `ConnectInfo<SocketAddr>`
+    /// *cannot* call one — the omission is what made the leaks possible, and it
+    /// is invisible at the call site. Catch it at the signature instead.
+    #[test]
+    fn every_handler_taking_a_profile_id_can_actually_check_it() {
+        // Query types whose fields include a profile_id (i.e. carry a claim).
+        let profile_bearing: Vec<&str> = ["ProfileQuery", "PlaylistsQuery", "SearchQuery",
+            "BrowseQuery", "DeviceQuery", "LikedQuery", "StatsQuery"]
+            .into_iter()
+            .filter(|t| {
+                OWN_SOURCE
+                    .split(&format!("struct {t}"))
+                    .nth(1)
+                    .and_then(|rest| rest.split('}').next())
+                    .is_some_and(|body| body.contains("profile_id"))
+            })
+            .collect();
+        assert!(!profile_bearing.is_empty(), "test is broken, not the code");
+
+        let mut gaps: Vec<String> = Vec::new();
+        for chunk in OWN_SOURCE.split("async fn ").skip(1) {
+            let name = chunk.split('(').next().unwrap_or("?").trim().to_string();
+            let Some(sig) = chunk.split(") -> Response").next() else {
+                continue; // not a handler
+            };
+            if sig.len() > 2_000 {
+                continue; // ran past the signature into a body
+            }
+            let takes_claim = profile_bearing
+                .iter()
+                .any(|t| sig.contains(&format!("Query<{t}>")));
+            // handoff/remote-command take DeviceQuery but key on device_id and
+            // never read the profile claim; the previous test proves that.
+            let reads_claim = chunk
+                .split("\n}")
+                .next()
+                .is_some_and(|body| body.contains(".profile_id"));
+            if takes_claim && reads_claim && !sig.contains("ConnectInfo") {
+                gaps.push(name);
+            }
+        }
+        assert!(
+            gaps.is_empty(),
+            "these handlers read a client-supplied profile_id but don't take \
+             ConnectInfo<SocketAddr>, so they CANNOT scope it to the caller: {gaps:?}\n\
+             Add `ConnectInfo(addr): ConnectInfo<SocketAddr>,` and route the id through \
+             scoped_profile_id (see `home_handler`).",
+        );
+    }
+
+    /// The rule that decides who reads whose data. Every leak this file has had
+    /// was a handler failing to ASK this question — but the answer itself had
+    /// never been tested either, because it was welded to `AppState` (which owns
+    /// a `tauri::AppHandle` and so can't be built in a test). It's `scope_decision`
+    /// now, and these are the cases that matter.
+    #[test]
+    fn a_paired_device_is_who_its_session_says_it_is_whatever_it_asks_for() {
+        const GUEST: i64 = 2;
+        const OWNER: i64 = 1;
+
+        // No provider in front, so no guest, in every case below.
+        let nobody = || None;
+
+        // THE attack: the guest's phone, bound to the guest, asks for the owner's id.
+        assert_eq!(
+            scope_decision(false, Some(OWNER), nobody, || Some(GUEST)),
+            Some(Some(GUEST)),
+            "a paired device widened its scope by asking — this is the leak",
+        );
+        // Asking for nothing doesn't widen it either.
+        assert_eq!(scope_decision(false, None, nobody, || Some(GUEST)), Some(Some(GUEST)));
+        // Asking for its own id is the ordinary case.
+        assert_eq!(scope_decision(false, Some(GUEST), nobody, || Some(GUEST)), Some(Some(GUEST)));
+
+        // Paired but no profile chosen yet: reads nothing. NOT the owner's
+        // default — falling back to a real profile here would hand a fresh
+        // device someone's library.
+        assert_eq!(scope_decision(false, Some(OWNER), nobody, || None), None, "unbound session got data");
+        assert_eq!(scope_decision(false, None, nobody, || None), None);
+
+        // Loopback is the owner (the desktop webview switching profiles in-app):
+        // its claim stands verbatim, including the no-profile scope.
+        assert_eq!(scope_decision(true, Some(OWNER), nobody, || Some(GUEST)), Some(Some(OWNER)));
+        assert_eq!(scope_decision(true, None, nobody, || Some(GUEST)), Some(None));
+        assert_eq!(scope_decision(true, Some(GUEST), nobody, || None), Some(Some(GUEST)));
+    }
+
+    /// A guest signed in by a sharing provider is their own account, and asking
+    /// for somebody else's id does not change that.
+    ///
+    /// The ordering matters as much as the rule: a guest's account wins over the
+    /// session binding, because a shared link opened on a phone that ALSO happens
+    /// to be paired to this server over the local network would otherwise read as
+    /// whoever that pairing chose.
+    #[test]
+    fn a_guest_reads_their_own_account_and_nobody_elses() {
+        const GUEST: i64 = 2;
+        const OWNER: i64 = 1;
+        const SAM: i64 = 7;
+
+        assert_eq!(
+            scope_decision(false, Some(OWNER), || Some(SAM), || Some(GUEST)),
+            Some(Some(SAM)),
+            "a guest reached another account by asking",
+        );
+        assert_eq!(scope_decision(false, None, || Some(SAM), || None), Some(Some(SAM)));
+
+        // A guest whose account could not be resolved falls through to the
+        // session rule — and with no session, reads nothing at all. Never the
+        // owner's library.
+        assert_eq!(scope_decision(false, Some(OWNER), || None, || None), None);
+
+        // The desktop is still the desktop. A provider cannot reach it anyway,
+        // but the ordering is stated rather than assumed.
+        assert_eq!(scope_decision(true, Some(OWNER), || Some(SAM), || None), Some(Some(OWNER)));
+    }
+
+    /// The same rule for reads, where the owner falls back to a default profile
+    /// and a guest deliberately does not.
+    #[test]
+    fn a_guest_reading_never_falls_back_to_the_default_profile() {
+        const DEFAULT: i64 = 1;
+        const SAM: i64 = 7;
+
+        assert_eq!(
+            read_scope_decision(false, None, || DEFAULT, || Some(SAM), || None),
+            Some(SAM),
+        );
+        // Unresolvable guest, no session: empty, not the default. Falling back
+        // here would serve a stranger the owner's whole library.
+        assert_eq!(
+            read_scope_decision(false, None, || DEFAULT, || None, || None),
+            None,
+            "a guest was handed the default profile's library",
+        );
+        // The owner on the desktop still gets the default when they claim nothing.
+        assert_eq!(
+            read_scope_decision(true, None, || DEFAULT, || None, || None),
+            Some(DEFAULT),
+        );
+    }
+
+    /// The rule above is only ever as good as the `bool` handed to it, and for
+    /// most of this file's life the shell computed that from loopback alone.
+    /// Behind the Meradomo tunnel that is the owner's entire authority given
+    /// away: the agent proxies to `127.0.0.1` and deliberately sends no
+    /// `X-Forwarded-For`, so a phone anywhere in the world is loopback, the first
+    /// branch returns its claim verbatim, and the two branches this file keeps
+    /// calling the point are never reached.
+    ///
+    /// Confirmed against a running 0.3.6 build before the fix: a session that had
+    /// never chosen a profile POSTed `/api/devices/heartbeat` with
+    /// `profile_id: 1`, got `204`, and read its own device back out of
+    /// `GET /api/devices?profile_id=1` — both halves of the leak
+    /// `devices_heartbeat` documents itself as preventing.
+    ///
+    /// So assert the predicate and the policy TOGETHER. Neither is wrong alone.
+    #[test]
+    fn a_tunnelled_device_is_not_the_owner_however_loopback_it_looks() {
+        const GUEST: i64 = 2;
+        const OWNER: i64 = 1;
+
+        let mut via_tunnel = HeaderMap::new();
+        via_tunnel.insert("x-meradomo-email", "owner@example.com".parse().unwrap());
+        let tunnelled = is_this_machine(&via_tunnel, &peer("127.0.0.1"));
+
+        // the guest's phone, through the tunnel, names the owner's profile. Loopback by
+        // peer address, and it must still be told it is the guest.
+        assert_eq!(
+            scope_decision(tunnelled, Some(OWNER), || None, || Some(GUEST)),
+            Some(Some(GUEST)),
+            "a tunnelled device claimed another profile and was believed",
+        );
+
+        // Paired but never bound: reads nothing. This is the case the loopback
+        // branch used to answer first, so the rule never applied at all.
+        assert_eq!(
+            scope_decision(tunnelled, Some(OWNER), || None, || None),
+            None,
+            "an unbound tunnelled session was handed a profile",
+        );
+        assert_eq!(scope_decision(tunnelled, None, || None, || None), None);
+
+        // The desktop webview is untouched: real loopback, no tunnel headers, so
+        // its in-app profile switching still speaks for itself.
+        let owner = is_this_machine(&HeaderMap::new(), &peer("127.0.0.1"));
+        assert_eq!(
+            scope_decision(owner, Some(OWNER), || None, || Some(GUEST)),
+            Some(Some(OWNER)),
+            "the owner lost its own profile switching",
+        );
+    }
+
+    /// The loopback branch must not pay for the session lookup — it takes the db
+    /// lock, and `scoped_profile_id` is documented as callable before the caller
+    /// takes it. A lookup here would be a deadlock waiting for a caller to hold
+    /// the lock first.
+    #[test]
+    fn the_owner_path_never_touches_the_session_store() {
+        let mut looked_up = false;
+        let mut guest_looked_up = false;
+        let _ = scope_decision(
+            true,
+            Some(1),
+            || {
+                guest_looked_up = true;
+                Some(3)
+            },
+            || {
+                looked_up = true;
+                Some(2)
+            },
+        );
+        assert!(!looked_up, "loopback consulted the session store — that risks the db-lock deadlock");
+        assert!(!guest_looked_up, "loopback resolved a guest account — same db lock, same deadlock");
+    }
+
+    /// The same rule for the READ endpoints — the library list, the Home feed,
+    /// the playlist list. Same threat, same answer; it only parts company with
+    /// `scope_decision` on what an absent claim means to the owner.
+    #[test]
+    fn a_paired_device_cannot_read_another_profiles_library_by_asking() {
+        const GUEST: i64 = 2;
+        const OWNER: i64 = 1;
+        const DEFAULT: i64 = 7;
+
+        // No provider in front, so no guest, in every case below.
+        let nobody = || None;
+
+        // The attack: the guest's phone asks for the owner's library. It gets the guest's.
+        assert_eq!(
+            read_scope_decision(false, Some(OWNER), || DEFAULT, nobody, || Some(GUEST)),
+            Some(GUEST),
+            "a paired device read another profile by naming it — this is the leak",
+        );
+        assert_eq!(read_scope_decision(false, None, || DEFAULT, nobody, || Some(GUEST)), Some(GUEST));
+
+        // Unbound reads NOTHING. Not the default, not the owner's — callers turn
+        // this None into an empty list. Falling back here is the whole bug class.
+        assert_eq!(
+            read_scope_decision(false, Some(OWNER), || DEFAULT, nobody, || None),
+            None,
+            "an unbound session was handed a profile's library",
+        );
+
+        // Loopback (the owner): claim honoured; no claim → the default profile,
+        // because "no profile" isn't a sensible library to show.
+        assert_eq!(read_scope_decision(true, Some(OWNER), || DEFAULT, nobody, || Some(GUEST)), Some(OWNER));
+        assert_eq!(read_scope_decision(true, None, || DEFAULT, nobody, || Some(GUEST)), Some(DEFAULT));
+    }
+
+    /// The read gate's half of the tunnel bug — worse than the write gate's,
+    /// because its owner branch resolves an absent claim to a REAL profile.
+    /// Trusting loopback here didn't merely let a phone name someone else's
+    /// library (`/api/playlists`, `/api/library/songs`, `/api/home`); a phone
+    /// that had never chosen a profile got the DEFAULT one's library by asking
+    /// for nothing at all.
+    #[test]
+    fn a_tunnelled_device_cannot_read_a_library_by_looking_local() {
+        const GUEST: i64 = 2;
+        const OWNER: i64 = 1;
+        const DEFAULT: i64 = 7;
+
+        let mut via_tunnel = HeaderMap::new();
+        via_tunnel.insert("x-meradomo-email", "owner@example.com".parse().unwrap());
+        let tunnelled = is_this_machine(&via_tunnel, &peer("127.0.0.1"));
+
+        assert_eq!(
+            read_scope_decision(tunnelled, Some(OWNER), || DEFAULT, || None, || Some(GUEST)),
+            Some(GUEST),
+            "a tunnelled device read the library it named",
+        );
+        assert_eq!(
+            read_scope_decision(tunnelled, None, || DEFAULT, || None, || None),
+            None,
+            "an unbound tunnelled session was handed the default profile's library",
+        );
+
+        // The desktop webview keeps both of its behaviours.
+        let owner = is_this_machine(&HeaderMap::new(), &peer("127.0.0.1"));
+        assert_eq!(
+            read_scope_decision(owner, Some(OWNER), || DEFAULT, || None, || Some(GUEST)),
+            Some(OWNER),
+        );
+        assert_eq!(
+            read_scope_decision(owner, None, || DEFAULT, || None, || Some(GUEST)),
+            Some(DEFAULT),
+        );
+    }
+
+    /// Each branch needs exactly one of the two db-locking lookups; taking the
+    /// other is wasted work at best and, for the session store on the loopback
+    /// path, the same lock hazard as above.
+    #[test]
+    fn read_scope_only_pays_for_the_lookup_its_branch_needs() {
+        let (mut default_hit, mut guest_hit, mut session_hit) = (false, false, false);
+        let _ = read_scope_decision(
+            true,
+            None,
+            || {
+                default_hit = true;
+                7
+            },
+            || {
+                guest_hit = true;
+                Some(3)
+            },
+            || {
+                session_hit = true;
+                Some(2)
+            },
+        );
+        assert!(default_hit, "owner with no claim must resolve the default profile");
+        assert!(!session_hit, "loopback consulted the session store");
+        assert!(!guest_hit, "loopback resolved a guest account — same db lock, same hazard");
+
+        let (mut default_hit, mut guest_hit, mut session_hit) = (false, false, false);
+        let _ = read_scope_decision(
+            false,
+            Some(1),
+            || {
+                default_hit = true;
+                7
+            },
+            || {
+                guest_hit = true;
+                Some(3)
+            },
+            || {
+                session_hit = true;
+                Some(2)
+            },
+        );
+        assert!(!default_hit, "a paired device resolved the owner's default profile");
+        assert!(guest_hit, "the guest branch must be consulted before the session");
+        assert!(!session_hit, "a guest account was found and the session was consulted anyway");
+    }
+
+    fn peer(ip: &str) -> SocketAddr {
+        SocketAddr::new(ip.parse().unwrap(), 50000)
+    }
+
+    /// Who is shown the list of accounts on this machine.
+    ///
+    /// This is load-bearing. Auto-creating an account for everybody the owner
+    /// shares with means the profile list stops being "my family" and becomes "a
+    /// list of people", and a picker over that list is a way into somebody else's
+    /// library. The desktop is the owner's own machine and sees everything; every
+    /// other caller sees strictly less.
+    #[test]
+    fn a_guest_is_shown_their_own_account_and_no_sign_of_anybody_elses() {
+        assert_eq!(profile_view(false, Some(7)), ProfileView::JustTheirs(7));
+    }
+
+    #[test]
+    fn a_device_paired_over_the_local_network_never_sees_remote_accounts() {
+        // Pairing proves somebody typed a code that was on the screen. That is
+        // enough to reach the music in the house; it is not enough to be offered
+        // the account of somebody the owner shared with over the internet.
+        assert_eq!(profile_view(false, None), ProfileView::LocalOnly);
+    }
+
+    #[test]
+    fn the_desktop_sees_every_account_on_its_own_machine() {
+        assert_eq!(profile_view(true, None), ProfileView::All);
+        // Even if identity headers somehow reached it, this machine is this
+        // machine — the first branch decides.
+        assert_eq!(profile_view(true, Some(7)), ProfileView::All);
+    }
+
+    /// A device reached through the Meradomo tunnel arrives from loopback (the
+    /// agent proxies to 127.0.0.1), so loopback alone can't mean "this Mac" —
+    /// it named every remote device after the host, and a phone showed up in
+    /// its owner's own device list as "a MacBook Pro (2)".
+    #[test]
+    fn tunnel_identity_headers_mean_the_client_is_not_this_machine() {
+        // The desktop webview: real loopback, no tunnel headers → this machine.
+        assert!(is_this_machine(&HeaderMap::new(), &peer("127.0.0.1")));
+
+        // A phone through the agent: also loopback, but carrying the identity
+        // headers the agent injects → NOT this machine.
+        let mut via_tunnel = HeaderMap::new();
+        via_tunnel.insert("x-meradomo-email", "owner@example.com".parse().unwrap());
+        assert!(!is_this_machine(&via_tunnel, &peer("127.0.0.1")));
+
+        // Any other X-Meradomo-* header is equally proof of the tunnel.
+        let mut only_role = HeaderMap::new();
+        only_role.insert("x-meradomo-role", "owner".parse().unwrap());
+        assert!(!is_this_machine(&only_role, &peer("127.0.0.1")));
+
+        // A LAN client is not this machine either, headers or no headers.
+        assert!(!is_this_machine(&HeaderMap::new(), &peer("192.168.1.40")));
+    }
+
+    fn xff(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", value.parse().unwrap());
+        h
+    }
+
+    /// Every trust decision in this file — pairing bypass, LAN allow, and which
+    /// profile a request may read — hangs off this one function. It had no test.
+    ///
+    /// The rule: consult `X-Forwarded-For` ONLY when the TCP peer is already
+    /// loopback, so the header can lower trust (our tunnel naming its real
+    /// caller) but never raise it.
+    #[test]
+    fn effective_client_ip_never_lets_a_header_grant_owner_trust() {
+        // The desktop webview: real loopback, no header → owner.
+        assert!(effective_client_ip(&peer("127.0.0.1"), &HeaderMap::new()).is_loopback());
+
+        // The attack that matters: a remote caller forging the header. Its TCP
+        // peer isn't loopback, so the header is ignored outright — no amount of
+        // XFF makes you the owner.
+        let forged = effective_client_ip(&peer("203.0.113.9"), &xff("127.0.0.1"));
+        assert_eq!(forged, peer("203.0.113.9").ip(), "a forged XFF took owner trust");
+        assert!(!forged.is_loopback());
+        // Same for a LAN peer trying it.
+        assert!(!effective_client_ip(&peer("192.168.1.50"), &xff("127.0.0.1")).is_loopback());
+
+        // Our tunnel connects FROM loopback and names the real caller: trust is
+        // downgraded to that caller, who then faces the remote gate + pairing.
+        let tunnelled = effective_client_ip(&peer("127.0.0.1"), &xff("198.51.100.7"));
+        assert_eq!(tunnelled, "198.51.100.7".parse::<IpAddr>().unwrap());
+        assert!(!tunnelled.is_loopback(), "a tunnelled phone must not inherit owner trust");
+
+        // A tunnelled caller who prepends their own entry: the proxy appends its
+        // observation on the RIGHT, so the rightmost wins and the forgery on the
+        // left is ignored.
+        let spoofed = effective_client_ip(&peer("127.0.0.1"), &xff("127.0.0.1, 198.51.100.7"));
+        assert_eq!(
+            spoofed,
+            "198.51.100.7".parse::<IpAddr>().unwrap(),
+            "took a client-supplied leftmost XFF entry over the proxy's own",
+        );
+
+        // Junk in the header must not be read as loopback — fall back to the peer.
+        assert!(effective_client_ip(&peer("127.0.0.1"), &xff("not-an-ip")).is_loopback());
+    }
+
     #[test]
     fn rfc1918_ipv4_passes() {
         for ip in [
@@ -10413,6 +12718,120 @@ mod tests {
         crate::db::open(tmp.path()).unwrap()
     }
 
+    /// The desktop mint must collapse only its OWN stale prior sessions, never a
+    /// paired phone's — even though a phone reached through a loopback tunnel is
+    /// stored under 127.0.0.1 just like the desktop. The discriminator is the UA.
+    #[test]
+    fn loopback_prune_sweeps_only_same_ua_desktop_sessions() {
+        let conn = open_test_db();
+        let mac = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15";
+        let iphone = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15";
+
+        let insert = |id: &str, ua: &str, ip: &str, idle_secs: i64| {
+            conn.execute(
+                "INSERT INTO streaming_sessions
+                     (id, token_sha256, device_label, ip_address, user_agent, last_seen_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, strftime('%s','now') - ?6)",
+                params![id, format!("sha-{id}"), "label", ip, ua, idle_secs],
+            )
+            .unwrap();
+        };
+        // The desktop's own stale prior launch — should be swept.
+        insert("old-mac", mac, "127.0.0.1", 3600);
+        // A phone paired via a loopback reverse-proxy tunnel: same 127.0.0.1,
+        // stale — must SURVIVE because its UA differs from the minter's.
+        insert("phone", iphone, "127.0.0.1", 3600);
+        // Another still-active desktop instance (fresh) — spared by staleness.
+        insert("fresh-mac", mac, "::1", 5);
+        // The just-minted desktop row is keep_id; it must never prune itself.
+        insert("new-mac", mac, "127.0.0.1", 0);
+
+        prune_own_stale_loopback_sessions(&conn, "new-mac", mac);
+
+        let alive = |id: &str| -> bool {
+            conn.query_row(
+                "SELECT COUNT(*) FROM streaming_sessions WHERE id = ?1",
+                params![id],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+                > 0
+        };
+        assert!(!alive("old-mac"), "the desktop's own stale prior session should be pruned");
+        assert!(alive("phone"), "a tunnelled phone session (different UA) must NOT be pruned");
+        assert!(alive("fresh-mac"), "a still-active desktop session (fresh last_seen) must be spared");
+        assert!(alive("new-mac"), "the just-minted session must never prune itself");
+    }
+
+    /// A minimal TrackHit for the candidate-cache tests (only id/title carry
+    /// identity here; the rest exercises the full serde round-trip).
+    fn thit(id: u64, title: &str) -> crate::deezer::TrackHit {
+        crate::deezer::TrackHit {
+            id,
+            title: title.to_string(),
+            duration: 200,
+            artist: crate::deezer::ArtistRef {
+                name: "Artist".to_string(),
+            },
+            album: crate::deezer::AlbumRef {
+                id: 1,
+                title: "Album".to_string(),
+                cover_xl: None,
+                cover_big: None,
+                cover_medium: None,
+            },
+            isrc: None,
+            release_date: None,
+            preview: None,
+            explicit_lyrics: false,
+            rank: 0,
+        }
+    }
+
+    #[test]
+    fn candidate_cache_roundtrips_and_prunes_prior_weeks() {
+        let conn = open_test_db();
+        let set = [
+            vec![thit(1, "a"), thit(2, "b")],
+            vec![thit(3, "c")],
+            vec![], // an empty source list must round-trip too
+            vec![thit(4, "d")],
+        ];
+        // Cold: a never-written key misses.
+        assert!(candidate_cache_get(&conn, "drake", "2026-W07").is_none());
+        // Put, then a same-week read returns the exact 4 lists.
+        candidate_cache_put(&conn, "drake", "2026-W07", &set);
+        let got = candidate_cache_get(&conn, "drake", "2026-W07").expect("same-week hit");
+        assert_eq!(got[0].len(), 2);
+        assert_eq!(got[0][0].id, 1);
+        assert_eq!(got[0][1].title, "b");
+        assert!(got[2].is_empty(), "empty list preserved");
+        assert_eq!(got[3][0].id, 4);
+        // A later ISO-week is a MISS (the cache turns over) ...
+        assert!(candidate_cache_get(&conn, "drake", "2026-W08").is_none());
+        // ... and writing the new week PRUNES the prior week's row.
+        candidate_cache_put(&conn, "drake", "2026-W08", &set);
+        assert!(
+            candidate_cache_get(&conn, "drake", "2026-W07").is_none(),
+            "prior ISO-week pruned on write"
+        );
+        assert!(candidate_cache_get(&conn, "drake", "2026-W08").is_some());
+    }
+
+    #[test]
+    fn candidate_cache_is_keyed_per_artist() {
+        let conn = open_test_db();
+        candidate_cache_put(
+            &conn,
+            "drake",
+            "2026-W07",
+            &[vec![thit(1, "x")], vec![], vec![], vec![]],
+        );
+        // A different artist in the same week is an independent miss.
+        assert!(candidate_cache_get(&conn, "future", "2026-W07").is_none());
+        assert!(candidate_cache_get(&conn, "drake", "2026-W07").is_some());
+    }
+
     /// Insert one `tracks` row, returning its autoincrement id. Supplies the
     /// NOT NULL columns (`spotify_id` unique, `title`, `artists` JSON,
     /// `duration_ms`) so the INSERT can't silently fail.
@@ -10432,6 +12851,90 @@ mod tests {
         )
         .unwrap();
         conn.last_insert_rowid()
+    }
+
+    /// Build a `CatalogTrackOut` from just the real payload fields; the
+    /// library-state annotation fields fall to their serde defaults.
+    fn catalog_track(
+        source: &str,
+        source_id: &str,
+        title: &str,
+        artists: &[&str],
+        album: Option<&str>,
+        album_art_url: Option<&str>,
+        isrc: Option<&str>,
+    ) -> CatalogTrackOut {
+        serde_json::from_value(serde_json::json!({
+            "source": source,
+            "source_id": source_id,
+            "title": title,
+            "artists": artists,
+            "album": album,
+            "album_art_url": album_art_url,
+            "duration_ms": 200_000,
+            "isrc": isrc,
+        }))
+        .unwrap()
+    }
+
+    // The three upsert paths (upsert_track / upsert_track_and_link /
+    // patch_track_playlists) share one core, so this covers all three: a repeat
+    // upsert must REFRESH metadata on the existing row (the drifted patch copy
+    // used to leave it stale) and dedup deterministically by ISRC.
+    #[test]
+    fn upsert_track_refreshes_metadata_and_dedups_by_isrc() {
+        let conn = open_test_db();
+        let count = |c: &Connection| -> i64 {
+            c.query_row("SELECT COUNT(*) FROM tracks", [], |r| r.get(0)).unwrap()
+        };
+
+        // First upsert inserts a fresh row.
+        let (id1, new1) = upsert_track(
+            &conn,
+            &catalog_track(
+                "deezer", "12345", "Old Title", &["Artist A"],
+                Some("Old Album"), None, Some("USABC1234567"),
+            ),
+        )
+        .unwrap();
+        assert!(new1, "first upsert inserts a new row");
+        assert_eq!(count(&conn), 1);
+
+        // Same source:source_id, CHANGED metadata → refresh the row in place.
+        let (id2, new2) = upsert_track(
+            &conn,
+            &catalog_track(
+                "deezer", "12345", "New Title", &["Artist A", "Artist B"],
+                Some("New Album"), Some("http://art/new.jpg"), Some("USABC1234567"),
+            ),
+        )
+        .unwrap();
+        assert_eq!(id2, id1, "same synthetic id reuses the row");
+        assert!(!new2, "repeat upsert does not insert a duplicate");
+        assert_eq!(count(&conn), 1, "no duplicate row");
+        let (title, art): (String, Option<String>) = conn
+            .query_row(
+                "SELECT title, album_art_url FROM tracks WHERE id = ?1",
+                params![id1],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(title, "New Title", "metadata refreshed on repeat upsert");
+        assert_eq!(art.as_deref(), Some("http://art/new.jpg"), "cover filled in");
+
+        // Different source:source_id but SAME isrc → ISRC-first dedup resolves to
+        // the existing row (guards the old non-deterministic OR ... LIMIT 1 path).
+        let (id3, new3) = upsert_track(
+            &conn,
+            &catalog_track(
+                "spotify", "999", "Spotify Title", &["Artist A"],
+                None, None, Some("USABC1234567"),
+            ),
+        )
+        .unwrap();
+        assert_eq!(id3, id1, "ISRC match reuses the row across sources");
+        assert!(!new3, "ISRC dedup does not insert a new row");
+        assert_eq!(count(&conn), 1, "ISRC dedup kept a single row");
     }
 
     /// Insert one `play_events` row (mig 009 + 013 columns).
@@ -10466,6 +12969,82 @@ mod tests {
         chrono::Utc::now().timestamp() - days * 86_400
     }
 
+    /// Write the `saved_artists` profile-KV in the shape the client stores.
+    fn seed_saved_artists(conn: &Connection, pid: i64, names: &[&str]) {
+        let json = serde_json::to_string(
+            &names
+                .iter()
+                .map(|n| serde_json::json!({ "name": n }))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO profile_kv (profile_id, key, value) VALUES (?1, 'saved_artists', ?2)",
+            params![pid, json],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn saved_artist_names_parses_and_tolerates_bad_json() {
+        let conn = open_test_db();
+        // Missing key → empty.
+        assert!(saved_artist_names(&conn, Some(1)).is_empty());
+        // Good JSON → names in stored order, blank names filtered.
+        seed_saved_artists(&conn, 1, &["Drake", "  ", "Taylor Swift"]);
+        assert_eq!(
+            saved_artist_names(&conn, Some(1)),
+            vec!["Drake".to_string(), "Taylor Swift".to_string()]
+        );
+        // Malformed JSON → empty, never panics. (Overwrite profile 1's value;
+        // profile_kv has an FK to profiles, and only the seeded id 1 exists.)
+        conn.execute(
+            "INSERT OR REPLACE INTO profile_kv (profile_id, key, value) VALUES (1, 'saved_artists', 'not json')",
+            [],
+        )
+        .unwrap();
+        assert!(saved_artist_names(&conn, Some(1)).is_empty());
+    }
+
+    #[test]
+    fn seed_artists_uses_picks_when_no_history() {
+        let conn = open_test_db();
+        seed_saved_artists(&conn, 1, &["Picked A", "Picked B"]);
+        // Zero play history → the pool is purely the onboarding picks.
+        assert_eq!(
+            seed_artists(&conn, Some(1), 16),
+            vec!["Picked A".to_string(), "Picked B".to_string()]
+        );
+    }
+
+    #[test]
+    fn seed_artists_blends_thin_history() {
+        let conn = open_test_db();
+        let t = seed_track(&conn, "s1", "T", &["Played One"], None, 200_000);
+        seed_play(&conn, t, Some(1), plays_ago(1), 200_000, true);
+        // 1 played + 2 picks, one of which duplicates the played artist (case-insensitive).
+        seed_saved_artists(&conn, 1, &["played one", "Picked B"]);
+        let seeds = seed_artists(&conn, Some(1), 16);
+        assert_eq!(seeds[0], "Played One", "real history seeds first");
+        assert!(seeds.contains(&"Picked B".to_string()), "the fresh pick tops it up");
+        assert_eq!(seeds.len(), 2, "the duplicate pick is deduped, not doubled");
+    }
+
+    #[test]
+    fn seed_artists_ignores_picks_when_warm() {
+        let conn = open_test_db();
+        for (i, name) in ["A", "B", "C"].iter().enumerate() {
+            let t = seed_track(&conn, &format!("s{i}"), "T", &[*name], None, 200_000);
+            seed_play(&conn, t, Some(1), plays_ago(1), 200_000, true);
+        }
+        seed_saved_artists(&conn, 1, &["Picked X"]);
+        // ≥ MIN_SEEDS real plays → picks are never consulted (established profile,
+        // identical behaviour to the old top_played_artists-only path).
+        let seeds = seed_artists(&conn, Some(1), 16);
+        assert!(!seeds.contains(&"Picked X".to_string()));
+        assert_eq!(seeds.len(), 3);
+    }
+
     #[test]
     fn daily_seed_is_stable_and_sensitive() {
         let a = daily_seed(Some(1), "2026-07-01");
@@ -10487,6 +13066,51 @@ mod tests {
         assert_ne!(weekly_seed(Some(1), "2026-W28"), weekly_seed(Some(2), "2026-W28"));
         // Domain-separated from daily_seed for the same string input.
         assert_ne!(weekly_seed(Some(1), "2026-07-01"), daily_seed(Some(1), "2026-07-01"));
+    }
+
+    #[test]
+    fn stat_top_tracks_excludes_skips() {
+        let conn = open_test_db();
+        let pid = Some(1);
+        let track = |sid: &str, title: &str| {
+            upsert_track(&conn, &catalog_track("d", sid, title, &["A"], None, None, None))
+                .unwrap()
+                .0
+        };
+        let finished = track("1", "Finished"); // 3 completed        → 3 real
+        let skipped = track("2", "Skipped"); //   5 skips            → 0 real (dropped)
+        let mixed = track("3", "Mixed"); //       1 completed + 4 skips → 1 real
+        let legacy = track("4", "Legacy"); //     4 untracked (ms=0) → 4 real
+
+        for _ in 0..3 {
+            seed_play(&conn, finished, pid, plays_ago(1), 200_000, true);
+        }
+        for _ in 0..5 {
+            seed_play(&conn, skipped, pid, plays_ago(1), 3_000, false);
+        }
+        seed_play(&conn, mixed, pid, plays_ago(1), 200_000, true);
+        for _ in 0..4 {
+            seed_play(&conn, mixed, pid, plays_ago(1), 3_000, false);
+        }
+        for _ in 0..4 {
+            seed_play(&conn, legacy, pid, plays_ago(1), 0, false);
+        }
+
+        let top = stat_top_tracks(&conn, pid, 0, 25);
+
+        // A song you only ever skipped is not a "top song".
+        assert!(
+            !top.iter().any(|t| t.track_id == skipped),
+            "skip-only track must be excluded"
+        );
+        // Ranked by REAL plays: legacy(4) > finished(3) > mixed(1).
+        let ids: Vec<i64> = top.iter().map(|t| t.track_id).collect();
+        assert_eq!(ids, vec![legacy, finished, mixed], "ranked by real plays");
+        // The shown count is real plays: untracked plays count, skips don't inflate it.
+        let count = |id: i64| top.iter().find(|t| t.track_id == id).unwrap().count;
+        assert_eq!(count(legacy), 4, "untracked (ms=0) plays count as real");
+        assert_eq!(count(finished), 3);
+        assert_eq!(count(mixed), 1, "the 4 skips on 'mixed' don't count");
     }
 
     #[test]
@@ -10575,6 +13199,8 @@ mod tests {
             greeting: "Good evening".into(),
             welcome_back: false,
             discovery_age_secs: Some(0),
+            station_ready: true,
+            partial: false,
         };
         assert!(
             serde_json::to_string(&out)
@@ -10587,11 +13213,36 @@ mod tests {
             greeting: String::new(),
             welcome_back: false,
             discovery_age_secs: None,
+            station_ready: true,
+            partial: false,
         };
         let s = serde_json::to_string(&empty).unwrap();
         assert!(!s.contains("greeting"));
         // A None age is omitted so older clients see no unexpected field (N6).
         assert!(!s.contains("discovery_age_secs"));
+    }
+
+    // A brand-new profile has no plays, so the station seed pool is empty and a
+    // station would build zero tracks — the feed must say so (the client hides
+    // the tiles). One play is enough to flip it: that's exactly the pool
+    // `station_seeds` samples.
+    #[test]
+    fn station_readiness_follows_the_seed_pool() {
+        let conn = open_test_db();
+        assert!(
+            top_played_artists(&conn, None, 1).is_empty(),
+            "fresh profile: nothing to seed a station with"
+        );
+        assert!(station_seeds(&conn, None, 42).is_empty());
+
+        let id = seed_track(&conn, "t:a", "A", &["AA"], None, 200_000);
+        seed_play(&conn, id, None, plays_ago(1), 200_000, true);
+
+        assert!(!top_played_artists(&conn, None, 1).is_empty());
+        assert!(
+            !station_seeds(&conn, None, 42).is_empty(),
+            "readiness and the real seed pool must agree"
+        );
     }
 
     // imp 7 — "On repeat" must rank by completion weight, not raw play count:
@@ -11395,6 +14046,44 @@ mod tests {
         assert!(mon.iter().any(|s| s.title == "Release Radar"), "release shelf untouched on Mon");
     }
 
+    #[test]
+    fn arrange_shelves_pins_release_radar_off_friday() {
+        use ShelfIntent::*;
+        let mk = |title: &str, intent: ShelfIntent, rank: u8| {
+            let mut s = track_row_shelf(title, vec![th(1, "a", "A", 0)]);
+            s.intent = intent;
+            s.release_rank = rank;
+            s
+        };
+        // A full lineup that exhausts the 7-slot budget and would rotate a lone
+        // Fresh shelf off the page on some visits — Release Radar (rank 3) must
+        // survive EVERY non-Friday visit regardless of the seed, exactly once.
+        let cands = || {
+            vec![
+                mk("F1", Familiar, 0),
+                mk("F2", Familiar, 0),
+                mk("F3", Familiar, 0),
+                mk("F4", Familiar, 0),
+                mk("Release Radar", Fresh, 3),
+                mk("New releases", Fresh, 1),
+                mk("D1", Discover, 0),
+                mk("D2", Discover, 0),
+                mk("D3", Discover, 0),
+                mk("E1", Editorial, 0),
+                mk("E2", Editorial, 0),
+                mk("E3", Editorial, 0),
+            ]
+        };
+        for seed in 1u64..24 {
+            let a = arrange_shelves(cands(), seed, chrono::Weekday::Wed);
+            assert_eq!(
+                a.iter().filter(|s| s.title == "Release Radar").count(),
+                1,
+                "Release Radar must be pinned exactly once on every non-Friday visit (seed {seed})"
+            );
+        }
+    }
+
     // --- rail tiles + spotlight (Made-for-you) --------------------------
 
     #[test]
@@ -11830,6 +14519,15 @@ mod tests {
         let u = seed_track(&conn, "u:1", "U", &["A"], None, 200_000);
         set_genre(&conn, u, "Unknown");
         seed_play(&conn, u, None, now, 200_000, true);
+        // The decoy needs a real profile row now: play_events cascades off
+        // profiles(id) since migration 024, so plays belonging to a profile
+        // that was never created are a state neither the DB nor the app can
+        // reach. Only the fixture was pretending otherwise.
+        conn.execute(
+            "INSERT INTO profiles (id, name, avatar_color) VALUES (2, 'Decoy', '#222222')",
+            [],
+        )
+        .unwrap();
         mk("Electronic", 8, 9, Some(2)); // profile 2 decoy — must not leak
 
         assert_eq!(
@@ -11840,12 +14538,99 @@ mod tests {
     }
 
     #[test]
+    fn top_genre_profile_tops_up_from_onboarding_picks() {
+        let conn = open_test_db();
+        let now = chrono::Utc::now().timestamp();
+        let set_saved_genres = |json: &str| {
+            conn.execute(
+                "INSERT OR REPLACE INTO profile_kv (profile_id, key, value)
+                 VALUES (1, 'saved_genres', ?1)",
+                params![json],
+            )
+            .unwrap();
+        };
+        let mk = |g: &str, plays: usize| {
+            for i in 0..8 {
+                let id = seed_track(&conn, &format!("{g}:{i}"), "S", &["A"], None, 200_000);
+                set_genre(&conn, id, g);
+                for _ in 0..plays {
+                    seed_play(&conn, id, Some(1), now, 200_000, true);
+                }
+            }
+        };
+        set_saved_genres(r#"["Electronic","Jazz"]"#);
+
+        // Cold profile: no play history → the onboarding genre picks stand in,
+        // so the "Popular in {genre}" shelves have something on day one.
+        assert_eq!(
+            top_genre_profile(&conn, Some(1), 3),
+            vec!["Electronic", "Jazz"],
+            "no history → onboarding genre picks fill the shelf"
+        );
+
+        // Thin history (one qualifying bucket, below MIN_GENRE_SEEDS): history
+        // leads, picks top up to fill the remaining slots.
+        mk("Rock", 2);
+        assert_eq!(
+            top_genre_profile(&conn, Some(1), 3),
+            vec!["Rock", "Electronic", "Jazz"],
+            "thin history leads, picks top up"
+        );
+
+        // Warm profile (>= MIN_GENRE_SEEDS real buckets): seeded purely by
+        // history, the picks fade — an established profile is unaffected.
+        mk("Pop", 1);
+        assert_eq!(
+            top_genre_profile(&conn, Some(1), 3),
+            vec!["Rock", "Pop"],
+            "warm profile seeded by history; picks ignored"
+        );
+    }
+
+    #[test]
     fn bucket_to_deezer_genre_maps_known_skips_folk() {
         assert_eq!(bucket_to_deezer_genre("Hip-Hop"), Some(116));
         assert_eq!(bucket_to_deezer_genre("Rock"), Some(152));
         assert_eq!(bucket_to_deezer_genre("Electronic"), Some(113));
         assert_eq!(bucket_to_deezer_genre("Folk"), None);
         assert_eq!(bucket_to_deezer_genre("nonsense"), None);
+    }
+
+    #[test]
+    fn pick_artist_prefers_exact_name_with_photo_by_fans() {
+        let real = "https://cdn-images.dzcdn.net/images/artist/hash/1000x1000-000000-80-0-0.jpg";
+        let blank = "https://cdn-images.dzcdn.net/images/artist//1000x1000-000000-80-0-0.jpg";
+        let mk = |id: u64, name: &str, pic: Option<&str>, fans: u64| crate::deezer::ArtistHit {
+            id,
+            name: name.into(),
+            picture_xl: pic.map(Into::into),
+            picture_big: None,
+            picture_medium: None,
+            nb_album: None,
+            nb_fan: Some(fans),
+        };
+
+        // Deezer's real ordering for "Drake": a 50-fan impostor first, the real
+        // 24M-fan Drake buried, plus a photo-less phantom. Must pick the real one.
+        let hits = vec![
+            mk(1, "Drake", Some(real), 50),
+            mk(2, "Drake", Some(real), 29),
+            mk(3, "Drake", Some(real), 24_030_757),
+            mk(4, "Nick Drake", Some(real), 101_633),
+            mk(5, "Drake", Some(blank), 14),
+        ];
+        assert_eq!(pick_artist_for_name(hits, "Drake").map(|a| a.id), Some(3));
+
+        // Exact name but every match is photo-less → still the most-fans exact
+        // match (not a different-name artist that happens to have a photo).
+        let no_photos = vec![
+            mk(10, "Zzz", Some(real), 9_000_000),
+            mk(11, "Solo", Some(blank), 100),
+            mk(12, "Solo", None, 5_000),
+        ];
+        assert_eq!(pick_artist_for_name(no_photos, "Solo").map(|a| a.id), Some(12));
+
+        assert!(pick_artist_for_name(vec![], "Anyone").is_none());
     }
 
     #[test]
@@ -11868,19 +14653,21 @@ mod tests {
     }
 
     // CI-style backstop mirroring the pre-commit leak-guard: catches a
-    // `--no-verify` bypass that lands engine-acquisition vocabulary in the open
-    // core. The token list lives ONLY in the (untracked) hook / its source
-    // script, so this test carries no such literals itself.
+    // `--no-verify` bypass that lands forbidden tokens in the open core. The
+    // token list lives ONLY in the (untracked) hook / its source script, so this
+    // test carries no such literals itself. Locally it reads the installed hook;
+    // point $BEETBOT_LEAKGUARD at the source script in CI (a fresh clone has no
+    // installed hook).
     #[test]
-    fn open_core_has_no_engine_tokens() {
+    fn open_core_has_no_forbidden_tokens() {
         use std::path::PathBuf;
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
-        let pattern_src = [
-            root.join(".git/hooks/pre-commit"),
-            root.join("../beetbot-app/scripts/leakguard-pre-commit.sh"),
-        ]
-        .into_iter()
-        .find_map(|p| std::fs::read_to_string(&p).ok());
+        let pattern_src = std::env::var("BEETBOT_LEAKGUARD")
+            .ok()
+            .map(PathBuf::from)
+            .into_iter()
+            .chain(std::iter::once(root.join(".git/hooks/pre-commit")))
+            .find_map(|p| std::fs::read_to_string(&p).ok());
         let Some(script) = pattern_src else {
             eprintln!("leak-guard pattern source not found; skipping tree scan");
             return;
@@ -11949,7 +14736,7 @@ mod tests {
         }
         assert!(
             offenders.is_empty(),
-            "open core contains engine-acquisition tokens:\n{}",
+            "open core contains forbidden tokens:\n{}",
             offenders.join("\n")
         );
     }

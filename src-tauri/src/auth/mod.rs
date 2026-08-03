@@ -194,6 +194,9 @@ impl SecurityLog {
         Self { path }
     }
 
+    /// The log file path. Read only by tests today; nothing in production reads
+    /// it back through the struct.
+    #[allow(dead_code)]
     pub fn path(&self) -> &Path {
         &self.path
     }

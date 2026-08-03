@@ -1,17 +1,25 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { FirstRunWizard } from '@/components/FirstRunWizard';
+import { CandidatesModal } from '@/components/CandidatesModal';
+import { useAddAudio } from '@/lib/addAudio';
+import { useResolveCapabilities } from '@/lib/capabilities';
 import { PlayerBar } from '@/components/PlayerBar';
 import { currentTrack, usePlayerStore } from '@/lib/store';
+import { usePlayerHotkeys } from '@/lib/usePlayerHotkeys';
 import { ambientGradient, extractDominantColor, type Rgb } from '@shared/albumColor';
 import { useAccentColor } from '@shared/useAccent';
+import { forgetScroll } from '@shared/useScrollMemory';
 import { usePinStore } from '@/lib/pins';
+import { useSavedStore } from '@/lib/saved';
 import { useUiStore } from '@/lib/ui';
 import { useAppearanceStore, applyZoom, clampZoom, ZOOM_STEP } from '@/lib/appearance';
+import { useAudioFxStore } from '@/lib/audiofx';
+import { setPlaybackProfile } from '@/lib/playbackPrefs';
 import { NowPlayingView } from '@/components/NowPlayingView';
 import { RightBar } from '@/components/RightBar';
 import { useProfileStore } from '@/lib/profile';
-import { setActiveProfileId } from '@shared/api';
+import { profileScopedKey, setActiveProfileId } from '@shared/api';
 import { ipc } from '@/lib/tauri';
 import { ProfileGate } from '@/components/ProfileGate';
 import { Sidebar } from '@/components/Sidebar';
@@ -27,6 +35,7 @@ import type { HomeDrillSnapshot } from '@shared/components/HomeScreen';
 import { useNavStore } from '@/lib/nav';
 import { TopBar } from '@/components/TopBar';
 import { SettingsPage } from '@/pages/Settings';
+import { notifyLibraryChanged } from '@shared/libraryChanged';
 
 type View =
   | { name: 'home' }
@@ -39,16 +48,20 @@ type View =
 
 type MediaControlAction = 'play' | 'pause' | 'toggle' | 'next' | 'prev' | 'stop';
 
+/** Base key for "this profile has seen the first-run wizard" — scoped per
+ *  profile via `profileScopedKey`, so a second person's new profile gets
+ *  onboarding instead of landing in an empty app. (It was global once, which
+ *  meant the first profile's dismissal silently suppressed it for everyone.)
+ *  A profile that already has playlists never sees the wizard regardless. */
 const ONBOARDING_KEY = 'beetbot.onboarding_seen';
 
-// Floating-shell layout (identity swing X3): the sidebar, main, right panel, and
-// player render as frosted rounded panels separated by ink gaps, floating over
-// the artwork wash, instead of flush edge-to-edge bars. A single switch so the
-// whole prototype is reversible — flip to false to fall straight back to the
-// flush shell (every component keeps its original chrome on the false path).
-const FLOATING_SHELL = true;
+// Shell layout: the sidebar, main, right panel, and player render as frosted
+// rounded panels separated by ink gaps, floating over the artwork wash.
 
 function App() {
+  // Resolve this build's capabilities once (streaming / downloading). The
+  // open-core build resolves everything to false, hiding those affordances.
+  useResolveCapabilities();
   // Browser-style view history (back/forward in the top bar). The visible view
   // is `stack[index]`; navigating truncates forward entries and pushes. Each
   // entry also carries a snapshot of any page open OVER that view —
@@ -85,10 +98,19 @@ function App() {
   // Win-back (imp 8): true when Home has a hoisted "Welcome back" shelf; lights a
   // dot on the TopBar Home button while you're on another view.
   const [winBack, setWinBack] = useState(false);
+  // Bumped by the TopBar Home button so Home jumps to the top of the feed.
+  const [homeReset, setHomeReset] = useState(0);
   // `null` while we're still deciding whether to show the wizard; `true`
   // means "show it"; `false` means "don't". Three-state guard so we don't
   // briefly flash the wizard on every reload while we check the DB.
   const [showWizard, setShowWizard] = useState<boolean | null>(null);
+  // "Add profile" from the gate runs onboarding as ONE mounted flow (name → taste
+  // → …) instead of creating the profile in the gate and remounting into the
+  // wizard — that remount is what used to flash, and it left no way back to the
+  // name screen. While true, the wizard owns the whole screen and creates the
+  // profile at its first step; it outranks the gate so setting the active profile
+  // mid-flow doesn't swap the tree out from under it.
+  const [newProfileFlow, setNewProfileFlow] = useState(false);
 
   // Search lives in a persistent top bar; its results/detail pages overlay the
   // current view (SearchOverlay), so search is never a sidebar tab. `barSlot` is
@@ -239,9 +261,16 @@ function App() {
   // render (App is the root, so it runs before any child screen's fetch effect).
   setActiveProfileId(activeProfileId);
 
-  // Scope sidebar pins to the active profile (pins are per-profile UI state).
+  // Scope sidebar pins + saved artists + the desktop look (zoom, auto-open Now
+  // Playing) to the active profile. Pins/saved are KV-backed for cross-device
+  // sync; appearance is device-local. Without this, one profile's taste would
+  // carry into the next.
   useEffect(() => {
     usePinStore.getState().setProfile(activeProfileId);
+    useSavedStore.getState().setProfile(activeProfileId);
+    useAppearanceStore.getState().setProfile(activeProfileId);
+    useAudioFxStore.getState().setProfile(activeProfileId);
+    setPlaybackProfile(activeProfileId);
   }, [activeProfileId]);
 
   // The player store is a single global WebView localStorage (not per-profile),
@@ -255,11 +284,18 @@ function App() {
     const prev = prevProfileRef.current;
     if (prev != null && activeProfileId !== prev) {
       usePlayerStore.getState().reset();
+      // Land the newly-selected profile on Home — starting them wherever the
+      // last profile happened to be (Settings, an album, …) is disorienting.
+      navigate({ name: 'home' });
     }
     prevProfileRef.current = activeProfileId;
-  }, [activeProfileId]);
+  }, [activeProfileId, navigate]);
 
   const nowPlayingFull = useUiStore((s) => s.nowPlayingFull);
+  // "Add audio file" is opened from any surface (now-playing bar, album page)
+  // via the addAudio store; the modal is rendered ONCE here at the root.
+  const addAudioTrack = useAddAudio((s) => s.track);
+  const clearAddAudio = useAddAudio((s) => s.clear);
 
   // If the persisted profile was deleted (e.g. on another device), fall back
   // to the picker rather than querying a non-existent profile.
@@ -289,12 +325,23 @@ function App() {
     let cancelled = false;
     (async () => {
       try {
-        if (localStorage.getItem(ONBOARDING_KEY) === '1') {
+        if (
+          localStorage.getItem(profileScopedKey(ONBOARDING_KEY, activeProfileId)) === '1'
+        ) {
           if (!cancelled) setShowWizard(false);
           return;
         }
         const playlists = await ipc.listPlaylists(activeProfileId);
         if (cancelled) return;
+        // Re-read the flag: a gate "Add profile" onboarding can finish (marking
+        // it seen) while this listPlaylists is in flight — the new profile has no
+        // playlists yet, so without this we'd resurrect the wizard over the app.
+        if (
+          localStorage.getItem(profileScopedKey(ONBOARDING_KEY, activeProfileId)) === '1'
+        ) {
+          setShowWizard(false);
+          return;
+        }
         setShowWizard(playlists.length === 0);
       } catch {
         if (!cancelled) setShowWizard(false);
@@ -304,6 +351,17 @@ function App() {
       cancelled = true;
     };
   }, [activeProfileId]);
+
+  // Settings' "Personalize home" re-opens onboarding for the ACTIVE profile,
+  // bypassing the "already has playlists" auto-gate above (that gate only decides
+  // the FIRST, automatic run — this is an explicit, user-initiated redo). The
+  // taste steps refresh this profile's picks and re-seed Home; playlists,
+  // library, and downloads are left untouched.
+  useEffect(() => {
+    const onRerun = () => setShowWizard(true);
+    window.addEventListener('beetbot:rerun-onboarding', onRerun);
+    return () => window.removeEventListener('beetbot:rerun-onboarding', onRerun);
+  }, []);
 
   // Route OS media-key / Now-Playing events into the player store.
   useEffect(() => {
@@ -340,6 +398,9 @@ function App() {
   const npTrack = usePlayerStore(currentTrack);
   const artUrl = npTrack?.album_art_url ?? null;
   useAccentColor(artUrl);
+
+  // Space / arrows drive the player (play-pause, seek, track skip, volume).
+  usePlayerHotkeys();
 
   // --- Appearance: zoom + "open Now Playing on play" -----------------------
   const zoom = useAppearanceStore((s) => s.zoom);
@@ -401,16 +462,36 @@ function App() {
 
   const handleWizardDone = () => {
     try {
-      localStorage.setItem(ONBOARDING_KEY, '1');
+      if (activeProfileId != null) {
+        localStorage.setItem(profileScopedKey(ONBOARDING_KEY, activeProfileId), '1');
+      }
     } catch {
       // Storage may be blocked; the next launch will just re-show.
     }
     setShowWizard(false);
   };
 
+  // Adding a profile from the gate: run the onboarding wizard as one continuous
+  // flow, starting at its profile-creation step. Checked BEFORE the profile gate
+  // so that creating the profile (which sets activeProfileId) doesn't fall through
+  // to the main app and remount a second wizard — this instance stays mounted the
+  // whole way, so nothing flashes and Back reaches the name screen.
+  if (newProfileFlow) {
+    return (
+      <FirstRunWizard
+        newProfile
+        onCancel={() => setNewProfileFlow(false)}
+        onDone={() => {
+          setNewProfileFlow(false);
+          handleWizardDone();
+        }}
+      />
+    );
+  }
+
   // Gate the whole app behind profile selection (Netflix-style).
   if (activeProfileId == null) {
-    return <ProfileGate />;
+    return <ProfileGate onNewProfile={() => setNewProfileFlow(true)} />;
   }
 
   return (
@@ -430,7 +511,16 @@ function App() {
       <TopBar
         homeActive={view.name === 'home'}
         homeBadge={winBack && view.name !== 'home'}
-        onHome={() => navigate({ name: 'home' })}
+        onHome={() => {
+          // The Home button is an explicit "take me home", not a Back — so it
+          // lands at the TOP of the feed rather than resuming your last spot
+          // (Spotify's behaviour). Dropping the saved position covers arriving
+          // from another view; the signal covers already being on Home, where
+          // navigate() dedupes and nothing would otherwise move.
+          forgetScroll('home');
+          setHomeReset((n) => n + 1);
+          navigate({ name: 'home' });
+        }}
         onSettings={() => navigate({ name: 'settings' })}
         onOpenStats={() => navigate({ name: 'stats' })}
         onBack={goBack}
@@ -442,15 +532,12 @@ function App() {
         barSlotRef={setBarSlot}
       />
       <div
-        className={`flex-1 min-h-0 flex${
-          // pt-14 (56px) drops the cards just below the transparent header so
-          // their full rounded tops show (Spotify-style), without wasting room —
-          // the cards' own content padding provides the inner inset.
-          FLOATING_SHELL ? ' gap-2 px-2 pb-2 pt-14' : ''
-        }`}
+        // pt-14 (56px) drops the cards just below the transparent header so
+        // their full rounded tops show (Spotify-style), without wasting room —
+        // the cards' own content padding provides the inner inset.
+        className="flex-1 min-h-0 flex gap-2 px-2 pb-2 pt-14"
       >
         <Sidebar
-          floating={FLOATING_SHELL}
           active={view.name}
           onOpenPlaylist={(id) => navigate({ name: 'playlist', id })}
           onOpenLibrary={() => navigate({ name: 'library' })}
@@ -462,11 +549,7 @@ function App() {
           // an in-place rename (no view change).
           refreshSignal={`${view.name}:${playlistListTick}`}
         />
-        <main
-          className={`relative flex-1 min-h-0 overflow-hidden${
-            FLOATING_SHELL ? ' rounded-2xl border border-white/10' : ''
-          }`}
-        >
+        <main className="relative flex-1 min-h-0 overflow-hidden rounded-2xl border border-white/10">
           {view.name === 'home' && (
             <HomePage
               onOpenPlaylist={(id) => navigate({ name: 'playlist', id })}
@@ -475,6 +558,7 @@ function App() {
               onMixPush={onHomeDrillPush}
               mixRestore={homeRestore}
               onMixBack={goBack}
+              homeReset={homeReset}
             />
           )}
           {view.name === 'library' && (
@@ -511,22 +595,41 @@ function App() {
             restore={restore}
             onOverlayPush={onOverlayPush}
             onOverlayBack={goBack}
-            // Spotify/Apple-Music-style: tapping into the (idle) search box
-            // surfaces Discover as the browse/empty state behind the dropdown.
-            onSearchFocus={() => {
-              if (view.name !== 'browse') navigate({ name: 'browse' });
-            }}
-            onOpenBrowse={() => {
-              if (view.name !== 'browse') navigate({ name: 'browse' });
-            }}
+            // NB: no onSearchFocus — focusing the search box used to jump the
+            // main view to Discover, which read as a jarring page change. Now
+            // focusing just shows the recents dropdown over the current page;
+            // the in-field Browse button (below) is the explicit way to Discover.
+            // No `view.name !== 'browse'` guard: navigate() already dedupes the
+            // plain-grid case, and from a genre drill (same view name, drill
+            // snapshot present) it must still run — pushing a bare Browse entry
+            // and clearing the drill back to the grid. The guard was exactly
+            // why the Browse button did nothing from a genre page.
+            onOpenBrowse={() => navigate({ name: 'browse' })}
+            // "From your library" search results: open one of the user's own
+            // library playlists as a full page (same nav the sidebar uses).
+            onOpenLibraryPlaylist={(id) => navigate({ name: 'playlist', id })}
+            // Album/single pages: "Add audio file" on a fileless row resolves
+            // the catalog track to a library row, then opens the import modal.
+            onAddAudio={(t) => void useAddAudio.getState().openForCatalog(t)}
           />
         </main>
         {/* Always mounted — RightBar animates its own open/close width (and
             returns null when fully closed, so it adds no flex gap then). */}
-        <RightBar floating={FLOATING_SHELL} />
+        <RightBar />
       </div>
-      <PlayerBar floating={FLOATING_SHELL} />
+      <PlayerBar />
       {nowPlayingFull && <NowPlayingView />}
+      {addAudioTrack && (
+        <CandidatesModal
+          track={addAudioTrack}
+          onClose={clearAddAudio}
+          // The row flips to its playable/downloaded state everywhere that
+          // refetches on this event (sidebar, Home, album ✓, playlist).
+          onResolved={() =>
+            notifyLibraryChanged()
+          }
+        />
+      )}
       {showWizard && <FirstRunWizard onDone={handleWizardDone} />}
     </div>
   );

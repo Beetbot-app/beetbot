@@ -42,20 +42,35 @@ export function LyricsView({
   }, [lines, currentTime]);
 
   const activeRef = useRef<HTMLButtonElement | null>(null);
-  useEffect(() => {
-    activeRef.current?.scrollIntoView({ block: 'center', behavior: 'smooth' });
-  }, [activeIdx]);
-
-  // On a track change (new lyrics), jump the panel back to the top so it never
-  // inherits the previous song's scroll position. Keyed on the lyrics content
-  // (stable within a song) so it fires once per song, not on every tick; the
-  // synced auto-scroll above then follows playback from the first line.
-  // Declared after the active-line effect so, on the render where both fire,
-  // this reset wins and the new song starts at the top.
   const scrollRef = useRef<HTMLDivElement | null>(null);
+
+  // Keep the active line centered. The FIRST placement for a given song snaps
+  // there INSTANTLY, everything after follows playback smoothly. "First" covers
+  // both cases that used to land you at the top: opening the panel while a song
+  // is already mid-playback, and a new track's lyrics loading in. Without the
+  // instant snap, opening the lyrics sat at the top until the next line was
+  // reached (the old reset-to-top ran on mount and overrode the auto-scroll).
+  // No active line yet (playhead before the first timestamp) → sit at the top,
+  // which also gives a fresh track its top-of-lyrics start.
+  const lyricsKey = lyrics?.synced ?? lyrics?.plain ?? null;
+  const placedFor = useRef<string | null>(null);
   useEffect(() => {
-    if (scrollRef.current) scrollRef.current.scrollTop = 0;
-  }, [lyrics?.synced, lyrics?.plain]);
+    const firstPlacement = placedFor.current !== lyricsKey;
+    placedFor.current = lyricsKey;
+    const line = activeRef.current;
+    const box = scrollRef.current;
+    if (line && box) {
+      // Scroll THIS box only. scrollIntoView() would centre the line in every
+      // ancestor scroller too — which on the phone means every new lyric line
+      // drags the whole Now Playing sheet down to the lyrics card, whether or
+      // not you were looking at it.
+      const delta = line.getBoundingClientRect().top - box.getBoundingClientRect().top;
+      const top = box.scrollTop + delta - (box.clientHeight - line.offsetHeight) / 2;
+      box.scrollTo({ top, behavior: firstPlacement ? 'auto' : 'smooth' });
+    } else if (firstPlacement && box) {
+      box.scrollTop = 0;
+    }
+  }, [activeIdx, lyricsKey]);
 
   if (loading) {
     return (
@@ -77,7 +92,12 @@ export function LyricsView({
     return (
       <div
         ref={scrollRef}
-        className="h-full overflow-y-auto overscroll-contain px-1 py-[42%] [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden"
+        // overflow-x-hidden is load-bearing: `overflow-y-auto` alone leaves the
+        // x-axis computing to auto, and the active line's scale-[1.03] from
+        // origin-left overhangs the right edge — so lyrics could be dragged
+        // sideways. pr-3 gives that 3% somewhere to grow into, so the clip
+        // lands on empty padding rather than on the last glyph of a full line.
+        className="h-full overflow-y-auto overflow-x-hidden overscroll-contain pl-1 pr-3 py-[24%] [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden"
         // Fade lines out toward the top/bottom edges (Apple/Spotify "live
         // lyrics" look) so the active line near the middle is the focus.
         style={{
@@ -119,7 +139,7 @@ export function LyricsView({
   return (
     <div
       ref={scrollRef}
-      className="h-full overflow-y-auto overscroll-contain px-1 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden"
+      className="h-full overflow-y-auto overflow-x-hidden overscroll-contain pl-1 pr-3 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden"
     >
       {(lyrics.plain ?? '')
         .split('\n')

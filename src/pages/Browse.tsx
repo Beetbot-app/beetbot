@@ -5,9 +5,16 @@ import {
 } from '@shared/components/BrowseScreen';
 import { setApiBase, type SearchTrackResult } from '@shared/api';
 import { useProfileStore } from '@/lib/profile';
+import {
+  useSidebarPinController,
+  useSavedArtistController,
+} from '@/lib/detailControllers';
 import { useNavStore } from '@/lib/nav';
 import { useSession } from '@/lib/session';
 import { usePlayerStore, currentTrack } from '@/lib/store';
+import { useAddAudio } from '@/lib/addAudio';
+import { useDownloadsStore } from '@/lib/downloads';
+import { useCanDownload } from '@/lib/capabilities';
 import {
   likeCatalogTrack,
   playOnDesktop,
@@ -40,6 +47,9 @@ export function BrowsePage({
   // One shared session token, fetched once per app launch (not per navigation).
   const { token, error } = useSession();
   const activeProfileId = useProfileStore((s) => s.activeProfileId);
+  const canDownload = useCanDownload();
+  const pinController = useSidebarPinController();
+  const saveController = useSavedArtistController();
 
   // Now-playing awareness for the genre page (Spotify-style hero/sticky/row
   // highlight). A catalog row may not carry a library id until played, so match
@@ -107,10 +117,28 @@ export function BrowsePage({
         }
         onAlbumAddToQueue={(t) => void queueCatalogTrack(t, token)}
         onAlbumSaveToLiked={(t) => void likeCatalogTrack(t, token, activeProfileId)}
+        // File actions — a catalog row resolves to a library row on save; "Add
+        // audio file" opens the app-level CandidatesModal (App renders it).
+        canDownload={canDownload && activeProfileId != null}
+        onAddAudio={(t) => void useAddAudio.getState().openForCatalog(t)}
+        onDownload={(t) => {
+          if (activeProfileId != null)
+            void useDownloadsStore
+              .getState()
+              .downloadCatalog(t, activeProfileId);
+        }}
+        onRemoveDownload={(t) => {
+          if (t.local_track_id != null && activeProfileId != null)
+            void useDownloadsStore
+              .getState()
+              .remove(t.local_track_id, activeProfileId);
+        }}
         isTrackCurrent={isTrackCurrent}
         isNowPlaying={isNowPlaying}
         onTogglePlay={() => usePlayerStore.getState().playPause()}
         currentAlbumName={nowPlaying?.album ?? null}
+        pin={pinController}
+        save={saveController}
       />
     </div>
   );

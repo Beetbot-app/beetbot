@@ -1,7 +1,9 @@
-import { Fragment, useCallback, useEffect, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { currentTrack, usePlayerStore, useCatalogNav } from '../store';
+import { heartbeatQueue, upcomingQueueIndices } from '@shared/playerStore';
+import { canStream, currentTrack, usePlayerStore, useCatalogNav } from '../store';
 import {
+  AUDIO_CACHE_NAME,
   cacheKeyFor,
   castControl,
   castStart,
@@ -9,9 +11,6 @@ import {
   getCastStatus,
   getLikedTrackIds,
   getLyrics,
-  fetchRadioStreamTracks,
-  logPlay,
-  logPlayFinish,
   setTrackLiked,
   listCastDevices,
   listDevices,
@@ -26,26 +25,47 @@ import {
   isPlayable,
   trackArtUrl,
   notifyUnauthorized,
+  HEARTBEAT_QUEUE_MAX,
   type CastDevice,
   type HandoffPayload,
   type Lyrics,
   type RemoteAction,
+  type NowPlayingInfo,
   type RemoteDevice,
   type SearchTrackResult,
-  type StreamTrack,
 } from '@shared/api';
-import { AddToPlaylistModal } from '@shared/components/SearchScreen';
+import { AddToPlaylistModal } from '@shared/components/modals/AddToPlaylistModal';
+import { buildSearchTrackResult, streamToSearchResult } from '@shared/trackAdapter';
+import {
+  useSleepTimer,
+  useAutoplayRadio,
+  usePlayLogging,
+  useCompletionSignal,
+} from '@shared/playerHooks';
 import { useHubReachable } from '@shared/useHubReachable';
-import { cn, SCRIM, CALLOUT_ERROR, EYEBROW_ON_ART } from '@shared/ui';
+import { gradientTopColor, useThemeColor } from '@shared/useThemeColor';
+import { useSheetDismiss } from '@shared/useSheetDismiss';
+import { ART_FIT_WIDTH, cn, SCRIM, CALLOUT_ERROR, EYEBROW_ON_ART } from '@shared/ui';
 import { useAccentColor } from '@shared/useAccent';
 import { TrackActionSheet } from './TrackActionSheet';
-import { LyricsView } from '@shared/components/LyricsView';
 import { Marquee } from '@shared/components/Marquee';
 import { LikeButton } from '@shared/components/LikeButton';
 import { EqualizerBars } from '@shared/components/EqualizerBars';
-import { RemoteNowPlaying } from '@shared/components/RemoteNowPlaying';
+import { RemoteBar } from '@shared/components/RemoteBar';
+import { DevicesPanel } from '@shared/components/DevicesPanel';
+import { ConnectIcon } from '@shared/components/ConnectIcon';
+import { QueueIcon } from '@shared/components/QueueIcon';
+import { BEET_LIVE } from '@shared/ui';
+import { RemoteNowPlayingScreen } from '@shared/components/RemoteNowPlayingScreen';
+import {
+  FullLyricsScreen,
+  LyricsCard,
+  hasLyricsToShow,
+  lyricsCardBg,
+} from '@shared/components/LyricsCard';
 import { audioStarted, registerAudioPauser } from '@shared/audioCoordinator';
 import { formatDuration } from '@shared/format';
+import { notifyLibraryChanged } from '@shared/libraryChanged';
 import {
   PauseIcon,
   PlayIcon,
@@ -64,6 +84,11 @@ interface Props {
   /** Square the mini-bar's TOP corners so a docked connection banner sitting
    *  flush above it completes one rounded card (banner = tinted header). */
   flushTop?: boolean;
+  /** A connection banner (you're-offline / can't-reach-your-library) is docked
+   *  above the bar right now. A track's 404 while offline is the outage talking,
+   *  not a genuinely missing source — so suppress the "source not available"
+   *  flash instead of stacking a second, misleading banner on the outage one. */
+  connBannerShown?: boolean;
 }
 
 /**
@@ -112,6 +137,59 @@ function Spinner({ size = 22 }: { size?: number }) {
  * so callers can `await` instead of nesting event handlers. Used for
  * artwork inlining (see the `artworkDataUrlsRef` comment in Player).
  */
+// iOS — incl. iPadOS masquerading as macOS — the one platform that
+// deactivates a backgrounded page's audio session seconds after the
+// <audio> element pauses, taking the lock-screen Now Playing card
+// (and any chance of resuming from it) down with it.
+const IS_IOS =
+  typeof navigator !== 'undefined' &&
+  (/iPad|iPhone|iPod/.test(navigator.userAgent) ||
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1));
+
+// How long a paused session is held open for lock-screen resume before
+// we let iOS reclaim it. Long enough for "paused to take a call /
+// stepped away"; bounded so a forgotten pause doesn't hold an audio
+// session (and its slice of battery) all night.
+const PAUSE_KEEPALIVE_MAX_MS = 15 * 60_000;
+
+/**
+ * A few seconds of genuine silence as an inline WAV. The pause
+ * keepalive loops this through a second <audio> element: WebKit keeps
+ * the page's audio session active only while something is actually
+ * playing — `mediaSession.playbackState = 'paused'` alone does not
+ * hold it, and `volume` is read-only on iOS so a muted copy of the
+ * real track is not an option (muted playback is ignored for session
+ * purposes anyway). A data: URL needs no network, no service worker,
+ * and works offline.
+ */
+function silentWavDataUrl(seconds: number): string {
+  const rate = 8000; // 8-bit mono PCM — smallest thing iOS will play
+  const samples = Math.floor(rate * seconds);
+  const buf = new ArrayBuffer(44 + samples);
+  const v = new DataView(buf);
+  const ascii = (off: number, s: string) => {
+    for (let i = 0; i < s.length; i++) v.setUint8(off + i, s.charCodeAt(i));
+  };
+  ascii(0, 'RIFF');
+  v.setUint32(4, 36 + samples, true);
+  ascii(8, 'WAVE');
+  ascii(12, 'fmt ');
+  v.setUint32(16, 16, true);
+  v.setUint16(20, 1, true); // PCM
+  v.setUint16(22, 1, true); // mono
+  v.setUint32(24, rate, true);
+  v.setUint32(28, rate, true); // byte rate (8-bit mono = sample rate)
+  v.setUint16(32, 1, true); // block align
+  v.setUint16(34, 8, true); // bits per sample
+  ascii(36, 'data');
+  v.setUint32(40, samples, true);
+  new Uint8Array(buf, 44).fill(0x80); // 8-bit PCM silence is the midpoint
+  const bytes = new Uint8Array(buf);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return `data:audio/wav;base64,${btoa(bin)}`;
+}
+
 function blobToDataUrl(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -153,29 +231,6 @@ function describeAudioError(err: MediaError | null): string {
  * call comes inside a user-initiated handler. After that, autoplay is
  * unlocked for this origin until the tab is closed.
  */
-// A tiny silent WAV. Played once (muted) on the fade element during a user
-// gesture to "bless" it, so later programmatic play() during a crossfade is
-// allowed by the browser's autoplay policy.
-const SILENT_WAV =
-  'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
-
-/** Track the OS "Reduce Motion" setting so we can swap slide/scale transitions
- *  for instant cross-fades (Apple replaces zoom transitions with a fade under
- *  Reduce Motion; the web equivalent is this media query). */
-function usePrefersReducedMotion(): boolean {
-  const [reduced, setReduced] = useState(
-    () =>
-      typeof window !== 'undefined' &&
-      !!window.matchMedia?.('(prefers-reduced-motion: reduce)').matches,
-  );
-  useEffect(() => {
-    const mq = window.matchMedia('(prefers-reduced-motion: reduce)');
-    const on = () => setReduced(mq.matches);
-    mq.addEventListener?.('change', on);
-    return () => mq.removeEventListener?.('change', on);
-  }, []);
-  return reduced;
-}
 
 /** Horizontal swipe → prev/next. Gestures are accelerators, never the only
  *  path — callers keep their visible prev/next buttons. Returns touch handlers
@@ -269,6 +324,47 @@ function extractVibrant(img: HTMLImageElement): string | null {
 
 /** Resolve album art to a backdrop accent color, re-running when the art URL
  *  changes. Null while loading / on failure (caller shows the default dark bg). */
+/**
+ * The muted album wash both player bars wear — a desaturated, ink-mixed version
+ * of the artwork's vibrant colour. Shared so the remote bar is tinted by the
+ * OTHER device's cover exactly the way the local bar is tinted by yours;
+ * anything else made the two read as different widgets.
+ */
+/**
+ * The full-bleed artwork gradient the Now Playing sheet wears — desaturated
+ * toward grey for a soft pastel wash, darker at the very top and bottom.
+ * Shared so the REMOTE sheet is washed by the other device's cover exactly the
+ * way the local one is washed by yours. Null when the colour is unknown, which
+ * both screens render as flat dark.
+ */
+export function artworkGradient(vibrant: string | null): string | null {
+  const m = vibrant?.match(/(\d+)\D+(\d+)\D+(\d+)/);
+  if (!m) return null;
+  let [r, g, b] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  const gray = 0.3 * r + 0.5 * g + 0.2 * b;
+  const DESAT = 0.42;
+  r = r * (1 - DESAT) + gray * DESAT;
+  g = g * (1 - DESAT) + gray * DESAT;
+  b = b * (1 - DESAT) + gray * DESAT;
+  const mix = (c: number, t: number, w: number) => Math.round(c * (1 - w) + t * w);
+  const mid = `rgb(${mix(r, 44, 0.32)}, ${mix(g, 44, 0.32)}, ${mix(b, 48, 0.32)})`;
+  const edge = `rgb(${mix(r, 24, 0.58)}, ${mix(g, 24, 0.58)}, ${mix(b, 26, 0.58)})`;
+  return `linear-gradient(to bottom, ${edge} 0%, ${mid} 22%, ${mid} 72%, ${edge} 100%)`;
+}
+
+function albumWash(vibrant: string | null): string {
+  const m = vibrant?.match(/(\d+)\D+(\d+)\D+(\d+)/);
+  if (!m) return 'rgb(12 12 14)';
+  let [r, g, b] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  const gray = 0.3 * r + 0.5 * g + 0.2 * b;
+  const DESAT = 0.42;
+  r = r * (1 - DESAT) + gray * DESAT;
+  g = g * (1 - DESAT) + gray * DESAT;
+  b = b * (1 - DESAT) + gray * DESAT;
+  const mix = (c: number, t: number, w: number) => Math.round(c * (1 - w) + t * w);
+  return `rgb(${mix(r, 14, 0.7)}, ${mix(g, 14, 0.7)}, ${mix(b, 16, 0.7)})`;
+}
+
 function useArtworkColor(artUrl: string | null | undefined): string | null {
   const [color, setColor] = useState<string | null>(null);
   useEffect(() => {
@@ -291,43 +387,28 @@ function useArtworkColor(artUrl: string | null | undefined): string | null {
   return color;
 }
 
-/** Build the SearchTrackResult shape AddToPlaylistModal expects from the
- *  now-playing StreamTrack. Mirrors HomeScreen's statToTrack for a local row:
- *  `source: 'local'` + `source_id` = the track id makes the host's
- *  patch_track_playlists LINK the existing library row to the chosen playlists
- *  (via its `source == 'local'` guard) rather than insert a duplicate. */
-export function streamToSearchResult(t: StreamTrack): SearchTrackResult {
-  return {
-    source: 'local',
-    source_id: String(t.id),
-    title: t.title,
-    artists: t.artists,
-    album: t.album ?? null,
-    album_art_url: t.album_art_url ?? null,
-    duration_ms: t.duration_ms,
-    isrc: null,
-    local_track_id: t.id,
-    in_playlist_ids: [],
-    has_audio: t.has_audio,
-    preview_url: null,
-    explicit: false,
-  };
-}
 
-export function Player({ token, profileId, bottomInset = true, flushTop = false }: Props) {
+export function Player({
+  token,
+  profileId,
+  bottomInset = true,
+  flushTop = false,
+  connBannerShown = false,
+}: Props) {
   const audioRef = useRef<HTMLAudioElement>(null);
-  // Crossfade (experimental, opt-in): a throwaway second <audio> plays the
-  // OUTGOING track's tail while the primary fades IN the next track. iOS
-  // ignores element.volume, so both are routed through Web Audio GainNodes.
-  // None of this is created unless crossfadeSeconds > 0.
-  const fadeRef = useRef<HTMLAudioElement>(null);
-  const audioCtxRef = useRef<AudioContext | null>(null);
-  const primaryGainRef = useRef<GainNode | null>(null);
-  const fadeGainRef = useRef<GainNode | null>(null);
-  const cfStateRef = useRef<'idle' | 'fading'>('idle');
-  const cfCleanupRef = useRef<number | null>(null);
-  const fadePrimedRef = useRef(false);
+  // The pause keepalive: a silent loop that holds the iOS audio session
+  // open while the user is logically paused, so the lock-screen card
+  // survives (verified on-device: without it, iOS reclaims the session
+  // ~10 s after a lock-screen pause and the controls vanish). Created
+  // lazily on first pause; capped by PAUSE_KEEPALIVE_MAX_MS.
+  const keepaliveRef = useRef<HTMLAudioElement | null>(null);
+  const keepaliveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const keepaliveAssertRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  // Ephemeral "source not available" flash shown when an unavailable track is
+  // auto-skipped. Kept separate from `errorMsg` (which is wiped on every track
+  // change) so advancing to the next track doesn't clear it before it's seen.
+  const [flashMsg, setFlashMsg] = useState<string | null>(null);
   const [audioSrc, setAudioSrc] = useState<string | null>(null);
   // While the user is dragging the scrubber, the visible thumb position
   // tracks this local state instead of the store's currentTime. Only on
@@ -406,7 +487,6 @@ export function Player({ token, profileId, bottomInset = true, flushTop = false 
   // Can the current track START playing right now? Downloaded tracks always
   // can (local file); a non-downloaded track needs a reachable hub for /live.
   const canPlayCurrent = !track ? false : canPlayNow(track);
-  useAccentColor(track?.album_art_url ? trackArtUrl(track.id, token) : null);
   // Extracted the SAME way as the Now Playing screen's backdrop, so the mini bar
   // can wear the same album tinge (see miniBarBg near the render).
   const barVibrant = useArtworkColor(
@@ -423,94 +503,49 @@ export function Player({ token, profileId, bottomInset = true, flushTop = false 
   // Swipe the mini bar left/right to skip tracks (tap still expands).
   const miniSwipe = useSwipeNav(next, prev);
   const playPause = usePlayerStore((s) => s.playPause);
-  const repeat = usePlayerStore((s) => s.repeat);
-  const shuffle = usePlayerStore((s) => s.shuffle);
-  const autoplay = usePlayerStore((s) => s.autoplay);
-  const currentIndex = usePlayerStore((s) => s.currentIndex);
-  const queueLength = usePlayerStore((s) => s.queue.length);
-  const appendToQueue = usePlayerStore((s) => s.appendToQueue);
   const adoptHandoff = usePlayerStore((s) => s.adoptHandoff);
-  const sleepTimerEndsAt = usePlayerStore((s) => s.sleepTimerEndsAt);
-  // Phone crossfade is DISABLED. Crossfading requires routing the <audio>
-  // element through Web Audio (iOS makes element.volume read-only), but iOS
-  // SUSPENDS the AudioContext when the app is backgrounded / the screen
-  // locks — which stops playback. Background playback matters far more than
-  // crossfade, so we force it off here (the engine below never activates,
-  // the audio element is never routed through Web Audio) and keep crossfade
-  // desktop-only. The persisted setting is ignored.
-  const crossfadeSeconds = 0;
-  const crossfadeAdvance = usePlayerStore((s) => s.crossfadeAdvance);
+  // Crossfade is desktop-only: it needs Web Audio (iOS makes element.volume
+  // read-only) but iOS suspends the AudioContext when backgrounded, which stops
+  // playback — background playback matters more. The phone never crossfades; the
+  // persisted crossfadeSeconds setting is ignored here.
 
   // Sleep timer: pause when the scheduled time arrives. (The "end of track"
   // variant is handled in the store's handleTrackEnded.)
-  useEffect(() => {
-    if (sleepTimerEndsAt == null) return;
-    const fire = () => {
-      usePlayerStore.getState().pause();
-      usePlayerStore.getState().setSleepTimer('off');
-    };
-    const ms = sleepTimerEndsAt - Date.now();
-    if (ms <= 0) {
-      fire();
-      return;
-    }
-    const t = setTimeout(fire, ms);
-    return () => clearTimeout(t);
-  }, [sleepTimerEndsAt]);
+  useSleepTimer(usePlayerStore);
 
   // ---- Liked Songs (heart) ----
   const [likedIds, setLikedIds] = useState<Set<number>>(new Set());
   useEffect(() => {
     if (!token) return;
     let cancelled = false;
-    void getLikedTrackIds(token, profileId).then((s) => {
-      if (!cancelled) setLikedIds(s);
-    });
+    const reload = () => {
+      void getLikedTrackIds(token, profileId).then((s) => {
+        if (!cancelled) setLikedIds(s);
+      });
+    };
+    reload();
+    // Keep the star honest when the like changes from another surface — e.g.
+    // un-ticking Favorites in the Add-to-playlist sheet un-likes the current
+    // track. Without this the mini + Now Playing star stay filled until the
+    // next mount. (Mirrors the desktop PlayerBar listener.)
+    window.addEventListener('beetbot:library-changed', reload);
     return () => {
       cancelled = true;
+      window.removeEventListener('beetbot:library-changed', reload);
     };
   }, [token, profileId]);
 
-  // ---- Listening stats: log a play once a track passes ~20s ----
-  const playLoggedRef = useRef<number | null>(null);
-  useEffect(() => {
-    if (!track) return;
-    if (currentTime < 1 && playLoggedRef.current === track.id) {
-      playLoggedRef.current = null; // track restarted — allow a fresh log
-    } else if (currentTime >= 20 && playLoggedRef.current !== track.id) {
-      playLoggedRef.current = track.id;
-      void logPlay(token, track.id, profileId);
-      // Same threshold the server uses to record a play: surface it to Home so
-      // the live "Recently played" prepend only shows tracks the feed will keep.
-      usePlayerStore.getState().markPlayLogged(track);
-    }
-  }, [currentTime, track?.id, token, profileId]);
+  // Play-logging, completion signal, and autoplay-radio are shared with the
+  // desktop player via hooks (see shared/playerHooks.ts).
+  usePlayLogging({ store: usePlayerStore, token, profileId });
 
-  // ---- Phase 0: completion signal (finished vs skipped) ----
   // Latest playback position of the CURRENT track, refreshed on each timeupdate
   // (and snapped to full length on natural end); reported for the OUTGOING track
   // when the track changes. Feeds completion-weighted recommendations later.
   const lastTickRef = useRef<{ id: number; ms: number; durMs: number } | null>(
     null,
   );
-  const reportFinishRef = useRef<
-    (p: { id: number; ms: number; durMs: number }) => void
-  >(() => {});
-  reportFinishRef.current = (p) => {
-    if (p.ms < 5000) return; // ignore accidental taps
-    const completed = p.durMs > 0 && p.ms >= 0.85 * p.durMs;
-    void logPlayFinish(token, p.id, p.ms, completed, profileId);
-  };
-  useEffect(() => {
-    const myId = track?.id;
-    // Cleanup runs when track.id changes (or the player unmounts), with the
-    // outgoing track's last tick still in the ref (the new track hasn't ticked
-    // yet). Refs keep this effect from re-firing on token/profile changes.
-    return () => {
-      const p = lastTickRef.current;
-      if (p && p.id === myId) reportFinishRef.current(p);
-    };
-  }, [track?.id]);
+  useCompletionSignal({ store: usePlayerStore, token, profileId, lastTickRef });
 
   const trackLiked = track ? likedIds.has(track.id) : false;
   const applyLike = useCallback(
@@ -521,14 +556,21 @@ export function Player({ token, profileId, bottomInset = true, flushTop = false 
         else s.delete(id);
         return s;
       });
-      void setTrackLiked(token, id, next, profileId).catch(() => {
-        setLikedIds((prev) => {
-          const s = new Set(prev);
-          if (next) s.delete(id);
-          else s.add(id);
-          return s;
+      void setTrackLiked(token, id, next, profileId)
+        .then(() => {
+          // Tell the rest of the app (Home Favorites shelf, Library counts, the
+          // Favorites playlist) so they refresh live — the star already updated
+          // itself optimistically above.
+          notifyLibraryChanged();
+        })
+        .catch(() => {
+          setLikedIds((prev) => {
+            const s = new Set(prev);
+            if (next) s.delete(id);
+            else s.add(id);
+            return s;
+          });
         });
-      });
     },
     [token, profileId],
   );
@@ -571,7 +613,11 @@ export function Player({ token, profileId, bottomInset = true, flushTop = false 
 
   // Prefetch the NEXT queued track's lyrics so they're cached the instant the
   // song rolls over. Fire-and-forget; keyed on the next track's id.
-  const nextLyricsTrack = usePlayerStore((s) => s.queue[s.currentIndex + 1] ?? null);
+  // peekNextIndex = the store's true next pick (shuffle-plan aware).
+  const nextLyricsTrack = usePlayerStore((s) => {
+    const i = s.peekNextIndex();
+    return i >= 0 ? s.queue[i] : null;
+  });
   useEffect(() => {
     if (!token || !nextLyricsTrack) return;
     void getLyrics(token, {
@@ -588,57 +634,14 @@ export function Player({ token, profileId, bottomInset = true, flushTop = false 
     setErrorMsg(null);
   }, [track?.id]);
 
-  // ---- Autoplay / radio: keep the queue flowing past its end ----
-  // When you reach the end of the queue with repeat OFF and autoplay ON, fetch
-  // songs similar to the current track's artist and append them — so a single
-  // track (or a finished playlist) rolls into a radio of similar music instead
-  // of stopping. Triggered while the last/second-to-last track plays so the
-  // appended songs are ready before this one ends (no audible gap).
-  const radioKeyRef = useRef('');
-  const radioInFlightRef = useRef(false);
-  useEffect(() => {
-    // Only while actually playing toward the end, repeat off, not shuffling
-    // (shuffle replays forever, never runs dry). The isPlaying gate avoids a
-    // speculative fetch on cold-open when parked at the tail.
-    if (!isPlaying || !autoplay || shuffle || repeat !== 'off' || !track) return;
-    const upcoming = queueLength - 1 - currentIndex; // tracks queued after current
-    if (upcoming > 1) return; // still plenty ahead
-    const seed = track.artists[0];
-    if (!seed) return;
-    // De-dupe identical triggers (same queue length + seed) so we fetch once
-    // per tail; after appending, queueLength changes and a new tail can trigger.
-    const key = `${queueLength}:${track.id}`;
-    if (radioInFlightRef.current || radioKeyRef.current === key) return;
-    radioKeyRef.current = key;
-    radioInFlightRef.current = true;
-    void (async () => {
-      try {
-        const more = await fetchRadioStreamTracks(seed, token, {
-          title: track.title,
-          limit: 30,
-          profileId,
-        });
-        const n = more.length ? appendToQueue(more) : 0;
-        // If the track already ended while this fetch was in flight (the queue
-        // ran dry and playback stopped at the tail), roll into the freshly-
-        // appended radio instead of staying stopped. The currentTime===0 +
-        // tail-index checks distinguish this from a deliberate mid-track pause.
-        if (n > 0) {
-          const s = usePlayerStore.getState();
-          if (
-            !s.isPlaying &&
-            s.currentTime === 0 &&
-            s.currentIndex === s.queue.length - n - 1
-          ) {
-            s.jumpTo(s.currentIndex + 1);
-          }
-        }
-      } finally {
-        radioInFlightRef.current = false;
-      }
-    })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoplay, repeat, shuffle, isPlaying, track?.id, queueLength, currentIndex, token, profileId]);
+  // Autoplay-radio: phone appends the radio StreamTracks directly (its queue row
+  // type IS StreamTrack); the token comes straight from the prop.
+  useAutoplayRadio({
+    store: usePlayerStore,
+    getToken: () => token,
+    profileId,
+    buildRadioTracks: (more) => more,
+  });
 
   // Mutual exclusion with the 30-second preview clips: when a preview starts,
   // this pauses the full-track player. (The reverse — starting playback pauses
@@ -850,6 +853,73 @@ export function Player({ token, profileId, bottomInset = true, flushTop = false 
     name: string;
   } | null>(null);
   const [castError, setCastError] = useState<string | null>(null);
+  // True while warming a streamed track's /live temp file before hand-off.
+  const [castPreparing, setCastPreparing] = useState(false);
+
+  // -- iOS pause keepalive ------------------------------------------------
+  // Hold the audio session open across a pause so the lock-screen card
+  // survives. Start is called from TWO places: synchronously inside the
+  // media-session 'pause' handler (still within the user-gesture window
+  // iOS grants those callbacks — a backgrounded page can't start
+  // playback outside one) and from the isPlaying effect (covers in-app
+  // pauses, which happen foregrounded where no gesture is needed).
+  const stopSessionKeepalive = useCallback(() => {
+    if (keepaliveTimerRef.current) {
+      clearTimeout(keepaliveTimerRef.current);
+      keepaliveTimerRef.current = null;
+    }
+    if (keepaliveAssertRef.current) {
+      clearInterval(keepaliveAssertRef.current);
+      keepaliveAssertRef.current = null;
+    }
+    keepaliveRef.current?.pause();
+  }, []);
+  const startSessionKeepalive = useCallback(() => {
+    if (!IS_IOS || castActive) return;
+    if (!keepaliveRef.current) {
+      const a = new Audio(silentWavDataUrl(3));
+      a.loop = true;
+      a.preload = 'auto';
+      a.setAttribute('playsinline', '');
+      keepaliveRef.current = a;
+    }
+    // The moment the silent loop starts, iOS re-infers "this page is
+    // playing" from it — flipping the lock-screen button to pause bars
+    // and showing the loop's own 3-second duration (observed on-device
+    // 27 Jul). The explicit playbackState only wins if it's re-asserted
+    // AFTER the element starts, and iOS re-infers at its own leisure,
+    // so keep re-asserting on a slow tick while the keepalive runs.
+    const assertPaused = () => {
+      if ('mediaSession' in navigator) {
+        navigator.mediaSession.playbackState = 'paused';
+      }
+    };
+    void keepaliveRef.current.play().then(assertPaused).catch(() => {
+      /* No gesture credit left — the card will drop as before. */
+    });
+    if (keepaliveAssertRef.current) clearInterval(keepaliveAssertRef.current);
+    keepaliveAssertRef.current = setInterval(assertPaused, 5_000);
+    if (keepaliveTimerRef.current) clearTimeout(keepaliveTimerRef.current);
+    keepaliveTimerRef.current = setTimeout(
+      stopSessionKeepalive,
+      PAUSE_KEEPALIVE_MAX_MS,
+    );
+  }, [castActive, stopSessionKeepalive]);
+  // Keep the keepalive in lockstep with the logical state: paused with a
+  // track → hold the session; casting / nothing loaded → off. On resume,
+  // stop the silent loop on a DELAY: the real element spins up first and
+  // the session is never empty mid-handoff (a gap there is how iOS ends
+  // up advancing the clock with no audio routed). Also the unmount
+  // teardown.
+  useEffect(() => {
+    if (isPlaying) {
+      const t = setTimeout(stopSessionKeepalive, 1_000);
+      return () => clearTimeout(t);
+    }
+    if (!track || castActive) stopSessionKeepalive();
+    else startSessionKeepalive();
+  }, [isPlaying, track?.id, castActive, startSessionKeepalive, stopSessionKeepalive]);
+  useEffect(() => () => stopSessionKeepalive(), [stopSessionKeepalive]);
 
   // Optimistically raise the buffering flag the instant `isPlaying`
   // becomes true — that way the spinner appears on the play button
@@ -976,7 +1046,10 @@ export function Player({ token, profileId, bottomInset = true, flushTop = false 
   // track onto the receiver. Guard with castedTrackIdRef so we don't
   // re-LOAD the track that's already playing.
   useEffect(() => {
-    if (!castActive || !track || !track.has_audio) return;
+    // Castable = downloaded OR live-streamable; cast_start warms a streamed
+    // next-track server-side before the receiver LOADs it (a cold one adds a
+    // short gap, an already-warm one is instant).
+    if (!castActive || !track || !canStream(track)) return;
     if (castedTrackIdRef.current === track.id) return;
     castedTrackIdRef.current = track.id;
     castStart(castActive.id, track.id, token)
@@ -990,6 +1063,72 @@ export function Player({ token, profileId, bottomInset = true, flushTop = false 
 
   // ---- Playback handoff ("continue on the computer", and take a queue back).
   const [handoffDevices, setHandoffDevices] = useState<RemoteDevice[]>([]);
+  // The Devices panel, opened from the player bar in either mode.
+  const [devicesOpen, setDevicesOpen] = useState(false);
+
+  // What we've asked another device to do and haven't seen confirmed yet.
+  // Without this the flow was: tap → we flip instantly → the very next poll
+  // (2s) still carries the OLD state, because the target only picks commands
+  // up every 1s and then heartbeats every 2s → we flip back → the truth
+  // finally lands and we flip again. Three transitions for one tap.
+  const pendingRef = useRef<Map<string, { playing: boolean; until: number }>>(
+    new Map(),
+  );
+  /** Overlay unconfirmed intent on a fresh device list, and retire each entry
+   *  the moment the hub agrees (or the window lapses, so a device that never
+   *  obeys can't pin the UI to a lie). */
+  const applyPending = useCallback((list: RemoteDevice[]): RemoteDevice[] => {
+    const pending = pendingRef.current;
+    if (pending.size === 0) return list;
+    const now = Date.now();
+    return list.map((d) => {
+      const want = pending.get(d.device_id);
+      if (!want || !d.now_playing) return d;
+      if (now > want.until || d.now_playing.is_playing === want.playing) {
+        pending.delete(d.device_id);
+        return d;
+      }
+      return { ...d, now_playing: { ...d.now_playing, is_playing: want.playing } };
+    });
+  }, []);
+  // The device whose full now-playing screen is open — held by id, not by
+  // object, so the screen keeps updating as presence polls come in.
+  const [openDeviceId, setOpenDeviceId] = useState<string | null>(null);
+  // ⋯ menu for the track playing on ANOTHER device. Owned here rather than in
+  // the shared screen because every item acts on this device: our library, our
+  // navigation, our modal stack.
+  const [remoteMenuOpen, setRemoteMenuOpen] = useState(false);
+  // Same catalog navigation the Now Playing overlay uses — selected here too,
+  // because the remote ⋯ menu lives at this level.
+  const openArtistNav = useCatalogNav((s) => s.openArtist);
+  const openAlbumNav = useCatalogNav((s) => s.openAlbum);
+  const [remoteAddTrack, setRemoteAddTrack] = useState<SearchTrackResult | null>(null);
+
+  // The remote bar wears the OTHER device's album wash, extracted exactly the
+  // same way — so "theirs" and "mine" look like one control, not two widgets.
+  // Read straight off the device list — it must come AFTER that state is
+  // declared (reading it earlier is a temporal-dead-zone crash tsc won't flag).
+  // Prefer the device whose full screen is open — including when it's PAUSED.
+  // Keying this on "whichever device is playing" meant a paused device had no
+  // artwork to extract from, so its screen lost the wash exactly when the
+  // local sheet would still have one.
+  const openDeviceForArt =
+    handoffDevices.find((d) => d.device_id === openDeviceId) ?? null;
+  const remoteNowPlaying =
+    openDeviceForArt?.now_playing ??
+    handoffDevices.find((d) => d.now_playing?.is_playing)?.now_playing ??
+    null;
+  const remoteArtUrl =
+    remoteNowPlaying?.track_id != null
+      ? trackArtUrl(remoteNowPlaying.track_id, token)
+      : (remoteNowPlaying?.album_art_url ?? null);
+  const remoteVibrant = useArtworkColor(remoteArtUrl);
+  // Accent follows whichever cover the bar is actually showing: ours normally,
+  // the other device's when we're idle and standing in for it. (Declared here,
+  // after remoteArtUrl — the hook order stays stable either way.)
+  useAccentColor(
+    track?.album_art_url ? trackArtUrl(track.id, token) : remoteArtUrl,
+  );
 
   // Heartbeat so other devices can see this phone (as a handoff target) and
   // what it's playing (for their "playing on Phone" banner), and keep our own
@@ -1000,19 +1139,40 @@ export function Player({ token, profileId, bottomInset = true, flushTop = false 
     const beat = () => {
       const st = usePlayerStore.getState();
       const cur = st.queue[st.currentIndex];
+      // What we play next, in true (shuffle-aware) order, so another device's
+      // "Up next" for us matches what will actually happen.
+      const up = heartbeatQueue(
+        st.queue,
+        st.currentIndex,
+        st.shuffle,
+        st.shuffleUpcomingIds,
+        HEARTBEAT_QUEUE_MAX,
+      );
       const np = cur
         ? {
             title: cur.title,
             artists: cur.artists,
             album_art_url: cur.album_art_url,
+            album: cur.album ?? null,
             is_playing: st.isPlaying,
+            // Playhead + length so the other device can draw a live progress
+            // bar for us. Read off the element rather than store state so it
+            // stays honest mid-scrub.
+            position_ms: Math.round(
+              (audioRef.current?.currentTime ?? st.currentTime ?? 0) * 1000,
+            ),
+            duration_ms: cur.duration_ms,
+            // The id, not a URL: the reader signs its own art request.
+            track_id: cur.id,
+            queue: up.items,
+            queue_len: up.total,
           }
         : null;
       // Scope presence to the active profile so accounts stay isolated.
-      void sendHeartbeat(token, 'Phone', 'phone', np, profileId);
+      void sendHeartbeat(token, null, 'phone', np, profileId);
       listDevices(token, profileId)
         .then((d) => {
-          if (!cancelled) setHandoffDevices(d);
+          if (!cancelled) setHandoffDevices(applyPending(d));
         })
         .catch(() => {});
     };
@@ -1104,10 +1264,13 @@ export function Player({ token, profileId, bottomInset = true, flushTop = false 
   }, [token, castActive, adoptHandoff]);
 
   // Hand the current queue + playhead to another device, then pause here.
+  // Returns what was sent (or null if nothing was), so the caller can show the
+  // receiving device's screen straight away instead of leaving you looking at
+  // a player that just went silent.
   const handleHandoff = useCallback(
-    async (device: RemoteDevice) => {
+    async (device: RemoteDevice): Promise<NowPlayingInfo | null> => {
       const st = usePlayerStore.getState();
-      if (st.queue.length === 0) return;
+      if (st.queue.length === 0) return null;
       const payload: HandoffPayload = {
         source_label: 'Phone',
         tracks: st.queue.map((t) => ({
@@ -1125,8 +1288,22 @@ export function Player({ token, profileId, bottomInset = true, flushTop = false 
       try {
         await postHandoff(token, device.device_id, payload);
         usePlayerStore.setState({ isPlaying: false });
+        const cur = st.queue[st.currentIndex];
+        return cur
+          ? {
+              title: cur.title,
+              artists: cur.artists,
+              album_art_url: cur.album_art_url,
+              album: cur.album ?? null,
+              is_playing: true,
+              position_ms: Math.round(payload.position * 1000),
+              duration_ms: cur.duration_ms,
+              track_id: cur.id,
+            }
+          : null;
       } catch (e) {
         console.warn('[beetbot] handoff failed', e);
+        return null;
       }
     },
     [token],
@@ -1134,11 +1311,17 @@ export function Player({ token, profileId, bottomInset = true, flushTop = false 
 
   const handleStartCast = useCallback(
     async (device: CastDevice) => {
-      if (!track || !track.has_audio) {
-        setCastError('Track is not downloaded yet — can\'t cast.');
+      if (!track) return;
+      if (!canStream(track)) {
+        setCastError("This track can't be cast yet.");
         return;
       }
       setCastError(null);
+      // Streamed (not-downloaded) track → warm its /live temp file BEFORE
+      // hand-off so the receiver gets a ready, seekable stream and never times
+      // out cold. Usually instant (we're likely already playing it); a cold
+      // track blocks a few seconds here, shown as "Preparing…".
+      const isLive = !track.has_audio;
       try {
         // Carry the local playhead over so the receiver picks up
         // where the listener was — clicking Cast mid-track shouldn't
@@ -1147,6 +1330,19 @@ export function Player({ token, profileId, bottomInset = true, flushTop = false 
           audioRef.current?.currentTime ??
           usePlayerStore.getState().currentTime ??
           0;
+        if (isLive) {
+          setCastPreparing(true);
+          try {
+            const warm = playbackUrl(track, token);
+            if (warm) {
+              await fetch(warm, { headers: { Range: 'bytes=0-1' }, cache: 'no-store' });
+            }
+          } catch {
+            /* cast_start also warms server-side; a failed pre-warm isn't fatal */
+          } finally {
+            setCastPreparing(false);
+          }
+        }
         const res = await castStart(device.id, track.id, token, localPos);
         // Remember the track we just LOADed so the track-change
         // effect doesn't immediately fire a redundant castStart.
@@ -1156,6 +1352,7 @@ export function Player({ token, profileId, bottomInset = true, flushTop = false 
         // and we want the transport button to render Pause.
         usePlayerStore.setState({ isPlaying: true });
       } catch {
+        setCastPreparing(false);
         setCastError("Couldn't connect to that speaker. Try again.");
       }
     },
@@ -1242,7 +1439,7 @@ export function Player({ token, profileId, bottomInset = true, flushTop = false 
       let newBlobUrl: string | null = null;
       try {
         if ('caches' in self) {
-          const cache = await caches.open('beetbot-audio-v1');
+          const cache = await caches.open(AUDIO_CACHE_NAME);
           const hit = await cache.match(cacheKeyFor(track.id));
           if (hit) {
             const blob = await hit.blob();
@@ -1284,10 +1481,16 @@ export function Player({ token, profileId, bottomInset = true, flushTop = false 
   // change so we never waste bandwidth on tracks we won't reach.
   useEffect(() => {
     if (!track) return;
-    const { queue, currentIndex } = usePlayerStore.getState();
-    const upcoming = [queue[currentIndex + 1], queue[currentIndex + 2]].filter(
-      (t): t is NonNullable<typeof t> => Boolean(t && isPlayable(t)),
-    );
+    const st = usePlayerStore.getState();
+    const { queue, currentIndex } = st;
+    // +1 = the store's true next pick (shuffle-plan aware). +2 is only
+    // knowable in sequential mode; under shuffle we warm just the +1.
+    const ni = st.peekNextIndex();
+    const upcoming = (
+      st.shuffle
+        ? [ni >= 0 ? queue[ni] : undefined]
+        : [queue[currentIndex + 1], queue[currentIndex + 2]]
+    ).filter((t): t is NonNullable<typeof t> => Boolean(t && isPlayable(t)));
     if (upcoming.length === 0) return;
     const ctrl = new AbortController();
     // Stagger by 2s and 6s so neither prefetch competes with the
@@ -1401,6 +1604,9 @@ export function Player({ token, profileId, bottomInset = true, flushTop = false 
   // at ids that no longer exist. Reset on any successful play; capped so an
   // all-dead queue skips through once and stops instead of looping forever.
   const goneRef = useRef(0);
+  // Timer that clears the brief "source not available" banner after a skip so
+  // it reads as a flash, not a persistent error.
+  const flashRef = useRef(0);
 
   // While `castActive` is set the receiver is the source of truth — the
   // local element must stay paused or we get two copies of the same
@@ -1439,14 +1645,15 @@ export function Player({ token, profileId, bottomInset = true, flushTop = false 
         // surface that as a user-visible error.
         if (err instanceof DOMException && err.name === 'AbortError') return;
         usePlayerStore.setState({ isPlaying: false });
-        if (err instanceof Error) {
-          // NotAllowedError = autoplay blocked, NotSupportedError = no codec
+        // NotSupportedError means the media element couldn't load the source —
+        // the same failure the <audio> 'error' handler below probes and resolves
+        // (skip / retry / "Song source not available"). Let that handler be the
+        // single source of truth instead of racing it with a premature banner.
+        if (err instanceof Error && err.name !== 'NotSupportedError') {
           setErrorMsg(
             err.name === 'NotAllowedError'
-              ? 'Tap play to start.'
-              : err.name === 'NotSupportedError'
-                ? "This track can't be played here."
-                : 'Playback failed. Try again.',
+              ? 'Tap play to start.' // autoplay blocked by the browser
+              : 'Playback failed. Try again.',
           );
         }
       });
@@ -1491,265 +1698,6 @@ export function Player({ token, profileId, bottomInset = true, flushTop = false 
     return () => document.removeEventListener('visibilitychange', onVisible);
   }, [castActive]);
 
-  // ---- Crossfade engine (experimental, opt-in) -------------------------
-  //
-  // iOS ignores HTMLMediaElement.volume, so fading requires Web Audio. We
-  // build a tiny graph ONLY when crossfade is enabled (default-off playback
-  // never touches Web Audio and stays the proven AirPlay-safe path). The
-  // primary <audio> stays the permanent AirPlay / MediaSession anchor and
-  // fades IN the next track; a throwaway second <audio> plays the OUTGOING
-  // tail and fades OUT. The primary never swaps.
-  const cfTargetIdRef = useRef<number | null>(null);
-
-  const abortCrossfade = useCallback(() => {
-    if (cfCleanupRef.current) {
-      window.clearTimeout(cfCleanupRef.current);
-      cfCleanupRef.current = null;
-    }
-    const fade = fadeRef.current;
-    if (fade) {
-      try {
-        fade.pause();
-        fade.removeAttribute('src');
-        fade.load();
-      } catch {
-        /* ignore */
-      }
-    }
-    const ctx = audioCtxRef.current;
-    if (ctx && primaryGainRef.current) {
-      primaryGainRef.current.gain.cancelScheduledValues(ctx.currentTime);
-      primaryGainRef.current.gain.value = 1;
-    }
-    if (ctx && fadeGainRef.current) {
-      fadeGainRef.current.gain.cancelScheduledValues(ctx.currentTime);
-      fadeGainRef.current.gain.value = 1;
-    }
-    cfStateRef.current = 'idle';
-  }, []);
-
-  // Build the Web Audio graph once: route both <audio> elements through gain
-  // nodes. createMediaElementSource permanently routes the primary through Web
-  // Audio, so this is only ever called from a user gesture (the unlock effect
-  // below), where we can also resume() — routing a suspended context would
-  // silence playback.
-  const buildGraph = useCallback((): boolean => {
-    if (primaryGainRef.current) return true; // already built
-    const main = audioRef.current;
-    const fade = fadeRef.current;
-    if (!main || !fade) return false;
-    const Ctor =
-      window.AudioContext ||
-      (window as unknown as { webkitAudioContext?: typeof AudioContext })
-        .webkitAudioContext;
-    if (!Ctor) return false;
-    try {
-      let ctx = audioCtxRef.current;
-      if (!ctx) {
-        ctx = new Ctor();
-        audioCtxRef.current = ctx;
-      }
-      const pg = ctx.createGain();
-      const fg = ctx.createGain();
-      pg.gain.value = 1;
-      fg.gain.value = 1;
-      ctx.createMediaElementSource(main).connect(pg).connect(ctx.destination);
-      ctx.createMediaElementSource(fade).connect(fg).connect(ctx.destination);
-      primaryGainRef.current = pg;
-      fadeGainRef.current = fg;
-      return true;
-    } catch (e) {
-      console.warn('[beetbot] crossfade: web audio init failed', e);
-      return false;
-    }
-  }, []);
-
-  // Unlock the context on a real user gesture. Browsers only allow
-  // AudioContext.resume() inside a gesture call stack — a React effect can't
-  // do it — which is why the earlier version never fired. While crossfade is
-  // enabled, the next tap/keypress creates + resumes the context and routes
-  // the elements, so the graph is live by the time a fade is due.
-  useEffect(() => {
-    if (crossfadeSeconds <= 0) return;
-    const unlock = () => {
-      const Ctor =
-        window.AudioContext ||
-        (window as unknown as { webkitAudioContext?: typeof AudioContext })
-          .webkitAudioContext;
-      if (!Ctor) return;
-      let ctx = audioCtxRef.current;
-      if (!ctx) {
-        try {
-          ctx = new Ctor();
-          audioCtxRef.current = ctx;
-        } catch {
-          return;
-        }
-      }
-      void ctx.resume().catch(() => {});
-      buildGraph();
-      // Bless the fade element: play a silent clip during this gesture so its
-      // later programmatic play() (mid-crossfade, outside any gesture) is
-      // allowed. Without this the fade element silently refuses to start.
-      const fade = fadeRef.current;
-      if (fade && !fadePrimedRef.current) {
-        fadePrimedRef.current = true;
-        try {
-          fade.src = SILENT_WAV;
-          const pr = fade.play();
-          if (pr && pr.then) {
-            pr
-              .then(() => {
-                try {
-                  fade.pause();
-                  fade.currentTime = 0;
-                } catch {
-                  /* ignore */
-                }
-              })
-              .catch(() => {
-                fadePrimedRef.current = false;
-              });
-          }
-        } catch {
-          fadePrimedRef.current = false;
-        }
-      }
-    };
-    document.addEventListener('pointerdown', unlock);
-    document.addEventListener('keydown', unlock);
-    return () => {
-      document.removeEventListener('pointerdown', unlock);
-      document.removeEventListener('keydown', unlock);
-    };
-  }, [crossfadeSeconds, buildGraph]);
-
-  // Ready check at fade time: graph built and context running (resume if it
-  // briefly suspended, e.g. after backgrounding).
-  const ensureAudioGraph = useCallback((): boolean => {
-    const ctx = audioCtxRef.current;
-    if (!ctx || !primaryGainRef.current) return false;
-    if (ctx.state !== 'running') {
-      void ctx.resume().catch(() => {});
-      return false;
-    }
-    return true;
-  }, []);
-
-  const startCrossfade = useCallback(
-    (remaining: number) => {
-      const main = audioRef.current;
-      const fade = fadeRef.current;
-      const { queue, currentIndex } = usePlayerStore.getState();
-      const outgoing = queue[currentIndex];
-      const incoming = queue[currentIndex + 1];
-      if (!main || !fade || !outgoing || !incoming) return;
-      if (!ensureAudioGraph()) return;
-      const ctx = audioCtxRef.current;
-      const primaryGain = primaryGainRef.current;
-      const fadeGain = fadeGainRef.current;
-      if (!ctx || !primaryGain || !fadeGain) return;
-
-      cfStateRef.current = 'fading';
-      cfTargetIdRef.current = incoming.id;
-      const dur = Math.max(0.25, remaining);
-      const pos = main.currentTime;
-
-      // Move the outgoing tail to the throwaway element at the same spot.
-      fade.src = playbackUrl(outgoing, token) ?? '';
-      const seekFade = () => {
-        try {
-          fade.currentTime = pos;
-        } catch {
-          /* will catch up once metadata lands */
-        }
-        fade.removeEventListener('loadedmetadata', seekFade);
-      };
-      fade.addEventListener('loadedmetadata', seekFade);
-      void fade.play().catch(() => {});
-
-      const now = ctx.currentTime;
-      fadeGain.gain.cancelScheduledValues(now);
-      fadeGain.gain.setValueAtTime(1, now);
-      fadeGain.gain.linearRampToValueAtTime(0.0001, now + dur);
-      primaryGain.gain.cancelScheduledValues(now);
-      primaryGain.gain.setValueAtTime(0.0001, now);
-      primaryGain.gain.linearRampToValueAtTime(1, now + dur);
-
-      // Promote the primary to the next track. The existing src/play effects
-      // load + start it from 0; it ramps up under primaryGain.
-      crossfadeAdvance(0);
-
-      if (cfCleanupRef.current) window.clearTimeout(cfCleanupRef.current);
-      cfCleanupRef.current = window.setTimeout(
-        () => abortCrossfade(),
-        dur * 1000 + 300,
-      );
-    },
-    [ensureAudioGraph, abortCrossfade, token, crossfadeAdvance],
-  );
-
-  // Arm the crossfade as the current track nears its end. Gated to: enabled,
-  // foreground (iOS freezes timers when backgrounded), online streaming (not
-  // offline blob URLs), and not casting.
-  useEffect(() => {
-    if (crossfadeSeconds <= 0 || castActive || !isPlaying || !track) return;
-    if (sourceMode !== 'streaming') return;
-    if (typeof document !== 'undefined' && document.visibilityState !== 'visible')
-      return;
-    // Warm + route the graph (cheap no-op once routed; resumes the context if
-    // a recent gesture lets it). Self-heal the primary gain back to full when
-    // idle, in case a prior fade was left interrupted.
-    const ready = ensureAudioGraph();
-    if (ready && cfStateRef.current === 'idle' && audioCtxRef.current && primaryGainRef.current) {
-      const g = primaryGainRef.current.gain;
-      if (g.value !== 1) {
-        g.cancelScheduledValues(audioCtxRef.current.currentTime);
-        g.value = 1;
-      }
-    }
-    if (cfStateRef.current !== 'idle' || !(duration > 0)) return;
-    const { queue, currentIndex } = usePlayerStore.getState();
-    if (currentIndex + 1 >= queue.length) return; // no next track to fade into
-    const remaining = duration - currentTime;
-    if (remaining > 0.2 && remaining <= crossfadeSeconds) {
-      startCrossfade(remaining);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    currentTime,
-    duration,
-    crossfadeSeconds,
-    castActive,
-    isPlaying,
-    track?.id,
-    sourceMode,
-    startCrossfade,
-  ]);
-
-  // Abort a fade if the user pauses or jumps to a track that isn't the one
-  // we were fading into (manual skip mid-fade) — otherwise the primary could
-  // be left stuck at a low gain.
-  useEffect(() => {
-    if (cfStateRef.current !== 'fading') return;
-    if (!isPlaying) {
-      abortCrossfade();
-      return;
-    }
-    if (track && cfTargetIdRef.current != null && track.id !== cfTargetIdRef.current) {
-      abortCrossfade();
-    }
-  }, [isPlaying, track?.id, abortCrossfade]);
-
-  // Tear down the audio context on unmount.
-  useEffect(
-    () => () => {
-      if (cfCleanupRef.current) window.clearTimeout(cfCleanupRef.current);
-      const ctx = audioCtxRef.current;
-      if (ctx && ctx.state !== 'closed') void ctx.close().catch(() => {});
-    },
-    [],
-  );
 
   // Pre-fetch the CURRENT track's artwork into the data-URL cache. On
   // a fresh track open this kicks off the fetch; once it lands we
@@ -1834,8 +1782,29 @@ export function Player({ token, profileId, bottomInset = true, flushTop = false 
       album: track.album ?? '',
       artwork,
     });
-    ms.setActionHandler('play', () => usePlayerStore.getState().play());
-    ms.setActionHandler('pause', () => usePlayerStore.getState().pause());
+    ms.setActionHandler('play', () => {
+      usePlayerStore.getState().play();
+      // Kick the element NOW, inside the action callback's user-gesture
+      // window. The store→effect path lands a tick later, outside it,
+      // and a backgrounded page's play() from there makes iOS advance
+      // the clock without routing any audio (observed on-device 27 Jul:
+      // ticker moves, silence). The keepalive loop is left running for
+      // the handoff — the isPlaying effect drops it a second later, so
+      // the audio session is never empty mid-swap.
+      const a = audioRef.current;
+      if (a && a.paused) {
+        void a.play().catch(() => {
+          /* The effect's retry path takes it from here. */
+        });
+      }
+    });
+    ms.setActionHandler('pause', () => {
+      usePlayerStore.getState().pause();
+      // Synchronously, while still inside the action callback's
+      // user-gesture window: hold the audio session open, or iOS
+      // reclaims it (and the lock-screen card) ~10 s from now.
+      startSessionKeepalive();
+    });
     ms.setActionHandler('previoustrack', () =>
       usePlayerStore.getState().prev(),
     );
@@ -1858,6 +1827,8 @@ export function Player({ token, profileId, bottomInset = true, flushTop = false 
     track?.album_art_url,
     token,
     currentArtworkDataUrl,
+    startSessionKeepalive,
+    stopSessionKeepalive,
   ]);
 
   // (3) Playback state — flips when isPlaying changes. Cheap.
@@ -1913,32 +1884,247 @@ export function Player({ token, profileId, bottomInset = true, flushTop = false 
       setRemoteActive(null);
     }
   }, [handoffDevices]);
+  // Reflect a transport command on the other device IMMEDIATELY, then let the
+  // 2-second presence poll confirm it. Without this, tapping pause on a remote
+  // device sat visibly dead for up to two seconds — the lag that made this feel
+  // unlike Connect. If the device never obeys, the next poll simply puts the
+  // real state back, so an optimistic guess is self-healing.
+  const echoRemoteState = useCallback((deviceId: string, playing: boolean) => {
+    setHandoffDevices((ds) =>
+      ds.map((d) =>
+        d.device_id === deviceId && d.now_playing
+          ? { ...d, now_playing: { ...d.now_playing, is_playing: playing } }
+          : d,
+      ),
+    );
+  }, []);
+  const commandDevice = useCallback(
+    (deviceId: string, action: RemoteAction) => {
+      if (action === 'play' || action === 'pause') {
+        const playing = action === 'play';
+        // Target polls commands every 1s then heartbeats every 2s, and we poll
+        // every 2s — so ~5s covers the worst honest round trip.
+        pendingRef.current.set(deviceId, { playing, until: Date.now() + 5000 });
+        echoRemoteState(deviceId, playing);
+      }
+      void postRemoteCommand(token, deviceId, action);
+    },
+    [token, echoRemoteState],
+  );
   const sendRemote = (action: RemoteAction) => {
-    if (remoteActive)
-      void postRemoteCommand(token, remoteActive.device_id, action);
+    if (remoteActive) commandDevice(remoteActive.device_id, action);
   };
-  const remoteBanner =
-    remoteActive && remoteActive.now_playing
-      ? createPortal(
-          <div className="fixed top-3 left-1/2 -translate-x-1/2 z-[60] w-[min(92vw,26rem)]">
-            <RemoteNowPlaying
-              label={remoteActive.label}
-              nowPlaying={remoteActive.now_playing}
-              onPlayPause={() =>
-                sendRemote(
-                  remoteActive.now_playing!.is_playing ? 'pause' : 'play',
-                )
+  // Another device actually playing right now — dots the Devices button while
+  // this phone has its own music going, so "something else is on" is visible
+  // without a second bar shouting it.
+  const otherPlaying =
+    handoffDevices.find((d) => d.now_playing?.is_playing) ?? null;
+  // The device picker, reachable from the bar in BOTH modes (local and
+  // remote) — previously it hid inside the expanded Now Playing, which meant
+  // that when this phone had nothing loaded there was no way to reach your
+  // devices at all: exactly the moment you need them.
+  // The open device's live row (re-read each poll) and its full screen.
+  const openDevice =
+    handoffDevices.find((d) => d.device_id === openDeviceId) ?? null;
+  const remoteScreen =
+    openDevice?.now_playing != null ? (
+      <RemoteNowPlayingScreen
+        label={openDevice.label}
+        nowPlaying={openDevice.now_playing}
+        token={token}
+        bgGradient={artworkGradient(remoteVibrant)}
+        accent={remoteVibrant}
+        liked={
+          openDevice.now_playing.track_id != null &&
+          likedIds.has(openDevice.now_playing.track_id)
+        }
+        onToggleLike={
+          openDevice.now_playing.track_id != null
+            ? () => {
+                const id = openDevice.now_playing!.track_id!;
+                applyLike(id, !likedIds.has(id));
               }
-              onPrev={() => sendRemote('prev')}
-              onNext={() => sendRemote('next')}
-              onSync={() => void requestHandoff(token, remoteActive.device_id)}
-            />
-          </div>,
-          document.body,
-        )
-      : null;
+            : undefined
+        }
+        onOpenMenu={() => setRemoteMenuOpen(true)}
+        onCommand={(action) => commandDevice(openDevice.device_id, action)}
+        onPlayHere={() => {
+          void requestHandoff(token, openDevice.device_id);
+          setOpenDeviceId(null);
+          setDevicesOpen(false);
+        }}
+        onClose={() => setOpenDeviceId(null)}
+      />
+    ) : null;
 
-  if (!track) return remoteBanner;
+  // The ⋯ menu for a remote track. Four items, all of which act HERE: favourite
+  // and add-to-playlist are library writes keyed by track id, and the two
+  // navigations move this phone. Deliberately no sleep timer — that one really
+  // does belong to the device doing the playing.
+  const remoteNp = openDevice?.now_playing ?? null;
+  const remoteTrackId = remoteNp?.track_id ?? null;
+  const remoteArtist = remoteNp?.artists?.[0] ?? null;
+  const remoteMenu =
+    remoteMenuOpen && remoteNp ? (
+      <TrackActionSheet
+        onClose={() => setRemoteMenuOpen(false)}
+        quick={[
+          {
+            key: 'favorite',
+            label:
+              remoteTrackId != null && likedIds.has(remoteTrackId)
+                ? 'Favorited'
+                : 'Favorite',
+            icon: (
+              <svg width="22" height="22" viewBox="0 0 24 24" fill={remoteTrackId != null && likedIds.has(remoteTrackId) ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                <path d="m12 17.3-5.2 3 1-5.9-4.3-4.2 5.9-.9L12 4l2.6 5.3 5.9.9-4.3 4.2 1 5.9z" />
+              </svg>
+            ),
+            onClick: () => {
+              if (remoteTrackId != null) applyLike(remoteTrackId, !likedIds.has(remoteTrackId));
+            },
+          },
+          {
+            key: 'add',
+            label: 'Add',
+            icon: (
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                <path d="M12 5v14M5 12h14" />
+              </svg>
+            ),
+            onClick: () => {
+              if (remoteTrackId == null) return;
+              setRemoteAddTrack(
+                buildSearchTrackResult({
+                  source: 'local',
+                  id: remoteTrackId,
+                  title: remoteNp.title,
+                  artists: remoteNp.artists,
+                  album: remoteNp.album ?? null,
+                  album_art_url: remoteNp.album_art_url ?? null,
+                  duration_ms: remoteNp.duration_ms ?? 0,
+                  isrc: null,
+                  has_audio: true,
+                  in_playlist_ids: [],
+                }),
+              );
+            },
+          },
+        ]}
+        items={[
+          ...(remoteArtist
+            ? [
+                {
+                  key: 'artist',
+                  label: 'Go to Artist',
+                  icon: (
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                      <circle cx="12" cy="8" r="4" />
+                      <path d="M4 21c0-4 3.6-7 8-7s8 3 8 7" />
+                    </svg>
+                  ),
+                  onClick: () => {
+                    openArtistNav(remoteArtist);
+                    setOpenDeviceId(null);
+                    setDevicesOpen(false);
+                  },
+                },
+              ]
+            : []),
+          ...(remoteNp.album
+            ? [
+                {
+                  key: 'album',
+                  label: 'Go to Album',
+                  icon: (
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                      <circle cx="12" cy="12" r="9" />
+                      <circle cx="12" cy="12" r="2.5" />
+                    </svg>
+                  ),
+                  onClick: () => {
+                    openAlbumNav(remoteNp.album!, remoteArtist);
+                    setOpenDeviceId(null);
+                    setDevicesOpen(false);
+                  },
+                },
+              ]
+            : []),
+        ]}
+      />
+    ) : null;
+
+  // Screen + its ⋯ menu + the add-to-playlist modal travel together, so the two
+  // render sites below stay a single slot.
+  const remoteLayer = (
+    <>
+      {remoteScreen}
+      {remoteMenu}
+      {remoteAddTrack &&
+        createPortal(
+          <AddToPlaylistModal
+            token={token}
+            activeProfileId={profileId}
+            track={remoteAddTrack}
+            onClose={() => setRemoteAddTrack(null)}
+          />,
+          document.body,
+        )}
+    </>
+  );
+
+  // Always mounted so it can ANIMATE both ways: a 0fr→1fr grid row slides it
+  // open to its natural height (no magic max-height to guess, no jump when the
+  // device list changes length). Collapsed it's zero-height, inert and hidden
+  // from assistive tech rather than merely invisible.
+  const devicesPanel = (
+    <div
+      className={cn(
+        'grid transition-[grid-template-rows] duration-300 ease-out motion-reduce:transition-none',
+        devicesOpen ? 'grid-rows-[1fr]' : 'grid-rows-[0fr]',
+      )}
+      aria-hidden={!devicesOpen}
+    >
+      <div className={cn('overflow-hidden', !devicesOpen && 'pointer-events-none')}>
+        <DevicesPanel
+          devices={handoffDevices}
+          token={token}
+          onCommand={commandDevice}
+          onPlayHere={(deviceId) => {
+            void requestHandoff(token, deviceId);
+            setDevicesOpen(false);
+          }}
+          onOpenDevice={(d) => setOpenDeviceId(d.device_id)}
+        />
+      </div>
+    </div>
+  );
+
+  // Nothing loaded here, but another device is playing → THIS bar becomes that
+  // device's bar (Spotify-Connect-style), instead of the old floating strip
+  // stacked on top of the local one. Two bars at once was the thing that made
+  // the feature feel unlike Connect.
+  if (!track) {
+    return remoteActive && remoteActive.now_playing ? (
+      <>
+        <RemoteBar
+          label={remoteActive.label}
+          nowPlaying={remoteActive.now_playing}
+          token={token}
+          washBg={albumWash(remoteVibrant)}
+          bottomInset={bottomInset}
+          onPlayPause={() =>
+            sendRemote(remoteActive.now_playing!.is_playing ? 'pause' : 'play')
+          }
+          onNext={() => sendRemote('next')}
+          onOpenDevices={() => setDevicesOpen((v) => !v)}
+          devicesOpen={devicesOpen}
+          panel={devicesPanel}
+        />
+        {remoteLayer}
+      </>
+    ) : null;
+  }
 
   // Visual scrubbing state — set while the user is dragging the
   // slider, cleared when they release. The actual audio seek (which
@@ -1998,18 +2184,7 @@ export function Player({ token, profileId, bottomInset = true, flushTop = false 
   // gray, then mute toward near-black) so the two share the same tinge, pushed a
   // touch darker so the bar still reads as a distinct surface. Falls back to
   // flat near-black when the art color is unknown.
-  const miniBarBg = (() => {
-    const m = barVibrant?.match(/(\d+)\D+(\d+)\D+(\d+)/);
-    if (!m) return 'rgb(12 12 14)';
-    let [r, g, b] = [Number(m[1]), Number(m[2]), Number(m[3])];
-    const gray = 0.3 * r + 0.5 * g + 0.2 * b;
-    const DESAT = 0.42;
-    r = r * (1 - DESAT) + gray * DESAT;
-    g = g * (1 - DESAT) + gray * DESAT;
-    b = b * (1 - DESAT) + gray * DESAT;
-    const mix = (c: number, t: number, w: number) => Math.round(c * (1 - w) + t * w);
-    return `rgb(${mix(r, 14, 0.7)}, ${mix(g, 14, 0.7)}, ${mix(b, 16, 0.7)})`;
-  })();
+  const miniBarBg = albumWash(barVibrant);
 
   return (
     <div
@@ -2040,7 +2215,6 @@ export function Player({ token, profileId, bottomInset = true, flushTop = false 
             : '0 6px 24px rgba(0,0,0,0.45), 0 0 0 1px color-mix(in srgb, var(--color-accent) 22%, transparent), 0 0 22px -7px var(--color-accent)',
       }}
     >
-      {remoteBanner}
       <audio
         ref={audioRef}
         src={audioSrc ?? undefined}
@@ -2131,6 +2305,8 @@ export function Player({ token, profileId, bottomInset = true, flushTop = false 
           // so a future hiccup gets a fresh set of retries.
           retryRef.current.count = 0;
           goneRef.current = 0;
+          // Audio is flowing — clear any lingering error/flash banner.
+          setErrorMsg(null);
           setAudioWarmingUp(false);
           // Use the deferred helper so the spinner stays up for at
           // least the minimum visible window even when buffering is
@@ -2203,15 +2379,31 @@ export function Player({ token, profileId, bottomInset = true, flushTop = false 
                   const cap = Math.max(store.queue.length, 1);
                   goneRef.current += 1;
                   retryRef.current.count = 0;
+                  // A 404 means the hub answered, so the source really is gone —
+                  // UNLESS a connection banner is already up, in which case the
+                  // outage is the real story and a "source not available" banner
+                  // would just stack a second, misleading message on it.
+                  const showSourceBanner = !connBannerShown;
                   if (goneRef.current > cap) {
+                    // Skipped through the whole queue and nothing played — stop
+                    // and leave a persistent banner so the silence is explained.
                     goneRef.current = 0;
-                    setErrorMsg(
-                      'These tracks are no longer available — try a fresh playlist or station.',
-                    );
+                    if (showSourceBanner) setErrorMsg('Song source not available');
                     usePlayerStore.setState({ isPlaying: false });
                     return;
                   }
-                  setErrorMsg(null);
+                  // No source for this row — flash a brief banner and skip on.
+                  // `flashMsg` is its own state (not the track-change-cleared
+                  // `errorMsg`), so advancing to the next track doesn't wipe it
+                  // before it's seen; the timer owns how long the flash lasts.
+                  if (showSourceBanner) {
+                    setFlashMsg('Song source not available');
+                    window.clearTimeout(flashRef.current);
+                    flashRef.current = window.setTimeout(
+                      () => setFlashMsg(null),
+                      1500,
+                    );
+                  }
                   store.next();
                 } else {
                   scheduleRetry();
@@ -2226,16 +2418,16 @@ export function Player({ token, profileId, bottomInset = true, flushTop = false 
           usePlayerStore.setState({ isPlaying: false });
         }}
       />
-      {/* Throwaway crossfade element: plays only the OUTGOING track's tail
-          during a fade (routed through Web Audio gain). No handlers — it
-          never drives the store, MediaSession, or AirPlay. */}
-      <audio ref={fadeRef} preload="auto" playsInline />
-      {errorMsg ? (
+      {(errorMsg ?? flashMsg) ? (
         <div className={cn(CALLOUT_ERROR, 'mx-4 mt-3 text-xs break-words')}>
-          {errorMsg}
+          {errorMsg ?? flashMsg}
         </div>
       ) : null}
 
+      {remoteLayer}
+      {/* Devices, inline: the bar grows upward to show your other devices
+          instead of a modal covering the page. */}
+      {devicesPanel}
       {/* Single-row mini bar (Spotify-style): art + title/artist + play, with a
           thin progress line at the bottom edge. Tap to open Now Playing (full
           scrubber + shuffle/repeat live there); swipe to skip. */}
@@ -2281,6 +2473,27 @@ export function Player({ token, profileId, bottomInset = true, flushTop = false 
               {track.artists.join(', ')}
             </div>
           </div>
+        </button>
+        {/* Devices — always reachable from the bar, and dotted while another
+            device is playing. Opening it never disturbs playback here: on a
+            household server both devices may legitimately play at once, so
+            this bar stays YOURS and the sheet is where you steer theirs. */}
+        <button
+          type="button"
+          aria-label={
+            otherPlaying ? `Devices — also playing on ${otherPlaying.label}` : 'Devices'
+          }
+          aria-expanded={devicesOpen}
+          onClick={() => setDevicesOpen((v) => !v)}
+          className="relative h-11 w-9 shrink-0 grid place-items-center text-neutral-300 active:scale-90 transition"
+        >
+          <ConnectIcon size={20} />
+          {otherPlaying && (
+            <span
+              className="absolute top-1.5 right-1 h-2 w-2 rounded-full ring-2 ring-neutral-900"
+              style={{ backgroundColor: BEET_LIVE }}
+            />
+          )}
         </button>
         <button
           type="button"
@@ -2387,12 +2600,26 @@ export function Player({ token, profileId, bottomInset = true, flushTop = false 
           castDevices={castDevices}
           castActive={castActive}
           castError={castError}
+          castPreparing={castPreparing}
           onStartCast={handleStartCast}
           onStopCast={handleStopCast}
           handoffDevices={handoffDevices}
           onHandoff={(d) => {
             setConnectOpen(false);
-            handleHandoff(d);
+            void handleHandoff(d).then((sent) => {
+              if (!sent) return;
+              // Seed the row optimistically: the receiver takes a couple of
+              // seconds to adopt and heartbeat, and staring at a dead screen
+              // in the meantime is precisely the clunky part. The next poll
+              // replaces this with the device's own truth.
+              setHandoffDevices((ds) =>
+                ds.map((x) =>
+                  x.device_id === d.device_id ? { ...x, now_playing: sent } : x,
+                ),
+              );
+              setExpanded(false);
+              setOpenDeviceId(d.device_id);
+            });
           }}
           onClose={() => {
             setConnectOpen(false);
@@ -2487,10 +2714,15 @@ function NowPlayingOverlay({
   onAddToPlaylist,
   modalAbove,
 }: NowPlayingOverlayProps) {
-  // Toggle the album art for a karaoke-style synced lyrics view.
-  const [showLyrics, setShowLyrics] = useState(false);
-  // B3: swap the art for an editable "Up next" queue. Mutually exclusive with
-  // the lyrics view.
+  // Lyrics live in a card BELOW the player, not in place of the artwork — so
+  // the state to track is "has the sheet been scrolled down to it", which
+  // drives the Lyrics button's pressed look and makes the button a toggle
+  // between the two ends of the scroll.
+  const sheetScrollRef = useRef<HTMLDivElement | null>(null);
+  const lyricsCardRef = useRef<HTMLElement | null>(null);
+  const [atLyrics, setAtLyrics] = useState(false);
+  const [lyricsFull, setLyricsFull] = useState(false);
+  // B3: swap the art for an editable "Up next" queue.
   const [showQueue, setShowQueue] = useState(false);
   // Overflow "..." menu: add to playlist / go to artist / go to album / share.
   const [menuOpen, setMenuOpen] = useState(false);
@@ -2503,23 +2735,15 @@ function NowPlayingOverlay({
   const sleepAtTrackEnd = usePlayerStore((s) => s.sleepAtTrackEnd);
   const setSleepTimer = usePlayerStore((s) => s.setSleepTimer);
 
-  const reduceMotion = usePrefersReducedMotion();
-  // A1 slide-up enter + A2 swipe-down-to-dismiss. `entered` drives the mount
-  // slide (false→true on the first frame); `dragY` follows a downward drag on
-  // the header grabber; `dragging` disables the spring transition so the sheet
-  // tracks the finger 1:1.
-  const [entered, setEntered] = useState(false);
-  const [dragY, setDragY] = useState(0);
-  const [dragging, setDragging] = useState(false);
-  const dragYRef = useRef(0);
-  const dismissStart = useRef<{ x: number; y: number } | null>(null);
-  const dismissAxis = useRef<'none' | 'v' | 'h'>('none');
-  // Per-gesture flag: true when this touch must NOT drive the swipe-to-dismiss
-  // — either it began on an interactive control (buttons, scrubber, links) or
-  // inside a scroll region that isn't at the top (so a downward drag scrolls
-  // that region instead of dismissing, matching Apple Music).
-  const dismissDisabled = useRef(false);
-  const closeTimerRef = useRef<number | null>(null);
+  // A1 slide-up enter + A2 swipe-down-to-dismiss, shared with the remote
+  // device sheet so the same gesture works on both.
+  const {
+    reduceMotion,
+    requestClose,
+    handlers: dismissHandlers,
+    sheetStyle,
+    transitionClass,
+  } = useSheetDismiss({ onClose });
   // A3: swipe the album art left/right to skip (taps still double-tap-to-like).
   const artSwipe = useSwipeNav(onNext, onPrev);
   // B1: a subtle color-from-artwork wash behind the top of the sheet.
@@ -2527,129 +2751,32 @@ function NowPlayingOverlay({
   // Apple-Music-style full-bleed gradient sampled from the artwork: a muted,
   // slightly-vignetted wash of the cover's dominant color so white text/controls
   // stay legible over any album. Falls back to the flat dark bg when unknown.
-  const bgGradient = (() => {
-    const m = accent?.match(/(\d+)\D+(\d+)\D+(\d+)/);
-    if (!m) return null;
-    let [r, g, b] = [Number(m[1]), Number(m[2]), Number(m[3])];
-    // Desaturate toward gray for a soft, Apple-like pastel wash rather than a
-    // vivid block of the cover color.
-    const gray = 0.3 * r + 0.5 * g + 0.2 * b;
-    const DESAT = 0.42;
-    r = r * (1 - DESAT) + gray * DESAT;
-    g = g * (1 - DESAT) + gray * DESAT;
-    b = b * (1 - DESAT) + gray * DESAT;
-    const mix = (c: number, t: number, w: number) => Math.round(c * (1 - w) + t * w);
-    // Muted mid-tone; darker at the very top/bottom (subtle vignette).
-    const mid = `rgb(${mix(r, 44, 0.32)}, ${mix(g, 44, 0.32)}, ${mix(b, 48, 0.32)})`;
-    const edge = `rgb(${mix(r, 24, 0.58)}, ${mix(g, 24, 0.58)}, ${mix(b, 26, 0.58)})`;
-    return `linear-gradient(to bottom, ${edge} 0%, ${mid} 22%, ${mid} 72%, ${edge} 100%)`;
-  })();
+  const bgGradient = artworkGradient(accent);
+  // The OS paints the status-bar strip; theme-color is the only way to stop it
+  // reading as a black seam above the wash.
+  useThemeColor(gradientTopColor(bgGradient));
+  // Only offer the card when there's something to put in it — a permanent
+  // empty panel peeking under every song is noise, and it would leave the
+  // Lyrics button scrolling you to "Lyrics not available".
+  const hasLyricsCard = hasLyricsToShow(lyrics, lyricsLoading);
+  // The Lyrics button is a shortcut for the scroll, not a second way to see
+  // them: down to the card, and back up if you're already there.
+  const toggleLyrics = () => {
+    const sc = sheetScrollRef.current;
+    if (!sc) return;
+    // scrollHeight rather than the card's offset: the card is shorter than a
+    // screen now, so its top can't reach the fold — the browser would clamp
+    // and land somewhere arbitrary. Going to the end puts the whole card in
+    // view, which is the actual intent.
+    sc.scrollTo({
+      top: atLyrics ? 0 : sc.scrollHeight,
+      behavior: reduceMotion ? 'auto' : 'smooth',
+    });
+  };
   // Elapsed fraction for the Apple-style scrubber fill (bright fill left, faint
   // track right).
   const scrubPct =
     duration > 0 ? (Math.min(currentTime, duration) / duration) * 100 : 0;
-
-  useEffect(() => {
-    const id = requestAnimationFrame(() => setEntered(true));
-    return () => cancelAnimationFrame(id);
-  }, []);
-
-  // Close with a slide-down, then unmount once it finishes. Under Reduce
-  // Motion, skip the animation and close immediately.
-  const requestClose = useCallback(() => {
-    if (reduceMotion) {
-      onClose();
-      return;
-    }
-    // Already sliding out — ignore repeat triggers (e.g. swipe-dismiss then
-    // Escape) so we don't restart the countdown or queue a second onClose.
-    if (closeTimerRef.current != null) return;
-    setDragging(false);
-    setEntered(false);
-    closeTimerRef.current = window.setTimeout(() => {
-      closeTimerRef.current = null;
-      onClose();
-    }, 280);
-  }, [onClose, reduceMotion]);
-
-  // Cancel a pending slide-out if the overlay unmounts for an external reason
-  // (e.g. the track clears mid-dismiss) so onClose never fires post-unmount.
-  useEffect(
-    () => () => {
-      if (closeTimerRef.current != null) window.clearTimeout(closeTimerRef.current);
-    },
-    [],
-  );
-
-  // Swipe-down-to-dismiss — wired to the whole sheet so you can pull it down
-  // from anywhere that isn't a control (Apple Music-style). It never competes
-  // with scrolling because a downward drag only dismisses when the touch began
-  // outside any scrolled-down region (see startsInScrolledRegion). Axis-locked:
-  // only a downward vertical drag pulls the sheet; release past the threshold
-  // dismisses, otherwise it springs back.
-  const startsInScrolledRegion = (target: HTMLElement | null): boolean => {
-    let el: HTMLElement | null = target;
-    while (el && el !== document.body) {
-      if (el.scrollHeight > el.clientHeight + 1) {
-        const oy = getComputedStyle(el).overflowY;
-        if ((oy === 'auto' || oy === 'scroll') && el.scrollTop > 0) return true;
-      }
-      el = el.parentElement;
-    }
-    return false;
-  };
-  const onDismissTouchStart = (e: React.TouchEvent) => {
-    if (e.touches.length !== 1) return;
-    const target = e.target as HTMLElement | null;
-    // Don't hijack drags that begin on a control (play/skip/star/⋯, the
-    // scrubber, toolbar toggles, links) or inside a scroll region that's
-    // scrolled away from the top — those keep their native behavior.
-    dismissDisabled.current =
-      !!target?.closest(
-        'button, input, a, [role="button"], [role="slider"], [data-no-dismiss]',
-      ) || startsInScrolledRegion(target);
-    const t = e.touches[0];
-    dismissStart.current = { x: t.clientX, y: t.clientY };
-    dismissAxis.current = 'none';
-  };
-  const onDismissTouchMove = (e: React.TouchEvent) => {
-    if (dismissDisabled.current) return;
-    const s = dismissStart.current;
-    if (!s) return;
-    const t = e.touches[0];
-    const dx = t.clientX - s.x;
-    const dy = t.clientY - s.y;
-    if (dismissAxis.current === 'none' && (Math.abs(dx) > 8 || Math.abs(dy) > 8)) {
-      dismissAxis.current = Math.abs(dy) > Math.abs(dx) ? 'v' : 'h';
-    }
-    if (dismissAxis.current === 'v' && dy > 0) {
-      dragYRef.current = dy;
-      if (!dragging) setDragging(true);
-      setDragY(dy);
-    }
-  };
-  const onDismissTouchEnd = () => {
-    dismissStart.current = null;
-    dismissAxis.current = 'none';
-    const y = dragYRef.current;
-    dragYRef.current = 0;
-    setDragging(false);
-    if (y > 120) {
-      requestClose();
-    } else {
-      setDragY(0);
-    }
-  };
-
-  // Lock background scroll while the overlay is up so dragging the
-  // scrubber doesn't accidentally scroll the playlist beneath it.
-  useEffect(() => {
-    const prev = document.body.style.overflow;
-    document.body.style.overflow = 'hidden';
-    return () => {
-      document.body.style.overflow = prev;
-    };
-  }, []);
 
   // Allow Escape to close, in addition to the chevron-down. Useful on
   // desktop browsers where the overlay is otherwise modal.
@@ -2675,24 +2802,17 @@ function NowPlayingOverlay({
   // overlay to the bar's height instead of letting it cover the viewport.
   return createPortal(
     <div
-      className={`fixed inset-0 z-40 flex flex-col overflow-hidden bg-neutral-950 text-neutral-100 ${
-        dragging || reduceMotion
-          ? ''
-          : 'transition-[transform,border-radius] duration-300'
-      }`}
+      className={`fixed inset-0 z-40 flex flex-col overflow-hidden bg-neutral-950 text-neutral-100 ${transitionClass}`}
       style={{
         paddingTop: 'env(safe-area-inset-top)',
-        paddingBottom: 'env(safe-area-inset-bottom)',
-        transform:
-          entered || reduceMotion ? `translateY(${dragY}px)` : 'translateY(100%)',
-        // Corners round as the sheet is pulled down, revealing the app behind
-        // it at the top — the Apple Music drag-to-dismiss feel.
-        borderRadius: dragY > 0 ? Math.min(28, dragY * 0.6) : 0,
+        // No bottom inset here on purpose: padding the ROOT stops the sheet —
+        // and the lyrics card with it — a home-indicator's height above the
+        // physical bottom, leaving a dead strip of wash under the card. The
+        // inset moves to the scroller's padding instead, so backgrounds bleed
+        // to the screen edge while content still clears the indicator.
+        ...sheetStyle,
       }}
-      onTouchStart={onDismissTouchStart}
-      onTouchMove={onDismissTouchMove}
-      onTouchEnd={onDismissTouchEnd}
-      onTouchCancel={onDismissTouchEnd}
+      {...dismissHandlers}
       role="dialog"
       aria-modal="true"
       aria-label="Now Playing"
@@ -2712,44 +2832,124 @@ function NowPlayingOverlay({
       />
       {/* Grab handle — a visual affordance. The whole sheet is draggable
           (handlers live on the root), so no touch wiring is needed here. */}
-      <div
-        className="shrink-0 pt-2 pb-1 flex justify-center"
-        aria-hidden
-      >
-        <div className="h-1 w-9 rounded-full bg-white/40" />
+      <div className="shrink-0 pt-2 pb-1 flex justify-center">
+        {/* Tappable as well as draggable: the swipe still works, but a tap on
+            the handle is the quickest way back and costs nothing to offer. */}
+        <button
+          type="button"
+          onClick={onClose}
+          aria-label="Close Now Playing"
+          className="p-2 -m-1 active:opacity-70"
+        >
+          <span className="block h-1 w-9 rounded-full bg-white/40" />
+        </button>
       </div>
-      {/* Header: just the source ("Playing from …"), centered. Swipe anywhere
-          on the sheet (below) to dismiss — matching Apple, no redundant close
-          chevron. Sleep timer lives in the ⋯ menu now. */}
-      <div className="px-4 py-3 shrink-0 text-center">
-        <div className={EYEBROW_ON_ART}>
-          Playing from
+      {/* Header: the source ("Playing from …") centered, with Connect and Queue
+          pinned to the corners. px-6 is not a coincidence — it's the same inset
+          the content column below uses, so Connect's box lines up with the
+          song title's left edge and Queue's with the ⋯ button's right edge.
+          Swipe anywhere on the sheet (below) to dismiss — matching Apple, no
+          redundant close chevron. Sleep timer lives in the ⋯ menu now. */}
+      <div className="px-6 py-3 shrink-0 flex items-center gap-2">
+        <button
+          type="button"
+          onClick={onOpenConnect}
+          aria-label="Connect to a device"
+          title={castActive ? castActive.name : airPlayActive ? 'AirPlay' : 'Connect'}
+          className={cn(
+            // -ml-3 pulls the 44px tap target out by exactly the glyph's inset,
+            // so the ICON's left edge — not the button box's — lands on the
+            // 24px content margin the title, artwork and scrubber all share.
+            'h-11 w-11 -ml-3 shrink-0 grid place-items-center rounded-full active:bg-white/20',
+            castActive || airPlayActive
+              ? 'text-white bg-white/10'
+              : 'text-white/70 hover:bg-white/10 hover:text-white',
+          )}
+        >
+          {/* The same mark the phone bar and the desktop player draw — one
+              feature should not wear two different glyphs. */}
+          <ConnectIcon size={20} />
+        </button>
+        <div className="flex-1 min-w-0 text-center">
+          <div className={EYEBROW_ON_ART}>
+            Playing from
+          </div>
+          <div className="text-xs font-medium truncate text-white/90">
+            {album ?? 'Library'}
+          </div>
         </div>
-        <div className="text-xs font-medium truncate text-white/90">
-          {album ?? 'Library'}
-        </div>
+        <button
+          type="button"
+          onClick={() => {
+            setShowQueue((v) => !v);
+            // Opening the queue from the lyrics card would leave you staring at
+            // lyrics with a queue you can't see — go back up to the player.
+            sheetScrollRef.current?.scrollTo({ top: 0 });
+          }}
+          aria-label="Queue"
+          aria-pressed={showQueue}
+          title="Queue"
+          className={cn(
+            // Mirror of the Connect button: -mr-3 puts the glyph's right edge
+            // on 24px-from-the-right, level with the ⋯ button's circle below.
+            'h-11 w-11 -mr-3 shrink-0 grid place-items-center rounded-full active:bg-white/20',
+            showQueue
+              ? 'text-white bg-white/10'
+              : 'text-white/70 hover:bg-white/10 hover:text-white',
+          )}
+        >
+          {/* 20px, not 19 — matches ConnectIcon opposite it, and makes the
+              inset exactly 12px so the margins land on 24 / 351. */}
+          {/* Same mark the desktop player draws. */}
+          <QueueIcon size={20} />
+        </button>
       </div>
 
-      {/* Album art + metadata + transport */}
-      <div className="flex-1 min-h-0 overflow-y-auto px-6 pb-4 flex flex-col">
-        <div className="flex-1 min-h-0 flex items-center justify-center py-4">
+      {/* The sheet body scrolls: one screenful of player, then the lyrics card
+          below it. */}
+      <div
+        ref={sheetScrollRef}
+        onScroll={(e) => setAtLyrics(e.currentTarget.scrollTop > 24)}
+        className="flex-1 min-h-0 overflow-y-auto px-6 pb-[calc(1rem+env(safe-area-inset-bottom))]"
+      >
+        {/* Player pane — art, metadata, transport. A fixed one screenful,
+            less the 48px that leaves the lyrics card's header row peeking.
+
+            The `+ env(safe-area-inset-bottom)` cancels the inset that the
+            scroller's own padding-bottom adds back in, so the peek is 48px on
+            every device rather than 48 + the home indicator. Measured off an
+            installed PWA it was 82pt — the card read as a big empty slab
+            instead of a header you scroll past. */}
+        <div
+          className={cn(
+            'flex flex-col',
+            hasLyricsCard ? 'h-[calc(100%-3.5rem+env(safe-area-inset-bottom))]' : 'min-h-full',
+          )}
+        >
+        <div
+          className="flex-1 min-h-0 flex items-center justify-center py-4"
+          // A size container so the cover can ask how tall its box is
+          // (100cqh) and stay square instead of letterboxing.
+          style={{ containerType: 'size' }}
+        >
           {showQueue ? (
             <div className="w-full max-w-md h-full min-h-0">
               <QueueView />
             </div>
-          ) : showLyrics ? (
-            <div className="w-full max-w-md h-full min-h-0">
-              <LyricsView
-                lyrics={lyrics}
-                currentTime={currentTime}
-                loading={lyricsLoading}
-                onSeekTo={onSeekTo}
-              />
-            </div>
           ) : (
             <div
-              className="w-[76%] max-w-sm mx-auto aspect-square rounded-2xl overflow-hidden bg-neutral-900 ring-1 ring-white/15 shadow-2xl shadow-black/60 select-none transition-transform duration-500"
-              style={{ transform: `scale(${isPlaying ? 1 : 0.94})` }}
+              // ART_FIT_WIDTH is the release valve for the pane's fixed
+              // height: on a screen too short for a full-width square the
+              // cover shrinks proportionally, staying square, instead of
+              // pushing the lyrics peek off the bottom. max-h-full stays as
+              // the fallback where container-query units are unsupported.
+              className="max-w-md max-h-full mx-auto aspect-square rounded-2xl overflow-hidden bg-neutral-900 ring-1 ring-white/15 shadow-2xl shadow-black/60 select-none transition-transform duration-500 ease-[cubic-bezier(0.22,1.2,0.36,1)]"
+              // Apple Music's signature: playing fills the content width (~24px
+              // margins, like Apple), then the cover shrinks notably inward when
+              // paused. 0.76 lands the paused size at roughly what the PLAYING
+              // size used to be — so playing now takes up much more of the
+              // screen and the shrink-on-pause reads clearly.
+              style={{ width: ART_FIT_WIDTH, transform: `scale(${isPlaying ? 1 : 0.76})` }}
               onDoubleClick={onDoubleTapArt}
               {...artSwipe.handlers}
               title="Double-tap to like · swipe to change track"
@@ -2924,73 +3124,41 @@ function NowPlayingOverlay({
             </svg>
           </button>
         </div>
+        </div>
+
+        {/* Lyrics card — a PREVIEW you scroll down to, not the lyrics
+            themselves. It used to be a full-screen box with its own scroller
+            nested inside the sheet's: scroll a little too far and you were
+            deep in a list that swallowed the gesture to get back out. A few
+            fixed lines and a "Show lyrics" button means there is nothing here
+            to get lost in; the whole reading experience moved to its own
+            screen, where it belongs. Shared with the remote device screen. */}
+        {hasLyricsCard && (
+          <LyricsCard
+            cardRef={lyricsCardRef}
+            lyrics={lyrics}
+            currentTime={currentTime}
+            loading={lyricsLoading}
+            bg={lyricsCardBg(accent)}
+            atLyrics={atLyrics}
+            onToggle={toggleLyrics}
+            onShowFull={() => setLyricsFull(true)}
+          />
+        )}
       </div>
 
-      {/* Bottom toolbar (Apple Music-style): Lyrics · Connect · Queue. Sits
-          OUTSIDE the scroll area so it never scrolls away. */}
-      <div className="shrink-0 px-6 pb-5 pt-2 flex items-center justify-around gap-2">
-        <button
-          type="button"
-          onClick={() => {
-            setShowLyrics((v) => !v);
-            setShowQueue(false);
-          }}
-          aria-label="Lyrics"
-          aria-pressed={showLyrics}
-          title="Lyrics"
-          className={cn(
-            'h-11 w-11 grid place-items-center rounded-full active:bg-white/20',
-            showLyrics
-              ? 'text-white bg-white/10'
-              : 'text-white/70 hover:bg-white/10 hover:text-white',
-          )}
-        >
-          <svg width="22" height="22" viewBox="0 0 16 16" fill="currentColor" aria-hidden>
-            <path d="M14 1a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H4.414A2 2 0 0 0 3 11.586l-2 2V2a1 1 0 0 1 1-1zM2 0a2 2 0 0 0-2 2v12.793a.5.5 0 0 0 .854.353l2.853-2.853A1 1 0 0 1 4.414 12H14a2 2 0 0 0 2-2V2a2 2 0 0 0-2-2z" />
-            <path d="M7.066 4.76A1.665 1.665 0 0 0 4 5.668a1.667 1.667 0 0 0 2.561 1.406c-.131.389-.375.804-.777 1.22a.417.417 0 1 0 .6.58c1.486-1.54 1.293-3.214.682-4.112zm4 0A1.665 1.665 0 0 0 8 5.668a1.667 1.667 0 0 0 2.561 1.406c-.131.389-.375.804-.777 1.22a.417.417 0 1 0 .6.58c1.486-1.54 1.293-3.214.682-4.112z" />
-          </svg>
-        </button>
-        <button
-          type="button"
-          onClick={onOpenConnect}
-          aria-label="Connect to a device"
-          title={castActive ? castActive.name : airPlayActive ? 'AirPlay' : 'Connect'}
-          className={cn(
-            'h-11 w-11 grid place-items-center rounded-full active:bg-white/20',
-            castActive || airPlayActive
-              ? 'text-white bg-white/10'
-              : 'text-white/70 hover:bg-white/10 hover:text-white',
-          )}
-        >
-          <svg width="23" height="23" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-            <path d="M6 18H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-2" />
-            <path d="M12 15l4.5 5.5h-9z" fill="currentColor" stroke="none" />
-          </svg>
-        </button>
-        <button
-          type="button"
-          onClick={() => {
-            setShowQueue((v) => !v);
-            setShowLyrics(false);
-          }}
-          aria-label="Queue"
-          aria-pressed={showQueue}
-          title="Queue"
-          className={cn(
-            'h-11 w-11 grid place-items-center rounded-full active:bg-white/20',
-            showQueue
-              ? 'text-white bg-white/10'
-              : 'text-white/70 hover:bg-white/10 hover:text-white',
-          )}
-        >
-          <svg width="23" height="23" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-            <path d="M8 6h12M8 12h12M8 18h12" />
-            <circle cx="4" cy="6" r="1.1" fill="currentColor" stroke="none" />
-            <circle cx="4" cy="12" r="1.1" fill="currentColor" stroke="none" />
-            <circle cx="4" cy="18" r="1.1" fill="currentColor" stroke="none" />
-          </svg>
-        </button>
-      </div>
+      {lyricsFull && hasLyricsCard && (
+        <FullLyricsScreen
+          title={title}
+          artists={artists}
+          lyrics={lyrics}
+          currentTime={currentTime}
+          loading={lyricsLoading}
+          onSeekTo={onSeekTo}
+          bg={lyricsCardBg(accent)}
+          onClose={() => setLyricsFull(false)}
+        />
+      )}
 
       {menuOpen && (
         <TrackActionSheet
@@ -3079,6 +3247,7 @@ function ConnectSheet({
   castDevices,
   castActive,
   castError,
+  castPreparing,
   onStartCast,
   onStopCast,
   handoffDevices,
@@ -3091,6 +3260,7 @@ function ConnectSheet({
   castDevices: CastDevice[];
   castActive: { id: string; name: string } | null;
   castError: string | null;
+  castPreparing: boolean;
   onStartCast: (d: CastDevice) => void;
   onStopCast: () => void;
   handoffDevices: RemoteDevice[];
@@ -3115,6 +3285,7 @@ function ConnectSheet({
   const rowBase =
     'w-full flex items-center gap-3 py-2.5 px-3 rounded-lg active:bg-white/10 text-left text-[15px]';
   const iconWrap = 'h-9 w-9 shrink-0 grid place-items-center rounded-full bg-white/10 text-white';
+  const sectionHead = `${EYEBROW_ON_ART} px-3 pt-3 pb-1`;
   const check = (
     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden className="text-white shrink-0">
       <path d="M5 13l4 4L19 7" />
@@ -3138,7 +3309,12 @@ function ConnectSheet({
         <h3 className="px-3 mb-1 text-sm font-semibold text-white/90">
           Connect to a device
         </h3>
-        <ul className="flex flex-col">
+        {/* Two different contracts, so two labelled groups. Everything under
+            "Sound output" is a speaker this phone borrows — the phone still
+            owns the playback. The devices below run Beetbot themselves and
+            play on their own, which is why they're separated and spelled out. */}
+        <p className={sectionHead}>Sound output</p>
+        <ul className="flex flex-col" aria-label="Sound output">
           {/* This device (local playback). While casting, tapping it stops the
               cast and brings playback back here. */}
           <li>
@@ -3188,7 +3364,8 @@ function ConnectSheet({
                 <button
                   type="button"
                   onClick={() => (active ? onStopCast() : onStartCast(d))}
-                  className={`${rowBase} ${active ? 'bg-white/10' : ''}`}
+                  disabled={castPreparing}
+                  className={`${rowBase} ${active ? 'bg-white/10' : ''} disabled:opacity-50`}
                 >
                   <span className={iconWrap}>
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
@@ -3201,24 +3378,72 @@ function ConnectSheet({
               </li>
             );
           })}
-          {/* Other Beetbot devices — hand the queue over ("Play on Computer") */}
-          {handoffDevices.map((d) => (
-            <li key={`ho-${d.device_id}`}>
-              <button type="button" onClick={() => onHandoff(d)} className={rowBase}>
-                <span className={iconWrap}>
-                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-                    <rect x="3" y="4" width="18" height="12" rx="2" />
-                    <path d="M8 20h8M12 16v4" />
-                  </svg>
-                </span>
-                <span className="flex-1 min-w-0 truncate">{d.label}</span>
-                {d.now_playing?.is_playing && (
-                  <span className="text-xs text-white/45 shrink-0">playing</span>
-                )}
-              </button>
-            </li>
-          ))}
         </ul>
+        {/* Other Beetbot devices — hand the queue over ("Play on Computer").
+            The heading and the line under it exist because nothing else in the
+            row says what tapping does: a Mac sitting in a list of Chromecasts
+            reads like one more speaker. */}
+        {handoffDevices.length > 0 && (
+          <>
+            <p className={sectionHead}>Your Beetbot devices</p>
+            {/* The sheet only opens from Now Playing, so there is always
+                something to hand over — no empty-queue case to hedge for. */}
+            <p className="px-3 pb-1.5 text-xs text-white/45">
+              Tap one to move your music over — this phone goes quiet.
+            </p>
+            <ul className="flex flex-col" aria-label="Your Beetbot devices">
+              {handoffDevices.map((d) => {
+                const np = d.now_playing;
+                const live = !!np?.is_playing;
+                return (
+                  <li key={`ho-${d.device_id}`}>
+                    <button
+                      type="button"
+                      onClick={() => onHandoff(d)}
+                      className={rowBase}
+                    >
+                      <span className={iconWrap}>
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                          <rect x="3" y="4" width="18" height="12" rx="2" />
+                          <path d="M8 20h8M12 16v4" />
+                        </svg>
+                      </span>
+                      <span className="block flex-1 min-w-0">
+                        <span className="block truncate">{d.label}</span>
+                        {/* What that device is doing right now — the green dot
+                            is the same live cue the Devices panel uses, and it
+                            only burns while the device is actually playing. */}
+                        <span className="mt-0.5 flex items-center gap-1.5 text-xs text-white/45">
+                          {live && (
+                            <span
+                              className="inline-block h-1.5 w-1.5 shrink-0 rounded-full"
+                              style={{ backgroundColor: BEET_LIVE }}
+                            />
+                          )}
+                          <span className="truncate">
+                            {np
+                              ? `${live ? '' : 'Paused · '}${np.title}${
+                                  np.artists.length ? ` — ${np.artists.join(', ')}` : ''
+                                }`
+                              : 'Nothing playing'}
+                          </span>
+                        </span>
+                      </span>
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          </>
+        )}
+        {castPreparing && (
+          <p className="px-3 mt-2 flex items-center gap-2 text-xs text-white/60">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" className="animate-spin" aria-hidden>
+              <path d="M21 12a9 9 0 1 1-6.2-8.6" />
+            </svg>
+            Preparing to cast…
+          </p>
+        )}
         {castError && (
           <p className="px-3 mt-2 text-xs text-red-300 break-words">{castError}</p>
         )}
@@ -3245,6 +3470,7 @@ function QueueView() {
   const removeAt = usePlayerStore((s) => s.removeAt);
   const jumpTo = usePlayerStore((s) => s.jumpTo);
   const moveItem = usePlayerStore((s) => s.moveItem);
+  const movePlanItem = usePlayerStore((s) => s.movePlanItem);
   const playNext = usePlayerStore((s) => s.playNext);
   const clearUpcoming = usePlayerStore((s) => s.clearUpcoming);
   // Queue-level playback modes surfaced as pills above the up-next list
@@ -3255,45 +3481,60 @@ function QueueView() {
   const toggleShuffle = usePlayerStore((s) => s.toggleShuffle);
   const toggleRepeat = usePlayerStore((s) => s.toggleRepeat);
   const setAutoplay = usePlayerStore((s) => s.setAutoplay);
-  // Active drag: the absolute queue index grabbed + the pointer's start/current
-  // Y. Drag is started from the grip handle only, so it never competes with
-  // tap-to-jump or list scrolling.
-  const [drag, setDrag] = useState<{ from: number; startY: number; y: number } | null>(
+  const plan = usePlayerStore((s) => s.shuffleUpcomingIds);
+  // Active drag: the grabbed DISPLAY position (within Up next) + the pointer's
+  // start/current Y. Display position, not queue index — under shuffle the
+  // list shows PLAN order, so the two no longer coincide. Drag is started from
+  // the grip handle only, so it never competes with tap-to-jump or scrolling.
+  const [drag, setDrag] = useState<{ fromPos: number; startY: number; y: number } | null>(
     null,
   );
-  // Abort an in-progress drag if playback advances under it — `drag.from` is an
-  // absolute index captured at drag-start, so a currentIndex change would make
-  // it point at a different track and reorder the wrong one.
+  // Abort an in-progress drag if playback advances (or shuffle toggles) under
+  // it — the grabbed position would point at a different track.
   useEffect(() => {
     setDrag(null);
-  }, [currentIndex]);
-  const rows = queue
-    .map((t, i) => ({ t, i }))
-    .filter(({ i }) => i >= currentIndex);
+  }, [currentIndex, shuffle]);
+  // Current row first, then Up next in TRUE play order (sequential tail, or
+  // the shuffle plan). `pos` is the display position within Up next; -1 marks
+  // the now-playing row.
+  const rows = useMemo(() => {
+    const cur = queue[currentIndex];
+    const upcoming = upcomingQueueIndices(queue, currentIndex, shuffle, plan).map(
+      (i, pos) => ({ t: queue[i], i, pos }),
+    );
+    return cur ? [{ t: cur, i: currentIndex, pos: -1 }, ...upcoming] : upcoming;
+  }, [queue, currentIndex, shuffle, plan]);
+  const upNextCount = rows.length - (rows[0]?.pos === -1 ? 1 : 0);
 
-  // Where the dragged row would drop, clamped to the upcoming range.
+  // Where the dragged row would drop, clamped to the Up-next range.
   const target =
     drag != null
       ? Math.max(
-          currentIndex + 1,
+          0,
           Math.min(
-            queue.length - 1,
-            drag.from + Math.round((drag.y - drag.startY) / QUEUE_ROW_H),
+            upNextCount - 1,
+            drag.fromPos + Math.round((drag.y - drag.startY) / QUEUE_ROW_H),
           ),
         )
       : -1;
 
-  // Translate a non-dragged upcoming row to open a gap at the drop target.
-  const rowShift = (i: number): number => {
-    if (drag == null) return 0;
-    if (target > drag.from && i > drag.from && i <= target) return -QUEUE_ROW_H;
-    if (target < drag.from && i < drag.from && i >= target) return QUEUE_ROW_H;
+  // Translate a non-dragged upcoming row to open a gap at the drop position.
+  const rowShift = (pos: number): number => {
+    if (drag == null || pos < 0) return 0;
+    if (target > drag.fromPos && pos > drag.fromPos && pos <= target) return -QUEUE_ROW_H;
+    if (target < drag.fromPos && pos < drag.fromPos && pos >= target) return QUEUE_ROW_H;
     return 0;
   };
 
   const endDrag = (commit: boolean) => {
-    if (drag != null && commit && target !== drag.from) {
-      moveItem(drag.from, target);
+    if (drag != null && commit && target !== drag.fromPos) {
+      if (shuffle) {
+        // The plan IS the play order under shuffle — reorder it directly.
+        movePlanItem(drag.fromPos, target);
+      } else {
+        // Sequential display is the contiguous queue tail: position ↔ index.
+        moveItem(currentIndex + 1 + drag.fromPos, currentIndex + 1 + target);
+      }
     }
     setDrag(null);
   };
@@ -3375,10 +3616,11 @@ function QueueView() {
         </button>
       </div>
       <ul className="flex flex-col">
-        {rows.map(({ t, i }) => {
-          const isCurrent = i === currentIndex;
-          const isDragging = drag?.from === i;
-          const translate = isDragging ? drag.y - drag.startY : rowShift(i);
+        {rows.map(({ t, i, pos }) => {
+          const isCurrent = pos === -1;
+          const isDragging = pos >= 0 && drag?.fromPos === pos;
+          const translate =
+            isDragging && drag ? drag.y - drag.startY : rowShift(pos);
           return (
             <Fragment key={`${i}:${t.id}`}>
               {isCurrent && (
@@ -3386,7 +3628,7 @@ function QueueView() {
                   Now playing
                 </li>
               )}
-              {i === currentIndex + 1 && (
+              {pos === 0 && (
                 <li className="px-1 pt-5 pb-1.5 flex items-center justify-between gap-2">
                   <span className={EYEBROW_ON_ART}>
                     Up next
@@ -3458,7 +3700,7 @@ function QueueView() {
                 <div className="flex items-center gap-0.5 shrink-0">
                   {/* Play next — jump this track to the top of Up next. Hidden
                       for the row that's already next (would be a no-op). */}
-                  {i > currentIndex + 1 && (
+                  {pos > 0 && (
                     <button
                       type="button"
                       onClick={() => playNext(i)}
@@ -3495,7 +3737,7 @@ function QueueView() {
                     onPointerDown={(e) => {
                       e.preventDefault();
                       e.currentTarget.setPointerCapture(e.pointerId);
-                      setDrag({ from: i, startY: e.clientY, y: e.clientY });
+                      setDrag({ fromPos: pos, startY: e.clientY, y: e.clientY });
                     }}
                     onPointerMove={(e) => {
                       setDrag((d) => (d ? { ...d, y: e.clientY } : d));

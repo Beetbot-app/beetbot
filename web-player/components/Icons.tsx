@@ -52,28 +52,6 @@ export function PauseIcon({ size = 22, ...rest }: IconProps) {
   );
 }
 
-export function PrevIcon({ size = 22, ...rest }: IconProps) {
-  return svg(
-    size,
-    <>
-      <path d="M6 6v12" />
-      <path d="M19.4 6.3 9 12l10.4 5.7a.5.5 0 0 0 .75-.43V6.73a.5.5 0 0 0-.75-.43Z" fill="currentColor" />
-    </>,
-    rest,
-  );
-}
-
-export function NextIcon({ size = 22, ...rest }: IconProps) {
-  return svg(
-    size,
-    <>
-      <path d="M18 6v12" />
-      <path d="M4.6 6.3 15 12 4.6 17.7a.5.5 0 0 1-.75-.43V6.73a.5.5 0 0 1 .75-.43Z" fill="currentColor" />
-    </>,
-    rest,
-  );
-}
-
 export function ShuffleIcon({ size = 20, ...rest }: IconProps) {
   return svg(
     size,
@@ -122,22 +100,6 @@ export function RepeatOneIcon({ size = 20, ...rest }: IconProps) {
       >
         1
       </text>
-    </>,
-    rest,
-  );
-}
-
-export function ChevronDownIcon({ size = 22, ...rest }: IconProps) {
-  return svg(size, <path d="m6 9 6 6 6-6" />, rest);
-}
-
-export function VolumeIcon({ size = 18, ...rest }: IconProps) {
-  return svg(
-    size,
-    <>
-      <path d="M11 5 6 9H3v6h3l5 4V5Z" fill="currentColor" />
-      <path d="M15.5 8.5a5 5 0 0 1 0 7" />
-      <path d="M18.5 5.5a9 9 0 0 1 0 13" />
     </>,
     rest,
   );

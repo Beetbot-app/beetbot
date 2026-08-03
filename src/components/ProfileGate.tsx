@@ -1,8 +1,20 @@
 import { useEffect, useRef, useState } from 'react';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
+import { Wordmark } from '@shared/components/Wordmark';
 import { ipc, type Profile } from '@/lib/tauri';
 import { useProfileStore } from '@/lib/profile';
+import { ambientGradient, extractDominantColor, type Rgb } from '@shared/albumColor';
+import {
+  BTN_GHOST,
+  BTN_PRIMARY,
+  BTN_SECONDARY,
+  EYEBROW,
+  INPUT,
+  SCRIM,
+  SHEET,
+  cn,
+} from '@shared/ui';
 
 const AVATAR_COLORS = [
   '#1db954', // green
@@ -18,6 +30,15 @@ const AVATAR_COLORS = [
 function initialOf(name: string): string {
   const t = name.trim();
   return t ? t[0]!.toUpperCase() : '?';
+}
+
+/** `#rrggbb` → Rgb, so a profile with no photo can still tint the gate from its
+ *  avatar colour (the photo path goes through extractDominantColor instead). */
+function hexToRgb(hex: string): Rgb | null {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
+  if (!m) return null;
+  const n = parseInt(m[1]!, 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
 }
 
 /** Avatar surface: the custom photo when set, else a colour + initial tile.
@@ -55,16 +76,19 @@ export function AvatarSurface({
 
 /**
  * Netflix-style "Who's listening?" gate. Shown whenever no profile is active.
- * Lets the user pick a profile (entering a PIN if one is set), add a new
- * profile, or manage (rename / recolor / set-PIN / delete) existing ones.
- * Selecting a profile sets it active in the store, which dismisses the gate.
+ * Lets the user pick a profile (entering a PIN if one is set) or add a new one.
+ * Editing / removing existing profiles lives in Settings → Account (owner-only)
+ * — the gate is pre-sign-in, so it doesn't expose that. Selecting a profile
+ * sets it active in the store, which dismisses the gate.
  */
-export function ProfileGate() {
+export function ProfileGate({ onNewProfile }: { onNewProfile: () => void }) {
   const setActiveProfile = useProfileStore((s) => s.setActiveProfile);
   const [profiles, setProfiles] = useState<Profile[] | null>(null);
-  const [manage, setManage] = useState(false);
-  const [editing, setEditing] = useState<Profile | 'new' | null>(null);
   const [pinFor, setPinFor] = useState<Profile | null>(null);
+  // The gate glows in the colour of whoever you're pointing at — their photo if
+  // they have one, else their avatar colour. Same wash the window and every
+  // hero use, so the first screen already speaks the app's language.
+  const [tint, setTint] = useState<Rgb | null>(null);
 
   const refresh = () =>
     ipc
@@ -76,6 +100,21 @@ export function ProfileGate() {
     refresh();
   }, []);
 
+  const hoverTint = (p: Profile | null) => {
+    if (!p) {
+      setTint(null);
+      return;
+    }
+    const fallback = hexToRgb(p.avatar_color);
+    if (!p.avatar_path) {
+      setTint(fallback);
+      return;
+    }
+    void extractDominantColor(convertFileSrc(p.avatar_path)).then((c) =>
+      setTint(c ?? fallback),
+    );
+  };
+
   const pick = (p: Profile) => {
     if (p.has_pin) {
       setPinFor(p);
@@ -84,81 +123,71 @@ export function ProfileGate() {
     }
   };
 
-  if (editing) {
-    return (
-      <ProfileForm
-        profile={editing === 'new' ? null : editing}
-        canDelete={(profiles?.length ?? 0) > 1}
-        onClose={() => setEditing(null)}
-        onSaved={() => {
-          setEditing(null);
-          refresh();
-        }}
-      />
-    );
-  }
-
   return (
-    <div className="fixed inset-0 z-50 bg-neutral-950 flex flex-col items-center justify-center p-8">
-      <h1 className="text-3xl font-bold tracking-tight mb-10 text-neutral-100">
-        Who&rsquo;s listening?
-      </h1>
-      <div className="flex flex-wrap items-start justify-center gap-6 max-w-3xl">
-        {(profiles ?? []).map((p) => (
-          <div key={p.id} className="flex flex-col items-center gap-2 w-28">
+    <div
+      className="fixed inset-0 z-50"
+      style={{
+        background: ambientGradient(tint, { anchor: 'window' }),
+        transition: 'background 700ms ease',
+      }}
+    >
+      {/* Same placement as the first-run wizard's, so the mark holds still as
+       *  you move gate → onboarding. */}
+      <div className="absolute top-7 left-8">
+        <Wordmark />
+      </div>
+      <div
+        className="flex h-full flex-col items-center justify-center p-8"
+        style={{ animation: 'beetbot-page-enter 280ms ease-out both' }}
+      >
+        <p className={cn(EYEBROW, 'mb-3 text-white/60')}>Welcome back</p>
+        <h1 className="mb-10 text-3xl font-bold tracking-tight text-neutral-100">
+          Who&rsquo;s listening?
+        </h1>
+        <div className="flex max-w-3xl flex-wrap items-start justify-center gap-6">
+          {(profiles ?? []).map((p) => (
+            <div key={p.id} className="flex w-28 flex-col items-center gap-2">
+              <button
+                type="button"
+                onClick={() => pick(p)}
+                onMouseEnter={() => hoverTint(p)}
+                onMouseLeave={() => hoverTint(null)}
+                onFocus={() => hoverTint(p)}
+                onBlur={() => hoverTint(null)}
+                className="group relative h-28 w-28 overflow-hidden rounded-2xl text-4xl shadow-lg ring-2 ring-white/10 transition hover:scale-105 hover:ring-white/60"
+              >
+                <AvatarSurface
+                  name={p.name}
+                  color={p.avatar_color}
+                  avatarPath={p.avatar_path}
+                />
+                {p.has_pin ? (
+                  <span className="absolute right-2 bottom-2 text-neutral-950/70">
+                    <LockIcon />
+                  </span>
+                ) : null}
+              </button>
+              <span className="max-w-full truncate text-sm text-neutral-300">
+                {p.name}
+              </span>
+            </div>
+          ))}
+          {/* Add profile tile */}
+          <div className="flex w-28 flex-col items-center gap-2">
             <button
               type="button"
-              onClick={() => (manage ? setEditing(p) : pick(p))}
-              className="group relative h-28 w-28 rounded-xl overflow-hidden text-4xl shadow-lg transition hover:scale-105 hover:ring-4 hover:ring-white/30"
+              onClick={onNewProfile}
+              className="grid h-28 w-28 place-items-center rounded-2xl border-2 border-dashed border-white/15 text-neutral-500 transition hover:border-white/40 hover:text-neutral-200"
+              aria-label="Add profile"
             >
-              <AvatarSurface
-                name={p.name}
-                color={p.avatar_color}
-                avatarPath={p.avatar_path}
-              />
-              {p.has_pin && !manage ? (
-                <span className="absolute bottom-2 right-2 text-neutral-950/70">
-                  <LockIcon />
-                </span>
-              ) : null}
-              {manage ? (
-                <span className="absolute inset-0 grid place-items-center bg-black/50 text-white">
-                  <EditIcon />
-                </span>
-              ) : null}
+              <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden>
+                <path d="M12 5v14M5 12h14" />
+              </svg>
             </button>
-            <span className="text-sm text-neutral-300 truncate max-w-full">
-              {p.name}
-            </span>
+            <span className="text-sm text-neutral-500">Add profile</span>
           </div>
-        ))}
-        {/* Add profile tile */}
-        <div className="flex flex-col items-center gap-2 w-28">
-          <button
-            type="button"
-            onClick={() => setEditing('new')}
-            className="h-28 w-28 rounded-xl grid place-items-center border-2 border-dashed border-neutral-700 text-neutral-500 hover:text-neutral-200 hover:border-neutral-500 transition"
-            aria-label="Add profile"
-          >
-            <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden>
-              <path d="M12 5v14M5 12h14" />
-            </svg>
-          </button>
-          <span className="text-sm text-neutral-500">Add profile</span>
         </div>
       </div>
-
-      <button
-        type="button"
-        onClick={() => setManage((v) => !v)}
-        className={`mt-12 px-5 py-2 rounded-lg border text-sm font-medium transition ${
-          manage
-            ? 'border-neutral-400 text-neutral-100'
-            : 'border-neutral-700 text-neutral-400 hover:text-neutral-100 hover:border-neutral-500'
-        }`}
-      >
-        {manage ? 'Done' : 'Manage profiles'}
-      </button>
 
       {pinFor ? (
         <PinPrompt
@@ -208,13 +237,14 @@ function PinPrompt({
   };
 
   return (
-    <div className="fixed inset-0 z-[60] bg-black/70 grid place-items-center p-6" onClick={onCancel}>
+    <div className={cn(SCRIM, 'z-[60] grid place-items-center p-6')} onClick={onCancel}>
       <form
         onClick={(e) => e.stopPropagation()}
         onSubmit={submit}
-        className="bg-neutral-900 border border-neutral-800 rounded-xl p-6 w-80 flex flex-col items-center gap-4"
+        className={cn(SHEET, 'flex w-80 flex-col items-center gap-4 p-6')}
+        style={{ animation: 'beetbot-page-enter 280ms ease-out both' }}
       >
-        <div className="h-16 w-16 rounded-lg overflow-hidden text-2xl">
+        <div className="h-16 w-16 overflow-hidden rounded-xl text-2xl">
           <AvatarSurface
             name={profile.name}
             color={profile.avatar_color}
@@ -222,6 +252,8 @@ function PinPrompt({
           />
         </div>
         <div className="text-sm text-neutral-300">Enter PIN for {profile.name}</div>
+        {/* A PIN wants the big tracked-out treatment, so it overrides INPUT's
+         *  text-base with `!` (see the note on INPUT in shared/ui.ts). */}
         <input
           autoFocus
           type="password"
@@ -229,23 +261,21 @@ function PinPrompt({
           value={pin}
           onChange={(e) => setPin(e.target.value.replace(/\D/g, '').slice(0, 8))}
           placeholder="••••"
-          className={`w-32 text-center tracking-[0.5em] text-lg rounded-lg bg-neutral-950 border px-3 py-2 text-neutral-100 focus:outline-none ${
-            error ? 'border-red-600' : 'border-neutral-700 focus:border-neutral-400'
-          }`}
+          className={cn(
+            INPUT,
+            'w-32 text-center text-lg! tracking-[0.5em]',
+            error && 'border-red-600',
+          )}
         />
         {error ? <div className="text-xs text-red-400">Wrong PIN</div> : null}
-        <div className="flex gap-2 w-full">
-          <button
-            type="button"
-            onClick={onCancel}
-            className="flex-1 py-2 rounded-lg text-sm text-neutral-300 hover:bg-neutral-800"
-          >
+        <div className="flex w-full gap-2">
+          <button type="button" onClick={onCancel} className={cn(BTN_GHOST, 'flex-1')}>
             Cancel
           </button>
           <button
             type="submit"
             disabled={pin.length < 1 || checking}
-            className="flex-1 py-2 rounded-lg text-sm font-medium bg-neutral-100 text-neutral-950 hover:bg-white disabled:bg-neutral-700 disabled:text-neutral-400"
+            className={cn(BTN_PRIMARY, 'flex-1')}
           >
             Unlock
           </button>
@@ -354,8 +384,8 @@ function CropModal({
   };
 
   return (
-    <div className="fixed inset-0 z-[70] bg-black/80 grid place-items-center p-6">
-      <div className="bg-neutral-900 border border-neutral-800 rounded-xl p-5 flex flex-col items-center gap-4">
+    <div className={cn(SCRIM, 'z-[70] grid place-items-center p-6')}>
+      <div className={cn(SHEET, 'flex flex-col items-center gap-4 p-5')}>
         <div className="text-sm font-medium text-neutral-200">
           Drag to reposition · slide to zoom
         </div>
@@ -399,19 +429,15 @@ function CropModal({
           className="w-full accent-neutral-200"
           aria-label="Zoom"
         />
-        <div className="flex gap-2 w-full">
-          <button
-            type="button"
-            onClick={onCancel}
-            className="flex-1 py-2 rounded-lg text-sm text-neutral-300 hover:bg-neutral-800"
-          >
+        <div className="flex w-full gap-2">
+          <button type="button" onClick={onCancel} className={cn(BTN_GHOST, 'flex-1')}>
             Cancel
           </button>
           <button
             type="button"
             onClick={apply}
             disabled={!img}
-            className="flex-1 py-2 rounded-lg text-sm font-medium bg-neutral-100 text-neutral-950 hover:bg-white disabled:bg-neutral-700"
+            className={cn(BTN_PRIMARY, 'flex-1')}
           >
             Apply
           </button>
@@ -421,17 +447,20 @@ function CropModal({
   );
 }
 
-/** Create / edit a profile (name, colour, optional PIN, delete). */
-function ProfileForm({
+/**
+ * All the create/edit state + persistence for one profile draft — name, colour,
+ * optional PIN, and photo (with cropper). Lifted into a hook so both the Settings
+ * modal (`ProfileForm`) and the onboarding wizard's first step can own the same
+ * fields and wrap their own chrome (heading + footer + navigation) around them.
+ */
+export function useProfileDraft({
   profile,
-  canDelete,
-  onClose,
   onSaved,
 }: {
   profile: Profile | null;
-  canDelete: boolean;
-  onClose: () => void;
-  onSaved: () => void;
+  /** Called after a successful save. On a NEW profile the created row is passed
+   *  so the caller can drop straight into it; on an edit it's `undefined`. */
+  onSaved: (created?: Profile) => void;
 }) {
   const [name, setName] = useState(profile?.name ?? '');
   const [color, setColor] = useState(profile?.avatar_color ?? AVATAR_COLORS[0]!);
@@ -451,6 +480,22 @@ function ProfileForm({
   const [error, setError] = useState<string | null>(null);
 
   const isNew = profile === null;
+
+  // Re-seed when the underlying profile IDENTITY changes — e.g. the onboarding
+  // wizard creates the profile at step 0, then the user navigates BACK to it:
+  // the draft should now edit that freshly-created row (name/colour/photo
+  // prefilled), not offer a blank "new" form again. Keyed on the id so ordinary
+  // typing (which never changes the id) can't clobber a field mid-edit.
+  const profileId = profile?.id ?? null;
+  useEffect(() => {
+    setName(profile?.name ?? '');
+    setColor(profile?.avatar_color ?? AVATAR_COLORS[0]!);
+    setAvatarPath(profile?.avatar_path ?? null);
+    setPendingData(null);
+    setPin('');
+    setError(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [profileId]);
 
   const pickPhoto = async () => {
     try {
@@ -499,8 +544,8 @@ function ProfileForm({
     setPendingData(null);
   };
 
-  const save = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const save = async (e?: React.FormEvent) => {
+    e?.preventDefault();
     const n = name.trim();
     if (!n) {
       setError('Name is required');
@@ -509,15 +554,18 @@ function ProfileForm({
     setBusy(true);
     setError(null);
     try {
+      let created: Profile | undefined;
       if (isNew) {
-        const created = await ipc.createProfile(n, color, pin.trim() || null);
-        if (pendingData) await ipc.setProfileAvatarData(created.id, pendingData);
+        created = await ipc.createProfile(n, color, pin.trim() || null);
+        // Reassign so `created` carries the avatar path — the wizard re-seeds its
+        // profile step from this row on Back, and would otherwise show no photo.
+        if (pendingData) created = await ipc.setProfileAvatarData(created.id, pendingData);
       } else {
         await ipc.updateProfile(profile!.id, n, color);
         // Only touch the PIN when the user typed a new one here.
         if (pin.trim()) await ipc.setProfilePin(profile!.id, pin.trim());
       }
-      onSaved();
+      onSaved(created);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -551,133 +599,211 @@ function ProfileForm({
     }
   };
 
+  return {
+    profile,
+    isNew,
+    name,
+    setName,
+    color,
+    setColor,
+    pin,
+    setPin,
+    avatarPath,
+    pendingData,
+    cropSrc,
+    setCropSrc,
+    busy,
+    error,
+    /** A name is the one hard requirement; everything else has a default. */
+    canSave: name.trim().length > 0 && !busy,
+    pickPhoto,
+    handleCropApply,
+    removePhoto,
+    removePin,
+    save,
+    del,
+  };
+}
+
+export type ProfileDraft = ReturnType<typeof useProfileDraft>;
+
+/**
+ * The name / photo / colour / PIN fields plus the photo cropper — chrome-free, so
+ * `ProfileForm` (the Settings modal) and the onboarding wizard's first step can
+ * each wrap their own heading + footer around the identical body.
+ */
+export function ProfileDraftFields({ draft }: { draft: ProfileDraft }) {
+  const {
+    profile,
+    isNew,
+    name,
+    setName,
+    color,
+    setColor,
+    pin,
+    setPin,
+    avatarPath,
+    pendingData,
+    cropSrc,
+    setCropSrc,
+    busy,
+    error,
+    pickPhoto,
+    handleCropApply,
+    removePhoto,
+    removePin,
+  } = draft;
   return (
-    <div className="fixed inset-0 z-50 bg-neutral-950 flex flex-col items-center justify-center p-8">
+    <>
+      <div className="flex items-center gap-4">
+        {/* Clickable avatar: shows the photo (existing) or colour tile;
+            click to choose a new photo. The hover overlay hints at it. */}
+        <button
+          type="button"
+          onClick={pickPhoto}
+          title="Upload photo"
+          className="group relative h-16 w-16 shrink-0 rounded-lg overflow-hidden text-2xl"
+        >
+          {pendingData ? (
+            <img
+              src={`data:image/jpeg;base64,${pendingData}`}
+              alt=""
+              className="h-full w-full object-cover"
+              draggable={false}
+            />
+          ) : (
+            <AvatarSurface name={name || '?'} color={color} avatarPath={avatarPath} />
+          )}
+          <span className="absolute inset-0 grid place-items-center bg-black/0 group-hover:bg-black/50 text-white opacity-0 group-hover:opacity-100 transition">
+            <CameraIcon />
+          </span>
+        </button>
+        <input
+          autoFocus
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder="Profile name"
+          maxLength={40}
+          className={cn(INPUT, 'flex-1')}
+        />
+      </div>
+
+      {/* Photo controls */}
+      <div className="flex items-center gap-3 -mt-1">
+        <button
+          type="button"
+          onClick={pickPhoto}
+          className="text-xs font-medium text-neutral-100 hover:text-neutral-200"
+        >
+          {avatarPath || pendingData ? 'Change photo' : 'Upload photo'}
+        </button>
+        {avatarPath || pendingData ? (
+          <button
+            type="button"
+            onClick={removePhoto}
+            className="text-xs text-neutral-400 hover:text-neutral-200"
+          >
+            Remove photo
+          </button>
+        ) : null}
+        {pendingData && !avatarPath ? (
+          <span className="text-xs text-neutral-500">
+            Photo will be added on save.
+          </span>
+        ) : null}
+      </div>
+
+      <div>
+        <div className="text-xs uppercase tracking-wide text-neutral-500 mb-2">Color</div>
+        <div className="flex flex-wrap gap-2">
+          {AVATAR_COLORS.map((c) => (
+            <button
+              key={c}
+              type="button"
+              onClick={() => setColor(c)}
+              className={`h-8 w-8 rounded-full transition ${
+                color === c ? 'ring-2 ring-white ring-offset-2 ring-offset-neutral-900' : ''
+              }`}
+              style={{ backgroundColor: c }}
+              aria-label={`Color ${c}`}
+            />
+          ))}
+        </div>
+      </div>
+
+      <div>
+        <div className="text-xs uppercase tracking-wide text-neutral-500 mb-2">
+          PIN {isNew ? '(optional)' : profile?.has_pin ? '(set — type to change)' : '(optional)'}
+        </div>
+        <div className="flex gap-2">
+          <input
+            type="password"
+            inputMode="numeric"
+            value={pin}
+            onChange={(e) => setPin(e.target.value.replace(/\D/g, '').slice(0, 8))}
+            placeholder={profile?.has_pin ? '••••' : 'No PIN'}
+            className={cn(INPUT, 'flex-1 tracking-widest')}
+          />
+          {!isNew && profile?.has_pin ? (
+            <button
+              type="button"
+              onClick={removePin}
+              disabled={busy}
+              className={cn(BTN_SECONDARY, 'text-xs')}
+            >
+              Remove
+            </button>
+          ) : null}
+        </div>
+      </div>
+
+      {error ? <div className="text-xs text-red-400">{error}</div> : null}
+
+      {cropSrc ? (
+        <CropModal
+          dataUrl={cropSrc}
+          onCancel={() => setCropSrc(null)}
+          onApply={handleCropApply}
+        />
+      ) : null}
+    </>
+  );
+}
+
+/** Create / edit a profile in a centered modal card (Settings → Account). */
+export function ProfileForm({
+  profile,
+  canDelete,
+  onClose,
+  onSaved,
+}: {
+  profile: Profile | null;
+  canDelete: boolean;
+  onClose: () => void;
+  /** Called after a successful save. On a NEW profile the created row is passed
+   *  so the caller can drop straight into it; on an edit it's `undefined`. */
+  onSaved: (created?: Profile) => void;
+}) {
+  const draft = useProfileDraft({ profile, onSaved });
+  const { isNew, busy, save, del } = draft;
+  return (
+    <div className={cn(SCRIM, 'z-50 grid place-items-center p-8')}>
       <form
         onSubmit={save}
-        className="w-full max-w-sm bg-neutral-900 border border-neutral-800 rounded-xl p-6 flex flex-col gap-4"
+        className={cn(SHEET, 'flex w-full max-w-sm flex-col gap-4 p-6')}
+        style={{ animation: 'beetbot-page-enter 280ms ease-out both' }}
       >
         <h2 className="text-xl font-bold tracking-tight text-neutral-100">
           {isNew ? 'Add profile' : 'Edit profile'}
         </h2>
 
-        <div className="flex items-center gap-4">
-          {/* Clickable avatar: shows the photo (existing) or colour tile;
-              click to choose a new photo. The hover overlay hints at it. */}
-          <button
-            type="button"
-            onClick={pickPhoto}
-            title="Upload photo"
-            className="group relative h-16 w-16 shrink-0 rounded-lg overflow-hidden text-2xl"
-          >
-            {pendingData ? (
-              <img
-                src={`data:image/jpeg;base64,${pendingData}`}
-                alt=""
-                className="h-full w-full object-cover"
-                draggable={false}
-              />
-            ) : (
-              <AvatarSurface name={name || '?'} color={color} avatarPath={avatarPath} />
-            )}
-            <span className="absolute inset-0 grid place-items-center bg-black/0 group-hover:bg-black/50 text-white opacity-0 group-hover:opacity-100 transition">
-              <CameraIcon />
-            </span>
-          </button>
-          <input
-            autoFocus
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            placeholder="Profile name"
-            maxLength={40}
-            className="flex-1 rounded-lg bg-neutral-950 border border-neutral-700 px-3 py-2 text-neutral-100 focus:outline-none focus:border-neutral-400"
-          />
-        </div>
-
-        {/* Photo controls */}
-        <div className="flex items-center gap-3 -mt-1">
-          <button
-            type="button"
-            onClick={pickPhoto}
-            className="text-xs font-medium text-neutral-100 hover:text-neutral-200"
-          >
-            {avatarPath || pendingData ? 'Change photo' : 'Upload photo'}
-          </button>
-          {avatarPath || pendingData ? (
-            <button
-              type="button"
-              onClick={removePhoto}
-              className="text-xs text-neutral-400 hover:text-neutral-200"
-            >
-              Remove photo
-            </button>
-          ) : null}
-          {pendingData && !avatarPath ? (
-            <span className="text-xs text-neutral-500">
-              Photo will be added on save.
-            </span>
-          ) : null}
-        </div>
-
-        <div>
-          <div className="text-xs uppercase tracking-wide text-neutral-500 mb-2">Color</div>
-          <div className="flex flex-wrap gap-2">
-            {AVATAR_COLORS.map((c) => (
-              <button
-                key={c}
-                type="button"
-                onClick={() => setColor(c)}
-                className={`h-8 w-8 rounded-full transition ${
-                  color === c ? 'ring-2 ring-white ring-offset-2 ring-offset-neutral-900' : ''
-                }`}
-                style={{ backgroundColor: c }}
-                aria-label={`Color ${c}`}
-              />
-            ))}
-          </div>
-        </div>
-
-        <div>
-          <div className="text-xs uppercase tracking-wide text-neutral-500 mb-2">
-            PIN {isNew ? '(optional)' : profile?.has_pin ? '(set — type to change)' : '(optional)'}
-          </div>
-          <div className="flex gap-2">
-            <input
-              type="password"
-              inputMode="numeric"
-              value={pin}
-              onChange={(e) => setPin(e.target.value.replace(/\D/g, '').slice(0, 8))}
-              placeholder={profile?.has_pin ? '••••' : 'No PIN'}
-              className="flex-1 rounded-lg bg-neutral-950 border border-neutral-700 px-3 py-2 text-neutral-100 tracking-widest focus:outline-none focus:border-neutral-400"
-            />
-            {!isNew && profile?.has_pin ? (
-              <button
-                type="button"
-                onClick={removePin}
-                disabled={busy}
-                className="px-3 rounded-lg text-xs text-neutral-300 border border-neutral-700 hover:bg-neutral-800"
-              >
-                Remove
-              </button>
-            ) : null}
-          </div>
-        </div>
-
-        {error ? <div className="text-xs text-red-400">{error}</div> : null}
+        <ProfileDraftFields draft={draft} />
 
         <div className="flex gap-2 pt-1">
-          <button
-            type="button"
-            onClick={onClose}
-            className="flex-1 py-2 rounded-lg text-sm text-neutral-300 hover:bg-neutral-800"
-          >
+          <button type="button" onClick={onClose} className={cn(BTN_GHOST, 'flex-1')}>
             Cancel
           </button>
-          <button
-            type="submit"
-            disabled={busy}
-            className="flex-1 py-2 rounded-lg text-sm font-medium bg-neutral-100 text-neutral-950 hover:bg-white disabled:bg-neutral-700 disabled:text-neutral-400"
-          >
+          <button type="submit" disabled={busy} className={cn(BTN_PRIMARY, 'flex-1')}>
             {isNew ? 'Create' : 'Save'}
           </button>
         </div>
@@ -693,14 +819,6 @@ function ProfileForm({
           </button>
         ) : null}
       </form>
-
-      {cropSrc ? (
-        <CropModal
-          dataUrl={cropSrc}
-          onCancel={() => setCropSrc(null)}
-          onApply={handleCropApply}
-        />
-      ) : null}
     </div>
   );
 }
@@ -709,15 +827,6 @@ function LockIcon() {
   return (
     <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
       <path d="M17 9V7a5 5 0 0 0-10 0v2a3 3 0 0 0-3 3v6a3 3 0 0 0 3 3h10a3 3 0 0 0 3-3v-6a3 3 0 0 0-3-3Zm-8-2a3 3 0 0 1 6 0v2H9V7Z" />
-    </svg>
-  );
-}
-
-function EditIcon() {
-  return (
-    <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-      <path d="M12 20h9" />
-      <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z" />
     </svg>
   );
 }

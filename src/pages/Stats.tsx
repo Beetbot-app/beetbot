@@ -37,8 +37,15 @@ export function StatsPage({ onBack }: { onBack: () => void }) {
   }
 
   return (
-    <div className="h-full overflow-y-auto pt-4">
-      <StatsScreen token={token} profileId={activeProfileId} onBack={onBack} />
+    <div className="h-full overflow-y-auto">
+      {/* Desktop hides the in-header back chevron — the global top-bar
+          Back/Forward already covers it. */}
+      <StatsScreen
+        token={token}
+        profileId={activeProfileId}
+        onBack={onBack}
+        showBack={false}
+      />
     </div>
   );
 }

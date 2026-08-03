@@ -75,14 +75,31 @@ export function useConnectivity(token: string | null): ConnPhase {
   // 2. Hub reachability, pushed from the shared (debounced) flag.
   useEffect(() => onHubReachability(setHubOnline), []);
 
-  // 3. Re-probe when the tab returns to the foreground — interval timers are
+  // 3. Re-probe when the app comes back to the foreground — interval timers are
   //    throttled/frozen while backgrounded, so the flag can be stale on return.
+  //
+  //    visibilitychange alone is not enough on a home-screen PWA. iOS restores
+  //    a standalone app from a snapshot: the page was FROZEN, not hidden, so no
+  //    visibilitychange fires, and the network never dropped so no `online`
+  //    fires either. Nothing re-probed, the reachability flag stayed latched at
+  //    false, and the "can't reach your library" banner survived until a full
+  //    relaunch — reported from a phone doing exactly that. `pageshow` is the
+  //    event that restore does fire; `focus` covers the desktop equivalent.
   useEffect(() => {
+    const reprobe = () => {
+      if (token) void pingHub(token);
+    };
     const onVisible = () => {
-      if (!document.hidden && token) void pingHub(token);
+      if (!document.hidden) reprobe();
     };
     document.addEventListener('visibilitychange', onVisible);
-    return () => document.removeEventListener('visibilitychange', onVisible);
+    window.addEventListener('pageshow', reprobe);
+    window.addEventListener('focus', reprobe);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('pageshow', reprobe);
+      window.removeEventListener('focus', reprobe);
+    };
   }, [token]);
 
   // Fire the reconnect pulse when we return to fully-reachable from any outage

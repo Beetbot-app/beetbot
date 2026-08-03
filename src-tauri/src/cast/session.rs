@@ -36,7 +36,7 @@ use super::protocol::{
     HeartbeatPayload, InboundEnvelope, LaunchPayload, LoadPayload,
     MediaCommandPayload, MediaImage, MediaInfo, MediaMetadata, MediaStatus,
     ReceiverStatus, SeekPayload, StopReceiverPayload, DEFAULT_MEDIA_RECEIVER,
-    NS_CONNECTION, NS_HEARTBEAT, NS_MEDIA, NS_RECEIVER, RECEIVER_ID, SENDER_ID,
+    NS_CONNECTION, NS_HEARTBEAT, NS_MEDIA, NS_RECEIVER, RECEIVER_ID,
 };
 
 /// What the HTTP layer wants the cast session to do.

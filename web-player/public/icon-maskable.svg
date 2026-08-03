@@ -6,10 +6,11 @@
       <stop offset="1" stop-color="#A1123F"/>
     </linearGradient>
   </defs>
-  <!-- ink rounded-square tile (macOS-safe margin) -->
-  <rect x="112" y="112" width="800" height="800" rx="184" fill="#141013"/>
-  <!-- beet at D (large) scale, centered: scale 4.25, translate to centre -->
-  <g transform="translate(257,240) scale(4.25)">
+  <!-- Full-bleed opaque tile for Android maskable icons: the launcher mask can
+       crop to a circle, so the background must reach every edge and the beet
+       stays inside the center safe zone (smaller than the "any" icon). -->
+  <rect x="0" y="0" width="1024" height="1024" fill="#141013"/>
+  <g transform="translate(170,121) scale(5.6)">
     <path d="M60 50 C50 24 32 26 35 42 Q51 41 58 52 Z" fill="#37C871"/>
     <path d="M60 50 C70 22 90 26 85 44 Q69 41 60 52 Z" fill="#2AAE5E"/>
     <path d="M60 46 L60 56" stroke="#2AAE5E" stroke-width="5" stroke-linecap="round"/>

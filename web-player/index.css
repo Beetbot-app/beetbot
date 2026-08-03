@@ -37,7 +37,13 @@
 html,
 body,
 #root {
-  height: 100%;
+  /* 100vh, NOT 100%. With viewport-fit=cover + a translucent status bar, a
+     percentage height does not account for the area behind the notch, and iOS
+     shrinks the standalone viewport by the status bar's height — which then
+     reappears as dead space at the BOTTOM of the screen. 100dvh is no good
+     either: it reports the wrong value on a PWA cold start and only corrects
+     itself after a rotation. 100vh is right from the first paint. */
+  height: 100vh;
   margin: 0;
   padding: 0;
 }

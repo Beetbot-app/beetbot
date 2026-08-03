@@ -8,6 +8,7 @@ import {
   profileScopedKey,
   getPlaylist,
   getStorageEstimate,
+  listLibrarySongs,
   listPlaylists,
   offlineCacheAvailable,
   playlistArtUrl,
@@ -17,13 +18,13 @@ import {
   sortPlaylistsByRecent,
   trackArtUrl,
   type PlaylistRow,
+  type StreamTrack,
 } from '@shared/api';
 import {
   cn,
   navPill,
   SCRIM,
   BOTTOM_SHEET,
-  BAR,
   BTN_PRIMARY,
   BTN_GHOST,
   BTN_GHOST_DANGER,
@@ -31,17 +32,23 @@ import {
   CALLOUT_ERROR,
   EYEBROW,
 } from '@shared/ui';
+import {
+  useActiveProfile,
+  SettingsAvatar,
+  STICKY_FROST,
+} from '@shared/components/PhoneTopBar';
 import { useHubReachable } from '@shared/useHubReachable';
+import { useSavedStore, type SavedArtist } from '@/lib/saved';
+import { canStream, useCatalogNav, usePlayerStore } from '../store';
+import { useRecentlyPlayedVersion } from '@shared/useRecentPlaylists';
 
 interface Props {
   token: string;
   onOpen: (id: number) => void;
   /** Active profile — scopes the library to this user. */
   profileId: number;
-  /** Switch profiles (returns to the picker). */
-  onSwitchProfile: () => void;
-  /** Open the listening-stats ("Wrapped") screen. */
-  onOpenStats: () => void;
+  /** Open Settings — the header avatar leads here (same as the Home avatar). */
+  onOpenSettings: () => void;
 }
 
 type ViewMode = 'grid' | 'list';
@@ -49,12 +56,14 @@ type SortMode = 'recent' | 'alpha' | 'added';
 // Client-side kind filter. Saved albums land in the same list as playlists
 // (typed `source: 'album'`), so a chip row can split them without any new
 // endpoint — it only appears when the library actually holds both kinds.
-type LibFilter = 'all' | 'playlists' | 'albums';
+type LibFilter = 'all' | 'playlists' | 'songs' | 'albums' | 'artists';
 
 const FILTER_LABEL: Record<LibFilter, string> = {
   all: 'All',
   playlists: 'Playlists',
+  songs: 'Songs',
   albums: 'Albums',
+  artists: 'Artists',
 };
 
 const VIEW_KEY = 'beetbot.library_view';
@@ -100,12 +109,150 @@ function subtitleFor(p: PlaylistRow): string {
   return `${type} · ${p.track_count} ${p.track_count === 1 ? 'song' : 'songs'}`;
 }
 
+/** Saved-artists view for the phone library — round avatars, tap opens the
+ *  artist page. Data comes straight from the saved store (no endpoint). */
+function ArtistsGrid({
+  artists,
+  view,
+  onOpen,
+}: {
+  artists: SavedArtist[];
+  view: ViewMode;
+  onOpen: (name: string) => void;
+}) {
+  if (view === 'grid') {
+    return (
+      <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
+        {artists.map((a) => (
+          <button
+            key={a.key}
+            type="button"
+            onClick={() => onOpen(a.name)}
+            className="group relative flex flex-col text-left transition active:scale-[0.98]"
+          >
+            <span className="pointer-events-none absolute -inset-2 rounded-xl transition-colors group-hover:bg-white/[0.06]" />
+            <div className="relative aspect-square w-full overflow-hidden rounded-full bg-neutral-800">
+              {a.art && (
+                <img src={a.art} alt="" loading="lazy" className="h-full w-full object-cover" />
+              )}
+            </div>
+            <div className="pt-2 px-0.5 min-w-0 text-center">
+              <div className="text-sm font-medium truncate">{a.name}</div>
+              <div className="text-xs text-neutral-500 truncate">Artist</div>
+            </div>
+          </button>
+        ))}
+      </div>
+    );
+  }
+  return (
+    <ul className="flex flex-col">
+      {artists.map((a) => (
+        <li key={a.key}>
+          <button
+            type="button"
+            onClick={() => onOpen(a.name)}
+            className="w-full flex items-center gap-3 py-2 px-1 rounded-lg hover:bg-neutral-900 active:bg-neutral-900 text-left"
+          >
+            <div className="h-12 w-12 shrink-0 overflow-hidden rounded-full bg-neutral-800">
+              {a.art && (
+                <img src={a.art} alt="" loading="lazy" className="h-full w-full object-cover" />
+              )}
+            </div>
+            <div className="flex-1 min-w-0">
+              <div className="text-sm font-medium truncate">{a.name}</div>
+              <div className="text-xs text-neutral-500 truncate">Artist</div>
+            </div>
+          </button>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/** Library › Songs — a flat, title-sorted list of every track in the library.
+ *  Tap plays it (queuing the rest). Non-playable rows dim. */
+function SongsList({
+  songs,
+  hasQuery,
+  query,
+  onPlay,
+}: {
+  songs: StreamTrack[] | null;
+  hasQuery: boolean;
+  query: string;
+  onPlay: (t: StreamTrack) => void;
+}) {
+  if (songs === null) {
+    return (
+      <ul className="flex flex-col" aria-hidden>
+        {Array.from({ length: 8 }).map((_, i) => (
+          <li key={i} className="flex items-center gap-3 py-2 px-1 animate-pulse">
+            <div className="h-12 w-12 shrink-0 rounded bg-neutral-900" />
+            <div className="flex-1">
+              <div className="h-3 w-1/2 rounded bg-neutral-900" />
+              <div className="mt-1.5 h-2.5 w-1/3 rounded bg-neutral-900" />
+            </div>
+          </li>
+        ))}
+      </ul>
+    );
+  }
+  if (songs.length === 0) {
+    return (
+      <div className="px-2 py-8 text-center text-sm text-neutral-500">
+        {hasQuery
+          ? `No matches for “${query}”.`
+          : 'No songs in your library yet.'}
+      </div>
+    );
+  }
+  return (
+    <ul className="flex flex-col">
+      {songs.map((t) => {
+        const playable = canStream(t);
+        return (
+          <li key={t.id}>
+            <button
+              type="button"
+              onClick={() => playable && onPlay(t)}
+              className={`w-full flex items-center gap-3 py-2 px-1 rounded-lg text-left ${
+                playable
+                  ? 'hover:bg-neutral-900 active:bg-neutral-900'
+                  : 'opacity-50'
+              }`}
+            >
+              <div className="h-12 w-12 shrink-0 grid place-items-center overflow-hidden rounded bg-neutral-800">
+                {t.album_art_url ? (
+                  <img
+                    src={t.album_art_url}
+                    alt=""
+                    loading="lazy"
+                    className="h-full w-full object-cover"
+                  />
+                ) : (
+                  <span className="text-neutral-600 text-xs">♪</span>
+                )}
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="text-sm font-medium truncate">{t.title}</div>
+                <div className="text-xs text-neutral-500 truncate">
+                  {t.artists.join(', ') || '—'}
+                </div>
+              </div>
+            </button>
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
 export function LibraryScreen({
   token,
   onOpen,
   profileId,
-  onSwitchProfile,
-  onOpenStats,
+  onOpenSettings,
 }: Props) {
   // Creating a playlist is a hub write, so gate the New-playlist buttons when
   // the desktop is unreachable (the connection banner explains why).
@@ -118,14 +265,26 @@ export function LibraryScreen({
     null,
   );
   const [view, setView] = useState<ViewMode>(() =>
-    readPref(VIEW_KEY, ['grid', 'list'] as const, 'grid'),
+    readPref(VIEW_KEY, ['grid', 'list'] as const, 'list'),
   );
   const [sort, setSort] = useState<SortMode>(() =>
     readPref(SORT_KEY, ['recent', 'alpha', 'added'] as const, 'recent'),
   );
   const [filter, setFilter] = useState<LibFilter>('all');
+  // Within-library text filter (matches the desktop). Collapses to a magnifier;
+  // expands to a field that narrows the current list by name.
+  const [query, setQuery] = useState('');
+  const [searchOpen, setSearchOpen] = useState(false);
+  // Flat library-songs list (Library › Songs), lazy-loaded the first time the
+  // Songs chip is opened. Fetched over the new /api/library/songs endpoint.
+  const [songs, setSongs] = useState<StreamTrack[] | null>(null);
+  const setQueue = usePlayerStore((s) => s.setQueue);
   const [sortOpen, setSortOpen] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
+  // The active profile drives the header avatar; tapping it opens Settings
+  // (same destination as the Home avatar), where Switch profile / Listening
+  // stats live.
+  const profile = useActiveProfile(token, profileId);
   // Pinned playlists float to the top (below Liked) regardless of sort.
   const [pinnedIds, setPinnedIds] = useState<Set<number>>(() => readPinned(profileId));
 
@@ -265,15 +424,21 @@ export function LibraryScreen({
 
   useEffect(() => {
     let cancelled = false;
-    (async () => {
+    const run = async () => {
       try {
         await refresh();
       } catch (e) {
         if (!cancelled) setError(friendlyError(e));
       }
-    })();
+    };
+    void run();
+    // Refetch when the library changes elsewhere (a like, an add/remove, a
+    // delete) so this screen's list + counts stay live while it's open.
+    const onChanged = () => void run();
+    window.addEventListener('beetbot:library-changed', onChanged);
     return () => {
       cancelled = true;
+      window.removeEventListener('beetbot:library-changed', onChanged);
     };
   }, [refresh]);
 
@@ -284,6 +449,7 @@ export function LibraryScreen({
     await refresh();
   }, [refresh]);
 
+  const recentsVersion = useRecentlyPlayedVersion();
   const sorted = useMemo(() => {
     if (!playlists) return null;
     let base: PlaylistRow[];
@@ -305,17 +471,40 @@ export function LibraryScreen({
     const rank = (p: PlaylistRow) =>
       p.source === 'liked' ? 0 : pinnedIds.has(p.id) ? 1 : 2;
     return base.sort((a, b) => rank(a) - rank(b));
-  }, [playlists, sort, pinnedIds]);
+  // `recentsVersion` isn't read in the body on purpose: it's the signal that the
+  // hub's shared recency merged in. Dropping it would silently stop the other
+  // device's plays from ever reordering this list.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [playlists, sort, pinnedIds, recentsVersion]);
 
-  // Only offer the Playlists/Albums chips when the library actually holds both
-  // — a playlists-only (or albums-only) library gets no clutter.
-  const showFilters = useMemo(() => {
-    if (!playlists) return false;
-    return (
-      playlists.some((p) => p.source === 'album') &&
-      playlists.some((p) => p.source !== 'album')
-    );
-  }, [playlists]);
+  // Saved artists (Library › Artists) come straight from the KV store — no
+  // endpoint needed, and they sync with the desktop.
+  const savedArtists = useSavedStore((s) => s.artists);
+  const openArtist = useCatalogNav((s) => s.openArtist);
+  const sortedArtists = useMemo(
+    () =>
+      [...savedArtists].sort((a, b) =>
+        a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }),
+      ),
+    [savedArtists],
+  );
+
+  // Which kind-filter chips to offer. Albums appear only when the library holds
+  // album-imports; Artists only when some are saved — no clutter otherwise.
+  const filters = useMemo<LibFilter[]>(() => {
+    const out: LibFilter[] = ['all', 'playlists'];
+    if (playlists && playlists.length > 0) out.push('songs');
+    if (playlists?.some((p) => p.source === 'album')) out.push('albums');
+    if (savedArtists.length > 0) out.push('artists');
+    return out;
+  }, [playlists, savedArtists]);
+  const showFilters = filters.length > 2;
+
+  // If the active filter's chip disappears (e.g. the last saved artist was
+  // removed), fall back to All.
+  useEffect(() => {
+    if (!filters.includes(filter)) setFilter('all');
+  }, [filters, filter]);
 
   const visible = useMemo(() => {
     if (!sorted) return null;
@@ -325,55 +514,161 @@ export function LibraryScreen({
     );
   }, [sorted, filter, showFilters]);
 
+  // Apply the within-library text filter on top of the kind filter + sort.
+  const q = query.trim().toLowerCase();
+  const shownPlaylists = useMemo(() => {
+    if (!visible) return null;
+    if (!q) return visible;
+    return visible.filter((p) => p.name.toLowerCase().includes(q));
+  }, [visible, q]);
+  const shownArtists = useMemo(
+    () =>
+      q
+        ? sortedArtists.filter((a) => a.name.toLowerCase().includes(q))
+        : sortedArtists,
+    [sortedArtists, q],
+  );
+
+  // Lazy-load the flat songs list the first time it's needed: when the Songs
+  // chip is opened, OR when there's a query on the "All" tab (so an "All" search
+  // matches song titles too, not just playlist/album/artist names).
+  useEffect(() => {
+    const needSongs = filter === 'songs' || (filter === 'all' && !!q);
+    if (!needSongs || songs !== null) return;
+    let cancelled = false;
+    listLibrarySongs(token, profileId)
+      .then((rows) => {
+        if (!cancelled) setSongs(rows);
+      })
+      .catch(() => {
+        if (!cancelled) setSongs([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [filter, q, songs, token, profileId]);
+
+  const shownSongs = useMemo(() => {
+    if (!songs) return null;
+    if (!q) return songs;
+    return songs.filter(
+      (s) =>
+        s.title.toLowerCase().includes(q) ||
+        s.artists.some((a) => a.toLowerCase().includes(q)),
+    );
+  }, [songs, q]);
+
+  // Tapping a song plays it and queues the whole (filtered) songs list from
+  // that point — only the playable rows, matching the desktop's behavior.
+  const playSong = (song: StreamTrack) => {
+    const playable = (shownSongs ?? []).filter(canStream);
+    const idx = playable.findIndex((t) => t.id === song.id);
+    if (idx >= 0) setQueue(playable, idx);
+  };
+
   return (
     <div className="pb-6">
-      {/* Sticky frosted header — same pattern as Settings/Playlist (Apple:
-          pure blur + hairline). Always renders so error/skeleton/empty appear
-          as the body beneath it. */}
-      <div className={cn(BAR, 'sticky top-0 z-10 flex items-center justify-between px-5 py-3 border-b')}>
-        <h1 className="text-xl font-bold tracking-tight">Your Library</h1>
-        <div className="flex items-center gap-1">
-        <button
-          type="button"
-          onClick={() => setCreateOpen(true)}
-          disabled={!hubUp}
-          aria-label="New playlist"
-          title={hubUp ? 'New playlist' : 'Needs your computer'}
-          className="h-9 w-9 grid place-items-center rounded-full text-neutral-400 active:bg-neutral-800 disabled:opacity-40 disabled:pointer-events-none"
-        >
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" aria-hidden>
-            <path d="M12 5v14M5 12h14" />
-          </svg>
-        </button>
-        <button
-          type="button"
-          onClick={onOpenStats}
-          aria-label="Your stats"
-          title="Your stats"
-          className="h-9 w-9 grid place-items-center rounded-full text-neutral-400 active:bg-neutral-800"
-        >
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-            <path d="M3 3v18h18" />
-            <rect x="7" y="11" width="3" height="6" />
-            <rect x="12" y="7" width="3" height="10" />
-            <rect x="17" y="13" width="3" height="4" />
-          </svg>
-        </button>
-        <button
-          type="button"
-          onClick={onSwitchProfile}
-          aria-label="Switch profile"
-          title="Switch profile"
-          className="h-9 w-9 grid place-items-center rounded-full text-neutral-400 active:bg-neutral-800"
-        >
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-            <path d="M8 3 4 7l4 4" />
-            <path d="M4 7h16" />
-            <path d="m16 21 4-4-4-4" />
-            <path d="M20 17H4" />
-          </svg>
-        </button>
+      {/* Sticky frosted header (Apple: pure blur + hairline). Row 1 is the
+          account avatar (→ Settings) + title + new-playlist; rows 2–4 (kind
+          filters / find-in-library / sort) pin WITH the bar so a long library
+          can be re-filtered without scrolling back to the top. Always renders
+          so error/skeleton/empty appear as the body beneath it. */}
+      <div className={cn(STICKY_FROST, 'sticky top-0 z-20 border-b border-white/5')}>
+        <div className="flex items-center justify-between px-4 pt-4 pb-2">
+          <h1 className="min-w-0 truncate text-xl font-bold tracking-tight">Your Library</h1>
+          <div className="flex items-center gap-1">
+            {/* Find-in-library — sits next to New playlist (Spotify-style);
+                toggles the search field below the chips. */}
+            {sorted && sorted.length > 0 && (
+              <button
+                type="button"
+                onClick={() =>
+                  setSearchOpen((v) => {
+                    if (v) setQuery('');
+                    return !v;
+                  })
+                }
+                aria-label={searchOpen ? 'Close search' : 'Find in Your Library'}
+                // -my-1: keep the 36px hit area but let the row measure 28px, so
+                // this bar's title + avatar land on the same baseline as Home's
+                // and Search's (which have no icons to stretch them).
+                className={`-my-1 h-9 w-9 grid place-items-center rounded-full transition ${
+                  searchOpen
+                    ? 'bg-neutral-900 text-neutral-100'
+                    : 'text-neutral-300 hover:bg-neutral-900 hover:text-neutral-100 active:bg-neutral-900'
+                }`}
+              >
+                <SearchIcon />
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => setCreateOpen(true)}
+              disabled={!hubUp}
+              aria-label="New playlist"
+              title={hubUp ? 'New playlist' : 'Needs your computer'}
+              className="-my-1 h-9 w-9 grid place-items-center rounded-full text-neutral-400 active:bg-neutral-800 disabled:opacity-40 disabled:pointer-events-none"
+            >
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" aria-hidden>
+                <path d="M12 5v14M5 12h14" />
+              </svg>
+            </button>
+            {/* Trailing item, same as Home/Search — ml-1.5 because the avatar's
+                own tap padding already supplies part of the gap to the icon
+                before it. */}
+            <SettingsAvatar
+              className="ml-1.5"
+              profile={profile}
+              token={token}
+              onOpenSettings={onOpenSettings}
+            />
+          </div>
         </div>
+
+        {/* Kind filters + within-library search — pinned with the bar so a
+            long library can be re-filtered/searched without scrolling to the
+            top. Sort + view toggle scroll with the content (in the body). */}
+        {sorted && sorted.length > 0 && (showFilters || searchOpen) && (
+          <div className="px-4 pb-2">
+            {/* Kind filter chips — only when the library holds more than one
+                kind, so a single-kind library stays clean. */}
+            {showFilters && (
+              <div className="flex items-center gap-2 px-1 overflow-x-auto">
+                {filters.map((f) => (
+                  <button
+                    key={f}
+                    type="button"
+                    onClick={() => setFilter(f)}
+                    className={cn(
+                      'shrink-0 rounded-full px-3 py-1.5 text-xs font-medium transition active:bg-white/10',
+                      navPill(filter === f),
+                    )}
+                  >
+                    {FILTER_LABEL[f]}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {/* Within-library search — the top-bar magnifier expands this field,
+                which narrows the current list by name (matches the desktop). */}
+            {searchOpen && (
+              <div className="mt-2 px-1">
+                <input
+                  autoFocus
+                  type="search"
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  onBlur={() => {
+                    if (!query.trim()) setSearchOpen(false);
+                  }}
+                  placeholder="Find in Your Library"
+                  className="w-full rounded-lg border border-neutral-800 bg-neutral-900 px-3 py-2 text-sm text-neutral-100 placeholder-neutral-600 focus:border-neutral-400 focus:outline-none"
+                />
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {error ? (
@@ -413,27 +708,8 @@ export function LibraryScreen({
         />
       )}
 
-      {/* Kind filter chips (Apple/Spotify-style) — only when the library holds
-          both playlists and saved albums, so a single-kind library stays clean. */}
-      {showFilters && (
-        <div className="flex items-center gap-2 mb-3 px-1 overflow-x-auto">
-          {(['all', 'playlists', 'albums'] as const).map((f) => (
-            <button
-              key={f}
-              type="button"
-              onClick={() => setFilter(f)}
-              className={cn(
-                'shrink-0 rounded-full px-3 py-1.5 text-xs font-medium transition active:bg-white/10',
-                navPill(filter === f),
-              )}
-            >
-              {FILTER_LABEL[f]}
-            </button>
-          ))}
-        </div>
-      )}
-
-      {/* Sort label (left) + list/grid toggle (right), Spotify-style. */}
+      {/* Sort (left) + list/grid toggle (right) — scrolls with the content
+          (not pinned), Spotify-style. */}
       <div className="flex items-center justify-between px-1 mb-3">
         <button
           type="button"
@@ -454,15 +730,33 @@ export function LibraryScreen({
         </button>
       </div>
 
-      {pinnedIds.size === 0 && sorted.length > 4 && (
-        <p className="px-1 mb-2 text-[11px] text-neutral-600">
-          Tip: press and hold a playlist to pin it to the top.
-        </p>
-      )}
-
+      {filter === 'songs' ? (
+        <SongsList
+          songs={shownSongs}
+          hasQuery={!!q}
+          query={query.trim()}
+          onPlay={playSong}
+        />
+      ) : q &&
+      (filter === 'artists'
+        ? shownArtists.length === 0
+        : filter === 'all'
+          ? // "All" matches playlists/albums AND songs — only truly empty when
+            // both miss (and the songs list has finished loading).
+            (shownPlaylists?.length ?? 0) === 0 &&
+            shownSongs !== null &&
+            shownSongs.length === 0
+          : (shownPlaylists?.length ?? 0) === 0) ? (
+        <div className="px-2 py-8 text-center text-sm text-neutral-500">
+          No matches for “{query.trim()}”.
+        </div>
+      ) : filter === 'artists' ? (
+        <ArtistsGrid artists={shownArtists} view={view} onOpen={openArtist} />
+      ) : (
+      <>
       {view === 'grid' ? (
         <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
-          {(visible ?? []).map((p) => (
+          {(shownPlaylists ?? []).map((p) => (
             <button
               key={p.id}
               type="button"
@@ -487,7 +781,7 @@ export function LibraryScreen({
         </div>
       ) : (
         <ul className="flex flex-col">
-          {(visible ?? []).map((p) => (
+          {(shownPlaylists ?? []).map((p) => (
             <li key={p.id}>
               <button
                 type="button"
@@ -521,6 +815,23 @@ export function LibraryScreen({
             </li>
           ))}
         </ul>
+      )}
+      {/* In "All", a query also matches song titles (loaded on demand). Show the
+          hits under a "Songs" heading below the matching playlists/albums. */}
+      {filter === 'all' && q && (shownSongs === null || shownSongs.length > 0) && (
+        <div className="mt-6">
+          <div className="px-1 mb-2 text-[11px] font-semibold uppercase tracking-wide text-neutral-500">
+            Songs
+          </div>
+          <SongsList
+            songs={shownSongs}
+            hasQuery
+            query={query.trim()}
+            onPlay={playSong}
+          />
+        </div>
+      )}
+      </>
       )}
       </div>
       )}
@@ -819,6 +1130,25 @@ function SortIcon() {
       <path d="M7 20V4" />
       <path d="m21 8-4-4-4 4" />
       <path d="M17 4v16" />
+    </svg>
+  );
+}
+
+function SearchIcon() {
+  return (
+    <svg
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      <circle cx="11" cy="11" r="7" />
+      <path d="m21 21-4.3-4.3" />
     </svg>
   );
 }

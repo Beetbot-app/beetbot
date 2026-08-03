@@ -25,9 +25,9 @@ export default defineConfig({
     emptyOutDir: true,
     target: 'es2020',
     rollupOptions: {
-      // Two entries: the SPA itself (index.html) and the service worker.
-      // The SW must land at /sw.js (root scope) -- we override the default
-      // assets/ hashing for it.
+      // Single entry: the SPA (index.html). The service worker is NOT a
+      // rollup entry -- it ships verbatim from web-player/public/ via Vite's
+      // publicDir, so it lands at /sw.js (root scope) unhashed as SWs require.
       input: {
         main: path.resolve(__dirname, 'web-player/index.html'),
       },

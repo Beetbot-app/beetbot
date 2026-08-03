@@ -7,8 +7,10 @@ import { useEffect } from 'react';
 import { extractDominantColor, type Rgb } from './albumColor';
 
 // Very desaturated covers read as gray — a gray accent looks like disabled UI,
-// so use white instead. Dark colors are blended toward white to a lightness
-// floor so the accent stays legible on the near-black background.
+// so use white instead (the current-track row is instead distinguished by being
+// the only full-brightness title; the non-current titles are dimmed). Dark
+// colors are blended toward white to a lightness floor so the accent stays
+// legible on the near-black background.
 function legible([r, g, b]: Rgb): Rgb {
   const max = Math.max(r, g, b);
   const min = Math.min(r, g, b);

@@ -1,4 +1,12 @@
-import { Children, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import {
+  Children,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react';
 import { createPortal } from 'react-dom';
 import {
   banArtist,
@@ -8,24 +16,23 @@ import {
   getCatalogPlaylist,
   getHome,
   getStation,
-  getProfiles,
   importAlbum,
   listPlaylists,
   playlistArtUrl,
-  profileAvatarUrl,
   profileScopedKey,
   sortPlaylistsByRecent,
   type CatalogPlaylistSummary,
   type HomeShelf,
   type PlaylistRow,
-  type Profile,
   type SearchAlbumResult,
   type SearchArtistResult,
   type SearchTrackResult,
   type StatTrack,
 } from '../api';
+import { useRecentlyPlayedVersion } from '../useRecentPlaylists';
+import { AddToPlaylistModal } from './modals/AddToPlaylistModal';
+import { statToTrack } from '../trackAdapter';
 import {
-  AddToPlaylistModal,
   AlbumDetailModal,
   ArtistDetailModal,
   MixDetailModal,
@@ -33,12 +40,19 @@ import {
   PlaylistDetailModal,
   ShelfRow,
   usePreviewPlayer,
+  type SidebarPinController,
+  type SavedArtistController,
 } from './SearchScreen';
 import { CollageCover } from './CollageCover';
+import { NowPlayingCover } from './NowPlayingCover';
+import { SettingsAvatar, useActiveProfile } from './PhoneTopBar';
 import { ContextMenu, MenuGlyphs, type MenuItem, type MenuState } from './ContextMenu';
 import { extractDominantColor } from '../albumColor';
 import { CardPlayButton, Marquee } from './Marquee';
+import { Toast } from './Toast';
 import { useHubReachable } from '../useHubReachable';
+import { useToast } from '../useToast';
+import { HOME_INSTANT_EVENT, takeInstantHomeShelves } from '../onboardingHome';
 
 interface Props {
   token: string;
@@ -93,8 +107,15 @@ interface Props {
   loadPlaylists?: () => Promise<PlaylistRow[]>;
   /** Open one of the user's own playlists (full screen). */
   onOpenPlaylist: (id: number) => void;
-  /** Jump to the full Browse/charts page. */
-  onOpenBrowse: () => void;
+  /** Jump to the full Browse/charts page (desktop header button). Omitted on
+   *  the phone, which reaches Browse via the Search tab instead. */
+  onOpenBrowse?: () => void;
+  /** Somewhere to go and find music — the first-run welcome card's one action.
+   *  Each shell maps it to its own route to the same place: the phone's Search
+   *  tab (whose empty state is the browse grid), the desktop's Browse page (the
+   *  same grid; its search field is always in the top bar anyway). The card is
+   *  not rendered without it. */
+  onOpenSearch?: () => void;
   /**
    * Desktop only: open an artist as a full page (via the desktop nav bus)
    * instead of the built-in modal. When omitted (phone), the in-component
@@ -138,6 +159,20 @@ interface Props {
   mixRestore?: { signal: number; snapshot: HomeDrillSnapshot | null };
   /** Desktop only: close the mix page by routing through history Back. */
   onMixBack?: () => void;
+  /** Desktop only: reports the currently-open drill's identity (or null on the
+   *  feed), so the host knows to show its drill overlay. */
+  onDrillKeyChange?: (key: string | null) => void;
+  /** Desktop only: element to render drill-ins into — an overlay that SITS OVER
+   *  the feed with its own scroll, rather than replacing the feed in-flow. That
+   *  keeps the feed mounted and un-scrolled, so Back reveals it exactly where it
+   *  was (the iOS navigation-stack model) instead of rebuilding it. Omitted on
+   *  the phone, which already stacks drills as fixed modals. */
+  drillPortal?: HTMLElement | null;
+  /** Desktop-only Pin/Save controls, forwarded to the artist / album / mix /
+   *  playlist detail pages so those buttons show no matter where a page was
+   *  opened from. Omitted on the phone. */
+  pin?: SidebarPinController;
+  save?: SavedArtistController;
 }
 
 /** True if a release date is within the last ~30 days — drives the "New" ribbon
@@ -151,25 +186,17 @@ function isRecentRelease(releaseDate: string | null | undefined): boolean {
   return Date.now() - t <= 30 * 24 * 60 * 60 * 1000;
 }
 
+// Local fallback for the header greeting until the server's lands. MUST match
+// the server's 4 buckets (daypart_for_hour in server/mod.rs: 5–11 / 12–16 /
+// 17–21 / else) — otherwise the fallback and the server greeting disagree (e.g.
+// local "Good evening" vs server "Late night") and the header visibly switches
+// text when the feed arrives.
 function greeting(): string {
   const h = new Date().getHours();
   if (h >= 5 && h < 12) return 'Good morning';
-  if (h >= 12 && h < 18) return 'Good afternoon';
-  return 'Good evening';
-}
-
-/** Honest "Updated …" caption for the header (N6). `ageSecs` is how old the
- *  discovery pool actually is (server-reported): fresh right after a rebuild,
- *  up to a few hours on a warm cache hit. We phrase the real age rather than
- *  always claiming "today" — but stay coarse (no ticking minute counter), since
- *  the per-visit arrangement is fresh regardless and the caption is ambient.
- *  Undefined age (older server) → the honest, non-committal "Updated today". */
-function freshnessLabel(ageSecs: number | undefined): string {
-  if (ageSecs == null) return 'Updated today';
-  if (ageSecs < 10 * 60) return 'Updated just now';
-  if (ageSecs < 60 * 60) return `Updated ${Math.round(ageSecs / 60)}m ago`;
-  if (ageSecs < 6 * 60 * 60) return `Updated ${Math.round(ageSecs / 3600)}h ago`;
-  return 'Updated today';
+  if (h >= 12 && h < 17) return 'Good afternoon';
+  if (h >= 17 && h < 22) return 'Good evening';
+  return 'Late night';
 }
 
 /** Module-level cache of the last home feed per profile. Home unmounts when you
@@ -182,30 +209,47 @@ function freshnessLabel(ageSecs: number | undefined): string {
  *  still runs on mount and quietly replaces it. Without this, the module cache
  *  dies with the process and every launch cold-starts into skeletons even
  *  though the server answers in ~30ms. */
-const homeFeedCache = new Map<
-  string,
-  { shelves: HomeShelf[]; playlists: PlaylistRow[] }
->();
+/** What we remember about a profile's Home between mounts and launches.
+ *  `stationReady` is optional because entries persisted before it existed (and
+ *  older servers) simply don't carry it — absent means "assume ready". */
+type HomeFeedCacheEntry = {
+  shelves: HomeShelf[];
+  playlists: PlaylistRow[];
+  stationReady?: boolean;
+  /** Server greeting (HomeFeed.greeting). Cached so a remount paints it straight
+   *  away instead of flashing the local clock greeting until the feed re-lands. */
+  greeting?: string | null;
+};
+
+const homeFeedCache = new Map<string, HomeFeedCacheEntry>();
 const homeCacheKey = (pid: number | null | undefined): string => String(pid ?? '');
 const HOME_FEED_LS = 'beetbot.home.feed';
 /** Don't resurrect a feed older than this — beyond it, skeletons are more
  *  honest than week-old shelves flashing before the refresh. */
 const HOME_FEED_LS_MAX_AGE_MS = 3 * 24 * 60 * 60 * 1000;
 
-function readHomeFeedLS(
-  pid: number | null | undefined,
-): { shelves: HomeShelf[]; playlists: PlaylistRow[] } | null {
+// Bump when a fix changes shelf CONTENT for the same shelf title — Home appends
+// the fresh feed by title and never replaces a shelf already on screen, so a
+// persisted pre-fix feed would otherwise keep showing (e.g. a "Your top artists"
+// row built when Drake resolved to a same-name impostor's photo) for up to the
+// max age. A version bump discards those caches once and forces a clean rebuild.
+const HOME_FEED_VERSION = 2;
+
+function readHomeFeedLS(pid: number | null | undefined): HomeFeedCacheEntry | null {
   try {
     const raw = localStorage.getItem(profileScopedKey(HOME_FEED_LS, pid ?? null));
     if (!raw) return null;
     const v = JSON.parse(raw) as {
+      version?: number;
       savedAt?: number;
       shelves?: HomeShelf[];
       playlists?: PlaylistRow[];
+      stationReady?: boolean;
     };
+    if (v.version !== HOME_FEED_VERSION) return null; // pre-fix feed — discard
     if (!Array.isArray(v.shelves) || !Array.isArray(v.playlists)) return null;
     if (!v.savedAt || Date.now() - v.savedAt > HOME_FEED_LS_MAX_AGE_MS) return null;
-    return { shelves: v.shelves, playlists: v.playlists };
+    return { shelves: v.shelves, playlists: v.playlists, stationReady: v.stationReady };
   } catch {
     return null; // corrupt / private mode — behave like no cache
   }
@@ -213,15 +257,28 @@ function readHomeFeedLS(
 
 function writeHomeFeedLS(
   pid: number | null | undefined,
-  entry: { shelves: HomeShelf[]; playlists: PlaylistRow[] },
+  entry: HomeFeedCacheEntry,
 ): void {
   try {
     localStorage.setItem(
       profileScopedKey(HOME_FEED_LS, pid ?? null),
-      JSON.stringify({ savedAt: Date.now(), ...entry }),
+      JSON.stringify({ version: HOME_FEED_VERSION, savedAt: Date.now(), ...entry }),
     );
   } catch {
     /* quota / private mode — relaunches just keep the skeleton path */
+  }
+}
+
+/** Base key for "this profile has dismissed Home's welcome card" — scoped per
+ *  profile via `profileScopedKey`, like the desktop's first-run flag, so one
+ *  person dismissing it never silences it for the next profile. */
+const WELCOME_LS = 'beetbot.home_welcome_dismissed';
+
+function readWelcomeDismissed(pid: number | null | undefined): boolean {
+  try {
+    return localStorage.getItem(profileScopedKey(WELCOME_LS, pid ?? null)) === '1';
+  } catch {
+    return false; // private mode — showing it again beats never showing it
   }
 }
 
@@ -229,7 +286,7 @@ function writeHomeFeedLS(
  *  subsequent reads in this session are cheap). */
 function getHomeFeedCache(
   pid: number | null | undefined,
-): { shelves: HomeShelf[]; playlists: PlaylistRow[] } | null {
+): HomeFeedCacheEntry | null {
   const key = homeCacheKey(pid);
   const m = homeFeedCache.get(key);
   if (m) return m;
@@ -238,11 +295,24 @@ function getHomeFeedCache(
   return ls;
 }
 
+/** Drop a profile's cached feed (memory + persisted) so the next fetch rebuilds
+ *  from scratch instead of re-painting a stale copy. Called right after
+ *  onboarding writes the user's picks, so Home doesn't resurrect the empty page
+ *  it cached at first launch. */
+export function clearHomeFeedCache(pid: number | null | undefined): void {
+  homeFeedCache.delete(homeCacheKey(pid));
+  try {
+    localStorage.removeItem(profileScopedKey(HOME_FEED_LS, pid ?? null));
+  } catch {
+    /* private mode — the in-memory delete already covers this session */
+  }
+}
+
 /** Spotify-style loading placeholders — pulsing gray boxes shown on the FIRST
  *  load (cold start), before the feed arrives, instead of a blank page. */
 function QuickAccessSkeleton() {
   return (
-    <div className="px-4 grid grid-cols-2 gap-2 mb-7 lg:mb-6" aria-hidden>
+    <div className="px-4 lg:px-8 grid grid-cols-2 gap-2 mb-7 lg:mb-10" aria-hidden>
       {Array.from({ length: 8 }).map((_, i) => (
         <div
           key={i}
@@ -258,11 +328,11 @@ function QuickAccessSkeleton() {
 
 function ShelfSkeleton() {
   return (
-    <section className="mb-7 lg:mb-6" aria-hidden>
+    <section className="mb-7 lg:mb-10" aria-hidden>
       {/* ml-4 (not px-4) so the bar is inset like the real title — px-4 would
           be padding INSIDE the fixed-width box, leaving it flush to the edge. */}
       <div className="ml-4 mb-2.5 h-5 w-44 rounded bg-neutral-800 animate-pulse" />
-      <div className="flex gap-3 px-4 pb-1 overflow-hidden">
+      <div className="flex gap-3 px-4 lg:px-8 pb-1 overflow-hidden">
         {Array.from({ length: 6 }).map((_, i) => (
           <div key={i} className="w-32 shrink-0 animate-pulse">
             <div className="h-32 w-32 rounded-lg bg-neutral-800" />
@@ -275,27 +345,6 @@ function ShelfSkeleton() {
   );
 }
 
-/** Adapt a play-log StatTrack into the SearchTrackResult shape the player
- *  expects, flagged as a LOCAL track so it plays straight from the library. */
-function statToTrack(t: StatTrack): SearchTrackResult {
-  return {
-    source: 'local',
-    source_id: String(t.track_id),
-    title: t.title,
-    artists: t.artists,
-    album: t.album,
-    album_art_url: t.album_art_url,
-    duration_ms: t.duration_ms,
-    isrc: null,
-    local_track_id: t.track_id,
-    in_playlist_ids: [],
-    // Only history tracks with an imported audio file are playable; the player
-    // gates play on has_audio.
-    has_audio: t.has_audio ?? false,
-    preview_url: null,
-    explicit: false,
-  };
-}
 
 /** A "Made for you" mix lifted out of a shelf into a rail tile + detail page. The
  *  `key` identifies it within the current feed (kind+title). */
@@ -392,6 +441,7 @@ export function HomeScreen({
   onPlayedFrom,
   onOpenPlaylist,
   onOpenBrowse,
+  onOpenSearch,
   onOpenArtist,
   onOpenAlbum,
   onOpenSettings,
@@ -403,6 +453,10 @@ export function HomeScreen({
   onMixPush,
   mixRestore,
   onMixBack,
+  onDrillKeyChange,
+  drillPortal,
+  pin,
+  save,
 }: Props) {
   // Re-render on hub-reachability changes so the hero card's play gate
   // (canPlayNow below) stays live; TrackCard subscribes on its own.
@@ -417,11 +471,31 @@ export function HomeScreen({
     () => getHomeFeedCache(activeProfileId)?.shelves ?? [],
   );
   // Server-computed greeting (HomeFeed.greeting) — falls back to the local
-  // clock until the feed lands and on older bundled servers.
-  const [serverGreeting, setServerGreeting] = useState<string | null>(null);
-  // Age (secs) of the discovery pool this feed is built from — drives the honest
-  // "Updated …" caption (N6). Undefined until the feed lands / on older servers.
-  const [feedAgeSecs, setFeedAgeSecs] = useState<number | undefined>(undefined);
+  // clock until the feed lands and on older bundled servers. Seeded from the
+  // cache (like shelves/playlists) so a remount doesn't flash the local greeting
+  // and then swap to the server one.
+  const [serverGreeting, setServerGreeting] = useState<string | null>(
+    () => getHomeFeedCache(activeProfileId)?.greeting ?? null,
+  );
+  // Whether the endless stations have anything to seed from (HomeFeed
+  // .station_ready). A profile that has never played a track can't have a
+  // station, so we hide the tiles rather than hand it a button that yields an
+  // empty queue. Defaults to true — an older server that omits the field, or a
+  // pre-field cache entry, keeps the tiles exactly as they were.
+  const [stationReady, setStationReady] = useState(
+    () => getHomeFeedCache(activeProfileId)?.stationReady ?? true,
+  );
+  // Whether this profile has dismissed the first-run welcome card. Dismissal is
+  // forever — the ✕ means what it says.
+  const [welcomeDismissed, setWelcomeDismissed] = useState(() =>
+    readWelcomeDismissed(activeProfileId),
+  );
+  // Re-read on a profile switch: the phone keeps HomeScreen mounted across one,
+  // so a lazy initializer alone would leave the previous profile's answer in
+  // place and hide the card from someone who's never seen it.
+  useEffect(() => {
+    setWelcomeDismissed(readWelcomeDismissed(activeProfileId));
+  }, [activeProfileId]);
   // Whether the shelf feed has resolved at least once (drives the shelf
   // skeleton). Starts true only if the cache actually holds SHELVES — the
   // quick-access playlists loader also writes the cache entry, so merely
@@ -431,6 +505,33 @@ export function HomeScreen({
     const cached = getHomeFeedCache(activeProfileId);
     return !!cached && cached.shelves.length > 0;
   });
+  // Re-seed every piece of feed state from the cache when the feed's IDENTITY
+  // changes (a profile switch) or its cache is deliberately dropped (the
+  // first-run wizard's home-refresh once it has written your picks). All of the
+  // above are lazy initializers — they run at MOUNT and never again — and both
+  // hosts keep HomeScreen mounted across a profile switch, so without this the
+  // state simply persists and Home keeps painting a feed built for a different
+  // moment: the previous profile's shelves under the new profile's name, or the
+  // empty page cached before onboarding wrote your artists. It self-corrects
+  // only when the next fetch lands, which on a cold profile is many seconds of
+  // showing someone else's recommendations — and the quick-access playlists
+  // reload over IPC in milliseconds, so the two halves of the page visibly
+  // disagree meanwhile. Same reason welcomeDismissed re-reads above; this is the
+  // rest of that fix. The fetch effect is declared below, so a landed feed always
+  // wins over this re-seed rather than racing it.
+  const feedStateSeeded = useRef(true);
+  useEffect(() => {
+    if (feedStateSeeded.current) {
+      feedStateSeeded.current = false; // mount: the initializers just did this
+      return;
+    }
+    const cached = getHomeFeedCache(activeProfileId);
+    setShelves(cached?.shelves ?? []);
+    setPlaylists(cached?.playlists ?? null);
+    setServerGreeting(cached?.greeting ?? null);
+    setStationReady(cached?.stationReady ?? true);
+    setFeedLoaded(!!cached && cached.shelves.length > 0);
+  }, [activeProfileId, refreshKey]);
   const [openArtist, setOpenArtist] = useState<SearchArtistResult | null>(null);
   const [openAlbum, setOpenAlbum] = useState<SearchAlbumResult | null>(null);
   const [openPlaylist, setOpenPlaylist] =
@@ -487,7 +588,27 @@ export function HomeScreen({
   // scrollable ancestor to the top whenever a desktop drill opens.
   const rootRef = useRef<HTMLDivElement>(null);
   const anyDrillOpen = !!openMix || !!openPlaylist || !!openShelfGrid;
+  // Tell the host which drill (if any) is showing, so it scopes scroll memory
+  // to a distinct key per drill and keeps the feed's own position intact.
+  const drillKey = openMix
+    ? `mix:${openMix.key}`
+    : openPlaylist
+      ? `hpl:${openPlaylist.source_id}`
+      : openShelfGrid
+        ? `shelf:${openShelfGrid.kind}:${openShelfGrid.title}`
+        : null;
+  // Layout effect (not passive) so the host's scroll key flips BEFORE paint —
+  // the drill then paints at the top in one frame (no mid-scroll flash) and the
+  // reset can't be mis-attributed to the feed's key.
+  useLayoutEffect(() => {
+    onDrillKeyChange?.(drillKey);
+  }, [drillKey, onDrillKeyChange]);
   useEffect(() => {
+    // When the host gives us an overlay to portal into, the drill has its own
+    // scroll container (which starts at the top on its own) and the feed
+    // underneath must KEEP its position — scrolling it here would destroy the
+    // very thing the overlay exists to preserve.
+    if (drillPortal) return;
     // `onOpenArtist` present === desktop (same signal as `isDesktop` below).
     if (!(onOpenArtist && anyDrillOpen)) return;
     let el = rootRef.current?.parentElement ?? null;
@@ -547,30 +668,13 @@ export function HomeScreen({
     | { kind: 'artist'; artist: SearchArtistResult }
     | null
   >(null);
-  const [toast, setToast] = useState<string | null>(null);
-  const showToast = (msg: string) => {
-    setToast(msg);
-    window.setTimeout(() => setToast((t) => (t === msg ? null : t)), 2600);
-  };
-  // Active profile — drives the greeting name and the header avatar.
-  const [profile, setProfile] = useState<Profile | null>(null);
+  const { toast, showToast } = useToast(2600);
+  // Active profile — drives the greeting name and the header avatar. Shared with
+  // Search/Library through one cached resolver: this screen used to hand-roll
+  // the same fetch, which meant its avatar (and greeting name) restarted from
+  // nothing on every visit even though the other two already knew the answer.
+  const profile = useActiveProfile(token, activeProfileId ?? null);
   const { playingUrl, toggle, stop } = usePreviewPlayer();
-
-  // Resolve the active profile (name for the greeting, avatar for the header).
-  useEffect(() => {
-    let cancelled = false;
-    void getProfiles(token)
-      .then((ps) => {
-        if (cancelled) return;
-        setProfile(ps.find((p) => p.id === activeProfileId) ?? null);
-      })
-      .catch(() => {
-        /* greeting just falls back to no name */
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [token, activeProfileId]);
 
   // N1: per-visit selection nonce. The server folds it into its shelf-selection
   // seed and deals a different slice of the day's cached discovery pools. Held
@@ -605,8 +709,21 @@ export function HomeScreen({
 
   useEffect(() => {
     let cancelled = false;
+    // A profile that JUST finished onboarding has picks-derived shelves waiting
+    // (see shared/onboardingHome) — paint them at once, ahead of the cold server
+    // build, so Home fills immediately instead of flashing the empty partial the
+    // ~40s discovery build leaves behind. One-shot: cleared on read.
+    const seeded = takeInstantHomeShelves(activeProfileId ?? -1);
+    if (seeded.length) {
+      setShelves((prev) => {
+        if (!prev.length) return seeded;
+        const shown = new Set(prev.map((s) => s.title));
+        return [...seeded.filter((s) => !shown.has(s.title)), ...prev];
+      });
+      setFeedLoaded(true);
+    }
     const key = homeCacheKey(activeProfileId);
-    const cachePatch = (patch: Partial<{ shelves: HomeShelf[]; playlists: PlaylistRow[] }>) => {
+    const cachePatch = (patch: Partial<HomeFeedCacheEntry>) => {
       const prev = homeFeedCache.get(key) ?? { shelves: [], playlists: [] };
       const next = { ...prev, ...patch };
       homeFeedCache.set(key, next);
@@ -633,25 +750,91 @@ export function HomeScreen({
     // with backoff instead of giving up and leaving Home empty until the user
     // navigates away and back. The shelf skeleton stays up across retries.
     const fetchHomeWithRetry = async () => {
-      const backoffMs = [800, 2000, 4000, 8000];
-      for (let attempt = 0; ; attempt++) {
+      // Retry on ERROR (a cold server is still warming). Retryable errors only —
+      // a 401 means the token's dead and retrying just burns the backoff.
+      const errBackoff = [800, 2000, 4000, 8000];
+      // POLL while the server serves a PARTIAL feed. On a cold cache it kicks the
+      // full discovery build into the BACKGROUND and answers immediately with a
+      // partial — which for a freshly-onboarded profile (no play history yet, the
+      // discovery shelves still building) is EMPTY. Settling on that empty partial
+      // is exactly what flashed the "add music" empty state before the real feed
+      // landed. So hold out for the complete feed (`partial` drops off the
+      // response once the build caches); the fast pass below still paints any
+      // partial shelves meanwhile, so a profile with content isn't held back.
+      // ~45s of polling comfortably outlasts a cold build's ~15-40s wall clock.
+      const partialBackoff = [1500, 2500, 3500, 4500, 5500, 6000, 6000, 6000, 6000];
+      let errAttempt = 0;
+      let partialAttempt = 0;
+      for (;;) {
         try {
-          return await getHome(token, activeProfileId, visitNonce);
+          const h = await getHome(token, activeProfileId, visitNonce);
+          if (h.partial && partialAttempt < partialBackoff.length) {
+            if (cancelled) return h;
+            await new Promise((r) =>
+              window.setTimeout(r, partialBackoff[partialAttempt++]),
+            );
+            continue;
+          }
+          return h;
         } catch (err) {
-          if (cancelled || attempt >= backoffMs.length) throw err;
-          await new Promise((r) => window.setTimeout(r, backoffMs[attempt]));
+          if (cancelled || errAttempt >= errBackoff.length) throw err;
+          await new Promise((r) => window.setTimeout(r, errBackoff[errAttempt++]));
         }
       }
     };
+    // Progressive paint. Every Deezer call the server makes is spaced 110ms apart
+    // process-wide, so a build's wall clock is almost exactly (calls × 110ms) —
+    // measured at ~6s for an established profile and ~40s for a brand-new one,
+    // whose artists the catalogue has never seen. But the shelves don't finish
+    // together: the cheap ones land in the first ~3s and four expensive ones own
+    // the long tail. So ask for BOTH at once — `fast` (the cheap subset, uncached)
+    // to paint immediately, and the real feed, which arrives later and caches as
+    // always. Nothing extra is asked of Deezer that the full build wasn't already
+    // going to ask; the fast pass just front-runs it.
+    //
+    // The fast result only ever paints if it wins the race AND nothing is on
+    // screen yet — on a warm profile the full feed answers from cache in ~13ms and
+    // this never shows at all.
+    if (!getHomeFeedCache(activeProfileId)?.shelves.length) {
+      void getHome(token, activeProfileId, visitNonce, true)
+        .then((h) => {
+          if (cancelled || !h.shelves.length) return;
+          setShelves((prev) => (prev.length ? prev : h.shelves)); // never clobber the real feed
+          setServerGreeting((prev) => prev ?? h.greeting ?? null);
+          setFeedLoaded(true);
+        })
+        .catch(() => {
+          // Best-effort: the full fetch below is the real one.
+        });
+    }
     void fetchHomeWithRetry()
       .then((h) => {
         if (cancelled) return;
-        setShelves(h.shelves);
+        // APPEND, don't replace. The full feed is a superset of the fast one, but
+        // it's independently arranged, so swapping it in wholesale would reshuffle
+        // a page the user is already reading. Keep what's shown, in place, and add
+        // only what's new — the page grows instead of jumping.
+        setShelves((prev) => {
+          if (!prev.length) return h.shelves;
+          const shown = new Set(prev.map((s) => s.title));
+          return [...prev, ...h.shelves.filter((s) => !shown.has(s.title))];
+        });
         setServerGreeting(h.greeting ?? null);
-        setFeedAgeSecs(h.discovery_age_secs);
         onWinBack?.(h.welcome_back ?? false);
         setFeedLoaded(true);
-        cachePatch({ shelves: h.shelves });
+        const ready = h.station_ready !== false; // absent (older server) ⇒ ready
+        setStationReady(ready);
+        // Cache the SERVER's own ordering, not the appended view: the next visit
+        // should open on the properly arranged feed, not on this one-off union.
+        // Never cache a still-partial feed (polling capped out on a slow build) —
+        // it would shadow the real one and open Home thin on the next visit.
+        if (!h.partial) {
+          cachePatch({
+            shelves: h.shelves,
+            stationReady: ready,
+            greeting: h.greeting ?? null,
+          });
+        }
       })
       .catch(() => {
         // All retries failed — clear the skeleton so it doesn't spin forever.
@@ -661,6 +844,81 @@ export function HomeScreen({
       cancelled = true;
     };
   }, [token, activeProfileId, refreshKey, visitNonce, loadPlaylists, onWinBack]);
+
+  // Onboarding finishes ASYNChronously relative to Home's mount: the picks' top
+  // tracks are still fetching when the wizard closes and Home appears, so the
+  // sync read above often finds nothing. When they land and the wizard stashes
+  // the instant shelves, prepend them (once) — the same shelves that read would
+  // have caught had they been ready in time.
+  useEffect(() => {
+    const onInstant = (e: Event) => {
+      const pid = (e as CustomEvent<{ profileId: number }>).detail?.profileId;
+      if (pid == null || pid !== activeProfileId) return;
+      const seeded = takeInstantHomeShelves(activeProfileId ?? -1);
+      if (!seeded.length) return;
+      setShelves((prev) => {
+        const shown = new Set(prev.map((s) => s.title));
+        return [...seeded.filter((s) => !shown.has(s.title)), ...prev];
+      });
+      setFeedLoaded(true);
+    };
+    window.addEventListener(HOME_INSTANT_EVENT, onInstant);
+    return () => window.removeEventListener(HOME_INSTANT_EVENT, onInstant);
+  }, [activeProfileId]);
+
+  // Keep the quick-access playlists current when the library changes elsewhere —
+  // a like from the player bar creates/updates Favorites, an add-to-playlist, a
+  // delete. Refetch ONLY the playlists (same window event the sidebar refetches
+  // on), never the whole feed: reshuffling every discovery shelf just because you
+  // starred a song would be jarring, and the shelves haven't changed.
+  useEffect(() => {
+    const reload = () => {
+      const key = homeCacheKey(activeProfileId);
+      const load = loadPlaylists ?? (() => listPlaylists(token, activeProfileId));
+      void load()
+        .then((p) => {
+          setPlaylists(p);
+          const prev = homeFeedCache.get(key) ?? { shelves: [], playlists: [] };
+          const next = { ...prev, playlists: p };
+          homeFeedCache.set(key, next);
+          writeHomeFeedLS(activeProfileId, next);
+        })
+        .catch(() => {
+          /* transient loader failure — the next real load reconciles */
+        });
+    };
+    window.addEventListener('beetbot:library-changed', reload);
+    return () => window.removeEventListener('beetbot:library-changed', reload);
+  }, [token, activeProfileId, loadPlaylists]);
+
+  // Pre-warm the stations once Home is up, so the "Made for you" station tiles
+  // open instantly. The server pre-warm builds home feeds FIRST and only reaches
+  // the stations in a later pass (prewarm_home_once), so on a fresh launch the
+  // first station tap would otherwise pay the ~14s cold fusion. Fire a background
+  // getStation per mode (for-you first — the primary tile — then fresh); the
+  // payoff is the server's 6h station_cache, so we discard the tracks. Once per
+  // profile (ref-guarded); a repeat call after a profile switch is a cheap cache
+  // hit. Keyed off feedLoaded so it yields to the initial /api/home fetch.
+  const stationWarmedFor = useRef<string | null>(null);
+  useEffect(() => {
+    if (!token || !feedLoaded) return;
+    const key = `${activeProfileId ?? 'none'}`;
+    if (stationWarmedFor.current === key) return;
+    stationWarmedFor.current = key; // set up-front so a re-render can't double-fire
+    let cancelled = false;
+    void (async () => {
+      try {
+        await getStation(token, activeProfileId); // My station (for-you)
+        if (!cancelled) await getStation(token, activeProfileId, 'fresh'); // Discovery
+      } catch {
+        // Best-effort: a failed warm just means that tap pays the cost, and the
+        // server's own pre-warm loop is the backstop.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [token, activeProfileId, feedLoaded]);
 
   // Keep "Recently played" LIVE: as the queue advances to a new track, prepend
   // it to that shelf instead of re-fetching the whole feed (which would reshuffle
@@ -707,13 +965,20 @@ export function HomeScreen({
     // eslint-disable-next-line react-hooks/exhaustive-deps -- fire on track id change only
   }, [nowPlayingTrack?.id, activeProfileId]);
 
-  // Liked pinned, then most-recently-played; cap at 8 tiles.
+  // Liked pinned, then most-recently-played; cap at 8 tiles. `recentsVersion`
+  // re-runs the sort when the hub's shared recency lands, so tiles reflect what
+  // was played on the user's other device.
+  const recentsVersion = useRecentlyPlayedVersion();
   const quickAccess = useMemo(() => {
     if (!playlists) return [];
     return [...sortPlaylistsByRecent(playlists)]
       .sort((a, b) => (a.source === 'liked' ? 0 : 1) - (b.source === 'liked' ? 0 : 1))
       .slice(0, 8);
-  }, [playlists]);
+  // `recentsVersion` isn't read in the body on purpose: it's the signal that the
+  // hub's shared recency merged in. Dropping it would silently stop the other
+  // device's plays from ever reordering this list.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [playlists, recentsVersion]);
 
   const openAlbumCard = (al: SearchAlbumResult) => {
     if (onOpenAlbum) {
@@ -786,6 +1051,19 @@ export function HomeScreen({
       showToast('Could not play playlist');
     }
   };
+  // Play a track from WITHIN an open detail page (mix / album / playlist), then
+  // stamp its source key — so clicking a row inside the page tags the source
+  // exactly like pressing the card's play button does, and the Home card then
+  // reflects play/pause (was showing a static play until you pressed the card).
+  const playFromDetail = async (
+    key: string,
+    t: SearchTrackResult,
+    list?: SearchTrackResult[],
+    index?: number,
+  ) => {
+    await onPlayTrack(t, list, index);
+    onPlayedFrom?.(key);
+  };
   const banArtistAction = async (name: string) => {
     if (!name.trim()) return;
     try {
@@ -800,6 +1078,10 @@ export function HomeScreen({
   // or null. A cold press pays the fusion fan-out (a few seconds) — without this
   // the button gives no feedback and reads as broken. Also guards double-taps.
   const [stationLoading, setStationLoading] = useState<string | null>(null);
+  // Which station's PAGE is being fetched to open (separate from the direct-play
+  // `stationLoading` above), so the tile shows a spinner while today's ~40-track
+  // batch loads before the drill page appears.
+  const [stationOpening, setStationOpening] = useState<string | null>(null);
   // The one reserved beet moment: a ~1s crimson glow on the "My station"
   // tile the instant a station ignites (see the beet-ignite keyframe).
   const [igniting, setIgniting] = useState(false);
@@ -809,7 +1091,10 @@ export function HomeScreen({
     try {
       const tracks = await getStation(token, activeProfileId, mode);
       if (tracks.length > 0) {
-        onPlayTrack(tracks[0], tracks, 0);
+        // await so the host's setQueue (which clears nowPlayingKey) lands first,
+        // then stamp this station as the source so its tile shows play/pause.
+        await onPlayTrack(tracks[0], tracks, 0);
+        onPlayedFrom?.(`station:${mode ?? 'for-you'}`);
         // Fire the brand pulse only for the main button (no steering mode).
         if (!mode) {
           setIgniting(true);
@@ -822,6 +1107,38 @@ export function HomeScreen({
       showToast("Couldn't start the station");
     } finally {
       setStationLoading(null);
+    }
+  };
+
+  // Open a station as a PAGE (not just play it): fetch today's ~40-track batch,
+  // wrap it in a MixData, and open the SAME drill page the mixes use (Play +
+  // Shuffle header, tracklist, per-song menus, desktop Back/Forward history). The
+  // daily rotation is unchanged — this shows today's batch; the tile's play
+  // button still starts it straight away, and the queue's autoplay keeps it
+  // endless past the batch exactly like a direct station press.
+  const openStationPage = async (mode?: string) => {
+    if (stationOpening) return; // already fetching a page
+    const key = mode ?? 'for-you';
+    setStationOpening(key);
+    try {
+      const tracks = await getStation(token, activeProfileId, mode);
+      if (tracks.length === 0) {
+        showToast('Not enough listening yet for a station');
+        return;
+      }
+      const mix: MixData = {
+        key: `station:${key}`,
+        title: mode === 'fresh' ? 'Discovery station' : 'My station',
+        eyebrow: 'Endless',
+        tracks,
+        cadence: 'Updated daily',
+      };
+      setOpenMix(mix);
+      onMixPush?.({ mix });
+    } catch {
+      showToast("Couldn't open the station");
+    } finally {
+      setStationOpening(null);
     }
   };
 
@@ -864,28 +1181,25 @@ export function HomeScreen({
     // taller card): square covers (album/track/playlist) vs the round artist.
     // `mt-4` offsets the arrow past the scroller's py-4 top (which gives the
     // cards' -inset-3 hover highlight room), so it lands on the cover.
-    const artClass = size === 'lg' ? 'mt-4 h-40' : 'mt-4 h-32';
-    const artistArtClass = size === 'lg' ? 'mt-4 h-36' : 'mt-4 h-28';
-    // Desktop: a big shelf's "Show all" opens its full grid as a drill PAGE
-    // instead of unfolding in place (a 30-item in-place expand is a wall). Phone
-    // keeps the in-place expand. `forceExpand` (set when rendering the page
-    // itself) shows the full grid with no toggle button.
-    const itemCount =
-      (shelf.tracks?.length ?? 0) +
-      (shelf.albums?.length ?? 0) +
-      (shelf.stat_tracks?.length ?? 0) +
-      (shelf.artists?.length ?? 0) +
-      (shelf.playlists?.length ?? 0);
-    const shelfExtra: { onShowAll?: () => void; forceExpand?: boolean } = forceExpand
-      ? { forceExpand: true }
-      : isDesktop && itemCount > 12 && onMixPush
-        ? {
-            onShowAll: () => {
-              setOpenShelfGrid(shelf);
-              onMixPush({ shelfGrid: shelf });
-            },
-          }
-        : {};
+    const artClass = size === 'lg' ? 'mt-4 h-40 lg:h-44' : 'mt-4 h-32 lg:h-44';
+    const artistArtClass = size === 'lg' ? 'mt-4 h-36 lg:h-40' : 'mt-4 h-28 lg:h-40';
+    // Desktop: every shelf's "Show all" opens its full grid as a drill PAGE
+    // (uniform behavior — the Shelf button already only shows for count > 4, so
+    // small shelves get no toggle at all). Phone home rows just scroll.
+    // `forceExpand` (set when rendering the page itself) shows the full grid
+    // with no toggle button.
+    const shelfExtra: { desktop: boolean; onShowAll?: () => void; forceExpand?: boolean } =
+      forceExpand
+        ? { desktop: isDesktop, forceExpand: true }
+        : isDesktop && onMixPush
+          ? {
+              desktop: isDesktop,
+              onShowAll: () => {
+                setOpenShelfGrid(shelf);
+                onMixPush({ shelfGrid: shelf });
+              },
+            }
+          : { desktop: isDesktop };
     // Spotlight (P4): the server marks exactly one discovery track_row per visit
     // as the mid-feed band. Checked BEFORE the hero so it wins even at idx 0
     // (both are full-width). The band replaces the whole row; Play seeds the
@@ -909,12 +1223,21 @@ export function HomeScreen({
       // banners are visually identical (full-bleed art + scrim + round stateful
       // play button + hover ring), just with shelf-level title/description.
       return (
-        <section key={`spot:${idx}:${shelf.title}`} className="px-4 mb-7 lg:mb-6">
+        <section key={`spot:${idx}:${shelf.title}`} className="px-4 lg:px-8 mb-7 lg:mb-10">
+          {/* Phone: the kicker rides ABOVE the card — the same place every other
+              shelf puts it (and where this hero's `lead` sibling already puts
+              it). Inside a 183px column it wraps to two lines, which stacked
+              with the title and the two-line subtitle packed five lines into a
+              112px box. Desktop keeps it in the card: that column is 712px. */}
+          <p className="mb-1.5 text-[11px] uppercase tracking-wide text-neutral-500 sm:hidden">
+            {shelf.eyebrow ?? 'In the spotlight'}
+          </p>
           <HeroCard
             cover={head.album_art_url ?? null}
             eyebrow={shelf.eyebrow ?? 'In the spotlight'}
             title={shelf.title}
             subtitle={desc}
+            subtitleShort={`${list.length} songs`}
             onClick={async () => {
               await onPlayTrack(list[0], list, 0);
               onPlayedFrom?.(spotKey);
@@ -938,14 +1261,14 @@ export function HomeScreen({
       if (list.length === 0) return null;
       const [head, ...rest] = list;
       return (
-        <section key={`hero:${idx}:${shelf.title}`} className="mb-7 lg:mb-6">
+        <section key={`hero:${idx}:${shelf.title}`} className="mb-7 lg:mb-10">
           {shelf.eyebrow ? (
-            <p className="px-4 text-[11px] uppercase tracking-wide text-neutral-500">
+            <p className="px-4 lg:px-8 text-[11px] uppercase tracking-wide text-neutral-500">
               {shelf.eyebrow}
             </p>
           ) : null}
-          <h2 className="px-4 mb-2.5 lg:mb-4 text-lg lg:text-2xl font-bold tracking-tight">{shelf.title}</h2>
-          <div className="px-4 mb-3">
+          <h2 className="px-4 lg:px-8 mb-2.5 lg:mb-4 text-lg lg:text-2xl font-bold tracking-tight">{shelf.title}</h2>
+          <div className="px-4 lg:px-8 mb-3 lg:mb-6">
             <HeroCard
               cover={head.album_art_url ?? null}
               title={head.title}
@@ -962,7 +1285,7 @@ export function HomeScreen({
           </div>
           {rest.length > 0 ? (
             <div className="-my-4">
-            <ShelfRow artClass="mt-4 h-32" scrollerClassName="flex gap-4 lg:gap-6 overflow-x-auto overflow-y-clip px-4 py-4 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden">
+            <ShelfRow artClass="mt-4 h-32 lg:h-44" scrollerClassName="flex gap-4 lg:gap-6 overflow-x-auto overflow-y-clip px-4 lg:px-8 py-4 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden">
               {rest.map((t, i) => (
                 <TrackCard
                   key={`${shelf.kind}:${i}:${t.source_id}`}
@@ -1070,7 +1393,7 @@ export function HomeScreen({
               active={nowPlayingKey === `playlist:${p.source_id}`}
               isPlaying={!!isPlaying}
               onToggle={onTogglePlay}
-              className={`${size === 'lg' ? 'w-40' : 'w-32'} shrink-0`}
+              className={`${size === 'lg' ? 'w-40 lg:w-44' : 'w-32 lg:w-44'} shrink-0`}
             />
           ))}
         </Shelf>
@@ -1102,6 +1425,77 @@ export function HomeScreen({
               onToggle={onTogglePlay}
             />
           ))}
+        </Shelf>
+      );
+    }
+    if (shelf.kind === 'mixed_row') {
+      // Heterogeneous row (Spotify's "More like {X}"): each item carries its own
+      // type, mapped onto the same artist/album/playlist cards the homogeneous
+      // rows use. Keys are `type:source:source_id` so the id spaces can't collide.
+      const items = shelf.items ?? [];
+      if (items.length === 0) return null;
+      return (
+        <Shelf
+          key={`${shelf.kind}:${idx}:${shelf.title}`}
+          title={shelf.title}
+          eyebrow={shelf.eyebrow}
+          artClass={artClass}
+          icon={shelf.seed_art}
+          {...shelfExtra}
+        >
+          {items.map((it) => {
+            if (it.type === 'artist') {
+              const a = it.artist;
+              return (
+                <ArtistCard
+                  key={`artist:${a.source}:${a.source_id}`}
+                  artist={a}
+                  size={size}
+                  matchAlbumSize
+                  onClick={() => openArtistCard(a)}
+                  onPlay={() => playArtistCard(a)}
+                  onLongPress={() => setCardMenu({ kind: 'artist', artist: a })}
+                  active={nowPlayingKey === `artist:${a.source_id}`}
+                  isPlaying={!!isPlaying}
+                  onToggle={onTogglePlay}
+                />
+              );
+            }
+            if (it.type === 'album') {
+              const al = it.album;
+              return (
+                <AlbumCard
+                  key={`album:${al.source}:${al.source_id}`}
+                  album={al}
+                  size={size}
+                  onClick={() => openAlbumCard(al)}
+                  onPlay={() => playAlbumCard(al)}
+                  onLongPress={() => setCardMenu({ kind: 'album', album: al })}
+                  active={nowPlayingKey === `album:${al.source_id}`}
+                  isPlaying={!!isPlaying}
+                  onToggle={onTogglePlay}
+                />
+              );
+            }
+            if (it.type === 'playlist') {
+              const p = it.playlist;
+              return (
+                <PlaylistCard
+                  key={`playlist:${p.source}:${p.source_id}`}
+                  playlist={p}
+                  onOpen={openCatalogPlaylist}
+                  onPlay={() => playPlaylistCard(p)}
+                  active={nowPlayingKey === `playlist:${p.source_id}`}
+                  isPlaying={!!isPlaying}
+                  onToggle={onTogglePlay}
+                  className={`${size === 'lg' ? 'w-40 lg:w-44' : 'w-32 lg:w-44'} shrink-0`}
+                />
+              );
+            }
+            // Unknown item type from a newer server on a stale bundle — skip the
+            // card rather than crash the whole feed (mirrors the shelf-kind guard).
+            return null;
+          })}
         </Shelf>
       );
     }
@@ -1147,29 +1541,50 @@ export function HomeScreen({
   // "Made for you" rail: two endless stations then the daily mixes as portrait
   // tiles. Spliced into the feed after the second shelf so the page opens with a
   // hero + one shelf, then this personal tier.
-  const madeForYouRail = (
+  //
+  // A profile with no listening history has neither (the server says
+  // `station_ready: false`, and mixes are built from the same play data), so the
+  // whole rail drops out — a "Made for you" heading over an empty strip, or a
+  // station tile that can only produce an empty queue, is worse than no rail.
+  const madeForYouRail = !stationReady && railMixes.length === 0 ? null : (
     <MadeForYouRail key="made-for-you-rail">
-      <StationTile
-        variant="my"
-        loading={stationLoading === 'for-you'}
-        igniting={igniting}
-        desktop={isDesktop}
-        arts={myStationArts}
-        onPress={() => void startStation()}
-      />
-      <StationTile
-        variant="discovery"
-        loading={stationLoading === 'fresh'}
-        desktop={isDesktop}
-        arts={discoveryStationArts}
-        onPress={() => void startStation('fresh')}
-      />
+      {stationReady && (
+        <>
+          <StationTile
+            variant="my"
+            loading={stationLoading === 'for-you'}
+            opening={stationOpening === 'for-you'}
+            igniting={igniting}
+            desktop={isDesktop}
+            arts={myStationArts}
+            active={nowPlayingKey === 'station:for-you'}
+            isPlaying={!!isPlaying}
+            onOpen={() => void openStationPage()}
+            onPress={() => void startStation()}
+            onToggle={onTogglePlay}
+          />
+          <StationTile
+            variant="discovery"
+            loading={stationLoading === 'fresh'}
+            opening={stationOpening === 'fresh'}
+            desktop={isDesktop}
+            arts={discoveryStationArts}
+            active={nowPlayingKey === 'station:fresh'}
+            isPlaying={!!isPlaying}
+            onOpen={() => void openStationPage('fresh')}
+            onPress={() => void startStation('fresh')}
+            onToggle={onTogglePlay}
+          />
+        </>
+      )}
       {railMixes.map((mix) => (
         <MixTile
           key={mix.key}
           mix={mix}
           cadence={mix.cadence ?? 'New every day'}
           desktop={isDesktop}
+          active={nowPlayingKey === `mix:${mix.key}`}
+          isPlaying={!!isPlaying}
           onOpen={() => {
             // Show the page now; on desktop also record the history stop (the
             // push doesn't restore — same "record without restoring" convention
@@ -1177,20 +1592,26 @@ export function HomeScreen({
             setOpenMix(mix);
             onMixPush?.({ mix });
           }}
-          onPlay={() => onPlayTrack(mix.tracks[0], mix.tracks, 0)}
+          onPlay={async () => {
+            // await so setQueue (clears nowPlayingKey) runs before we stamp this
+            // mix as the source — mirrors the album/playlist card play path.
+            await onPlayTrack(mix.tracks[0], mix.tracks, 0);
+            onPlayedFrom?.(`mix:${mix.key}`);
+          }}
+          onToggle={onTogglePlay}
         />
       ))}
     </MadeForYouRail>
   );
 
   return (
-    <div ref={rootRef} className="min-h-full bg-transparent text-neutral-100 pb-28">
-      {/* On desktop, an open drill-in (mix page OR catalog playlist) renders
-          inline (in-flow) and REPLACES the feed, so the global top-bar Back
-          reveals what's underneath. The phone keeps the feed and overlays the
-          drill as a fixed modal (in the modals block below). */}
-      {!(isDesktop && (openMix || openPlaylist || openShelfGrid)) && (
-        <>
+    <div ref={rootRef} className="min-h-full bg-transparent text-neutral-100 pb-6">
+      {/* The feed ALWAYS renders. A desktop drill-in is portaled into the
+          host's overlay (see `drillPortal`) and covers this, rather than
+          replacing it — so the feed is never unmounted and never loses its
+          scroll. The phone likewise keeps the feed and stacks the drill as a
+          fixed modal (in the modals block below). */}
+      <>
       <div
         // Phone only (onOpenSettings is omitted on desktop): a sticky, frosted
         // header so the greeting/Browse stay put and content tucks under it
@@ -1199,61 +1620,71 @@ export function HomeScreen({
         // drill-in detail page (also z-10, rendered later) so opening an album/
         // playlist from Home covers this header + reveals the page's back
         // chevron — while the bottom nav (z-20) stays on top.
-        className={`px-4 pt-5 pb-3 flex items-center justify-between gap-3 ${
+        className={`px-4 lg:px-8 pt-4 pb-2 ${
           onOpenSettings ? 'sticky top-0 z-10 bg-neutral-950/70 backdrop-blur-xl' : ''
         }`}
       >
-        <div className="flex items-center gap-3 min-w-0">
-          {onOpenSettings && (
+        <div className="flex items-center justify-between gap-3">
+          {/* min-w-0 so `truncate` can actually shrink a long greeting — as a
+              direct flex child it would otherwise refuse to go below its
+              content width and push the avatar off the row. */}
+          <h1 className="min-w-0 flex-1 text-xl font-bold tracking-tight truncate">
+            {serverGreeting ?? greeting()}
+            {profile?.name ? `, ${profile.name}` : ''}
+          </h1>
+          {/* Desktop only: the phone reaches Browse via the Search tab's empty
+              state (the "Browse all" genre grid), so no header button there.
+              `onOpenSettings` is the phone marker — absent ⇒ desktop. */}
+          {onOpenBrowse && !onOpenSettings && (
             <button
               type="button"
-              onClick={onOpenSettings}
-              aria-label="Settings"
-              className="h-9 w-9 shrink-0 rounded-full overflow-hidden active:opacity-80"
+              onClick={onOpenBrowse}
+              className="shrink-0 text-xs px-3 py-1.5 rounded-full border border-neutral-700 text-neutral-300 active:bg-neutral-800"
             >
-              {profile?.avatar_path ? (
-                <img
-                  src={profileAvatarUrl(profile.id, token)}
-                  alt=""
-                  className="h-full w-full object-cover"
-                  draggable={false}
-                />
-              ) : (
-                <span
-                  className="h-full w-full grid place-items-center text-sm font-semibold text-white"
-                  style={{ backgroundColor: profile?.avatar_color ?? '#3f3f46' }}
-                >
-                  {(profile?.name ?? '?').trim().charAt(0).toUpperCase() || '?'}
-                </span>
-              )}
+              Browse
             </button>
           )}
-          <div className="min-w-0">
-            <h1 className="text-2xl font-bold tracking-tight truncate">
-              {serverGreeting ?? greeting()}
-              {profile?.name ? `, ${profile.name}` : ''}
-            </h1>
-            {/* Apple-style caption: lives with the title it describes rather
-                than floating between sections. Honest freshness from the real
-                discovery-pool age (N6), not a hardcoded "today". */}
-            {feedLoaded && shelves.length > 0 && (
-              <p className="text-xs text-neutral-500">{freshnessLabel(feedAgeSecs)}</p>
-            )}
-          </div>
+          {onOpenSettings && (
+            <SettingsAvatar
+              profile={profile}
+              token={token}
+              onOpenSettings={onOpenSettings}
+            />
+          )}
         </div>
-        <button
-          type="button"
-          onClick={onOpenBrowse}
-          className="shrink-0 text-xs px-3 py-1.5 rounded-full border border-neutral-700 text-neutral-300 active:bg-neutral-800"
-        >
-          Browse
-        </button>
       </div>
+
+      {/* First run for this profile: no plays (so the stations are already
+          hidden) and no playlists. `playlists === null` means still loading —
+          don't guess. `stationReady` starts true, so this can't flash before the
+          feed lands. Both platforms: the Mac's first-run wizard fires on having
+          no PLAYLISTS, which is a different question, and it only ever fires
+          once — so a Mac profile that has skipped it still arrives at a bare
+          Home with nothing explaining it. */}
+      {onOpenSearch &&
+        !stationReady &&
+        !welcomeDismissed &&
+        playlists?.length === 0 && (
+          <WelcomeCard
+            onFind={onOpenSearch}
+            onDismiss={() => {
+              setWelcomeDismissed(true);
+              try {
+                localStorage.setItem(
+                  profileScopedKey(WELCOME_LS, activeProfileId ?? null),
+                  '1',
+                );
+              } catch {
+                /* private mode — it reappears next launch, which is survivable */
+              }
+            }}
+          />
+        )}
 
       {playlists === null && <QuickAccessSkeleton />}
 
       {quickAccess.length > 0 && (
-        <div className="px-4 grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-2 mb-7 lg:mb-6">
+        <div className="px-4 lg:px-8 grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-2 lg:gap-3 mb-7 lg:mb-10">
           {quickAccess.map((p) => (
             <button
               key={p.id}
@@ -1274,7 +1705,7 @@ export function HomeScreen({
                   />
                 )}
               </div>
-              <Marquee text={p.name} className="min-w-0 flex-1 pr-2 text-sm font-medium" />
+              <Marquee text={p.name} lines={2} className="min-w-0 flex-1 pr-2 text-sm font-medium leading-tight" />
             </button>
           ))}
         </div>
@@ -1290,7 +1721,9 @@ export function HomeScreen({
           return i === Math.min(1, rows.length - 1) ? [node, madeForYouRail] : [node];
         })
       ) : feedLoaded ? (
-        // Feed resolved but empty (thin library): still offer the stations.
+        // Feed resolved but empty (thin library): still offer the stations —
+        // unless there's no history to seed them with either, in which case the
+        // rail is null and Home stays honestly bare.
         madeForYouRail
       ) : (
         // Cold start: a few pulsing placeholder shelves until the feed lands.
@@ -1305,18 +1738,19 @@ export function HomeScreen({
         playlists !== null &&
         shelves.length === 0 &&
         quickAccess.length === 0 && (
-          <div className="px-4 mt-10 text-sm text-neutral-500">
+          <div className="px-4 lg:px-8 mt-10 text-sm text-neutral-500">
             Once you&apos;ve added music to your library and played a few tracks,
             your recent and most-played picks show up here.
           </div>
         )}
         </>
-      )}
 
       {openArtist && (
         <ArtistDetailModal
           token={token}
           artist={openArtist}
+          pin={pin}
+          save={save}
           onClose={() => {
             stop();
             setOpenArtist(null);
@@ -1330,6 +1764,10 @@ export function HomeScreen({
           }}
           playingPreviewUrl={playingUrl}
           onTogglePreview={toggle}
+          isTrackCurrent={isTrackCurrent}
+          isPlaying={isPlaying}
+          onTogglePlay={onTogglePlay}
+          onShowTrackSheet={onShowTrackSheet}
         />
       )}
       {openAlbum && (
@@ -1337,12 +1775,15 @@ export function HomeScreen({
           token={token}
           album={openAlbum}
           activeProfileId={activeProfileId}
+          pin={pin}
           onClose={() => {
             stop();
             setOpenAlbum(null);
           }}
-          onPickTrack={onPlayTrack}
-          onPlay={onPlayTrack}
+          onPickTrack={(t) => void playFromDetail(`album:${openAlbum.source_id}`, t)}
+          onPlay={(t, list, index) =>
+            void playFromDetail(`album:${openAlbum.source_id}`, t, list, index)
+          }
           // Phone: "⋯" bottom sheet + swipe-to-queue / swipe-to-save, matching
           // the library page. Absent on desktop (uses the hover "⋯" menu).
           onShowTrackSheet={onShowTrackSheet}
@@ -1350,14 +1791,27 @@ export function HomeScreen({
           onSaveTrack={onAlbumSaveToLiked}
           playingPreviewUrl={playingUrl}
           onTogglePreview={toggle}
+          isTrackCurrent={isTrackCurrent}
+          isPlaying={isPlaying}
+          onTogglePlay={onTogglePlay}
         />
       )}
+      {/* The three desktop drill-ins. On desktop they're portaled into the
+          host's overlay so they cover the feed with their OWN scroll container,
+          leaving the feed mounted and un-scrolled underneath (Back is then a
+          pure reveal — nothing to rebuild, nothing to restore). Without a
+          portal (the phone) they render right here, as the fixed modals they
+          already were. */}
+      {(() => {
+        const drill = (
+          <>
       {openPlaylist && (
         <PlaylistDetailModal
           token={token}
           playlist={openPlaylist}
           activeProfileId={activeProfileId}
           inline={isDesktop}
+          pin={pin}
           onClose={() => {
             stop();
             // Desktop: close by routing through history Back so the entry pops
@@ -1366,13 +1820,18 @@ export function HomeScreen({
             if (onMixBack) onMixBack();
             else setOpenPlaylist(null);
           }}
-          onPickTrack={onPlayTrack}
-          onPlay={onPlayTrack}
+          onPickTrack={(t) => void playFromDetail(`playlist:${openPlaylist.source_id}`, t)}
+          onPlay={(t, list, index) =>
+            void playFromDetail(`playlist:${openPlaylist.source_id}`, t, list, index)
+          }
           onShowTrackSheet={onShowTrackSheet}
           onQueueTrack={onAlbumAddToQueue}
           onSaveTrack={onAlbumSaveToLiked}
           playingPreviewUrl={playingUrl}
           onTogglePreview={toggle}
+          isTrackCurrent={isTrackCurrent}
+          isPlaying={isPlaying}
+          onTogglePlay={onTogglePlay}
         />
       )}
       {openMix && (
@@ -1381,6 +1840,7 @@ export function HomeScreen({
           mix={openMix}
           activeProfileId={activeProfileId}
           inline={isDesktop}
+          pin={pin}
           onClose={() => {
             stop();
             // Desktop: close by routing through history Back, so the entry pops
@@ -1389,8 +1849,8 @@ export function HomeScreen({
             if (onMixBack) onMixBack();
             else setOpenMix(null);
           }}
-          onPickTrack={onPlayTrack}
-          onPlay={onPlayTrack}
+          onPickTrack={(t) => void playFromDetail(openMix.key, t)}
+          onPlay={(t, list, index) => void playFromDetail(openMix.key, t, list, index)}
           onShowTrackSheet={onShowTrackSheet}
           // Desktop: the per-song hover "⋯" menu (Add to playlist / Favorites /
           // queue / Go to artist), same as the library playlist page. Phone folds
@@ -1414,13 +1874,18 @@ export function HomeScreen({
           onTogglePreview={toggle}
         />
       )}
-      {/* Desktop "Show all" drill: the big shelf's full grid, replacing the feed
-          (in-flow, so the top-bar Back reveals what's underneath — same as the
-          mix page). No in-page Back button: the app's global top-bar Back/Forward
-          (and Escape below) close it, matching the mix/playlist drill pages. */}
+      {/* Desktop "Show all" drill: the big shelf's full grid. No in-page Back
+          button: the app's global top-bar Back/Forward (and Escape below) close
+          it, matching the mix/playlist drill pages. */}
       {isDesktop && openShelfGrid && (
         <div className="pt-2">{renderShelf(openShelfGrid, 1, true)}</div>
       )}
+          </>
+        );
+        return isDesktop && drillPortal
+          ? createPortal(drill, drillPortal)
+          : drill;
+      })()}
       {addTrack && (
         <AddToPlaylistModal
           token={token}
@@ -1467,7 +1932,7 @@ export function HomeScreen({
           onClose={() => setCardMenu(null)}
         />
       )}
-      {toast && <Toast message={toast} />}
+      {toast && <Toast message={toast} placement="floating" />}
     </div>
   );
 }
@@ -1503,7 +1968,7 @@ function ActionSheet({
         className="absolute inset-0 bg-black/50"
         onClick={onClose}
       />
-      <div className="relative bg-neutral-900 rounded-t-2xl px-4 pt-2 pb-[calc(1rem+env(safe-area-inset-bottom))]">
+      <div className="relative bg-neutral-900 rounded-t-2xl px-4 lg:px-8 pt-2 pb-[calc(1rem+env(safe-area-inset-bottom))]">
         <div className="mx-auto mb-2 h-1 w-9 rounded-full bg-neutral-700" />
         <div className="px-1 mb-2">
           <div className="text-sm font-semibold text-neutral-100 truncate">{title}</div>
@@ -1533,70 +1998,97 @@ function ActionSheet({
   );
 }
 
-/** Transient toast above the player bar (action feedback). */
-function Toast({ message }: { message: string }) {
-  return createPortal(
-    <div
-      className="fixed left-1/2 -translate-x-1/2 z-[60] pointer-events-none"
-      style={{ bottom: 'calc(env(safe-area-inset-bottom) + 6rem)' }}
-    >
-      <div className="bg-neutral-800/95 backdrop-blur text-neutral-100 text-sm px-4 py-2 rounded-full shadow-lg ring-1 ring-white/10">
-        {message}
-      </div>
-    </div>,
-    document.body,
-  );
-}
-
 /** A "Made for you" rail: a horizontally scrolling row of portrait tiles under
  *  one uniform shelf header. Holds the two station tiles (and, from P3, the mix
  *  tiles as children). */
 function MadeForYouRail({ children }: { children: ReactNode }) {
   return (
-    <section className="mb-7 lg:mb-6">
-      <h2 className="px-4 mb-2.5 lg:mb-4 text-lg lg:text-2xl font-bold tracking-tight">Made for you</h2>
+    <section className="mb-7 lg:mb-10">
+      <h2 className="px-4 lg:px-8 mb-2.5 lg:mb-4 text-lg lg:text-2xl font-bold tracking-tight">Made for you</h2>
       {/* No scroll-snap here: `snap-x` + `snap-start` made the browser scroll past
           the px-4 left padding to align the first tile, so tiles sat flush at the
           edge (unlike every other shelf). Plain overflow matches the shelves.
           ShelfRow adds the same desktop hover ‹ › arrows as the shelves. */}
-      <ShelfRow scrollerClassName="flex gap-3 overflow-x-auto overscroll-x-contain px-4 py-1 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden">
+      <ShelfRow scrollerClassName="flex gap-3 overflow-x-auto overscroll-x-contain px-4 lg:px-8 py-1 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden">
         {children}
       </ShelfRow>
     </section>
   );
 }
 
-/** The play button used on rail tiles — same look/position as the album-card
- *  `CardPlayButton` (white circle, bottom-right, drop shadow). Hover-reveals on
- *  desktop; always visible on phone (where there's no hover and tapping the tile
- *  opens rather than plays, so the button is the direct-play affordance). */
-function TilePlayButton({
-  label,
-  desktop,
-  onPlay,
+/** Home's first-run card: a profile with no listening history has no stations
+ *  (they seed off play history, so the tiles are hidden) and no mixes, which
+ *  leaves Home honestly bare. This says why, and offers the one action that
+ *  fixes it.
+ *
+ *  That action is "go find something" rather than a one-tap "play something for
+ *  me" on purpose: the first thing you play becomes the seed every mix and
+ *  station is built from afterwards, so it should be a song you chose, not one
+ *  the app picked to fill a button.
+ *
+ *  Phone stacks it; desktop lays it out as a band — copy left, action right — so
+ *  it spans the same grid as every shelf and its trailing edge lands under the
+ *  account avatar. A half-width block ended on nothing, and a full-width one
+ *  with everything huddled at the left would just be a wide block with a hole in
+ *  it; using the width is what keeps it reading as a notice rather than a promo. */
+function WelcomeCard({
+  onFind,
+  onDismiss,
 }: {
-  label: string;
-  desktop?: boolean;
-  onPlay: () => void;
+  onFind: () => void;
+  onDismiss: () => void;
 }) {
   return (
-    <button
-      type="button"
-      aria-label={label}
-      onClick={(e) => {
-        e.stopPropagation();
-        onPlay();
-      }}
-      className={`absolute bottom-2 right-2 grid h-10 w-10 place-items-center rounded-full bg-white text-neutral-950 shadow-[0_8px_16px_rgba(0,0,0,0.5)] transition duration-200 ease-out hover:scale-105 active:scale-95 ${
-        desktop
-          ? 'opacity-0 translate-y-2 group-hover:opacity-100 group-hover:translate-y-0 focus-visible:opacity-100 focus-visible:translate-y-0'
-          : ''
-      }`}
-    >
-      <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden>
-        <path d="M8 5.14v13.72a1 1 0 0 0 1.5.86l11-6.86a1 1 0 0 0 0-1.72l-11-6.86A1 1 0 0 0 8 5.14z" />
-      </svg>
-    </button>
+    <div className="px-4 lg:px-8 mb-7 lg:mb-10">
+      <div className="relative overflow-hidden rounded-2xl bg-gradient-to-br from-rose-700 to-rose-950 p-4 ring-1 ring-white/10 lg:flex lg:items-center lg:gap-5 lg:p-5">
+        {/* Corner bloom — the same branded-wash language as the station tiles.
+            Absolute, so it sits out of the desktop row's flow. */}
+        <div
+          className="pointer-events-none absolute -right-7 -top-7 h-24 w-24 rounded-full bg-white/10"
+          aria-hidden
+        />
+        <div className="relative lg:min-w-0 lg:flex-1">
+          {/* pr-8 clears the phone's corner ✕; on desktop the ✕ joins the row
+              instead, so the copy gets the whole left side. */}
+          <h2 className="pr-8 text-[15px] font-bold tracking-tight text-white lg:pr-0 lg:text-base">
+            Welcome to Beetbot
+          </h2>
+          <p className="mt-1 text-[13px] leading-snug text-white/70 lg:text-sm">
+            Play anything and this page fills up — mixes, stations and picks, all
+            built from what you actually listen to.
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={onFind}
+          className="relative mt-3 shrink-0 rounded-full bg-white/15 px-3.5 py-1.5 text-[13px] font-semibold text-white transition hover:bg-white/25 active:scale-95 lg:mt-0"
+        >
+          Find something to play
+        </button>
+        {/* Pinned to the corner on the phone, but a trailing member of the row on
+            desktop (`lg:static`) — chasing the corner of a wide band would strand
+            it miles from the button it belongs beside. */}
+        <button
+          type="button"
+          onClick={onDismiss}
+          aria-label="Dismiss"
+          className="absolute right-3 top-3 grid h-6 w-6 shrink-0 place-items-center rounded-full bg-white/15 text-white/80 transition hover:bg-white/25 hover:text-white active:scale-95 lg:static"
+        >
+          <svg
+            width="10"
+            height="10"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="3"
+            strokeLinecap="round"
+            aria-hidden
+          >
+            <path d="M5 5l14 14M19 5L5 19" />
+          </svg>
+        </button>
+      </div>
+    </div>
   );
 }
 
@@ -1609,35 +2101,48 @@ function TilePlayButton({
 function StationTile({
   variant,
   loading,
+  opening,
   igniting,
   desktop,
   arts,
+  active,
+  isPlaying,
+  onOpen,
   onPress,
+  onToggle,
 }: {
   variant: 'my' | 'discovery';
   loading: boolean;
+  opening?: boolean;
   igniting?: boolean;
   desktop?: boolean;
   arts: string[];
+  /** This station is the current playback source → persistent play/pause button. */
+  active?: boolean;
+  isPlaying?: boolean;
+  onOpen: () => void;
   onPress: () => void;
+  onToggle?: () => void;
 }) {
   const my = variant === 'my';
-  const label = my ? 'Play My station' : 'Play Discovery station';
+  const title = my ? 'My station' : 'Discovery station';
+  // Busy = either a direct play (loading) or a page fetch (opening) in flight.
+  const busy = loading || !!opening;
   return (
     <div
       role="button"
       tabIndex={0}
       onClick={() => {
-        if (!loading) onPress();
+        if (!busy) onOpen();
       }}
       onKeyDown={(e) => {
-        if ((e.key === 'Enter' || e.key === ' ') && !loading) {
+        if ((e.key === 'Enter' || e.key === ' ') && !busy) {
           e.preventDefault();
-          onPress();
+          onOpen();
         }
       }}
-      aria-label={label}
-      aria-busy={loading}
+      aria-label={`Open ${title}`}
+      aria-busy={busy}
       className={`group relative shrink-0 aspect-[3/4] overflow-hidden rounded-2xl ring-1 ring-white/10 cursor-pointer transition-transform active:scale-[0.98] ${
         desktop ? 'w-[200px] hover:ring-white/25' : 'w-[55vw] max-w-[240px]'
       }`}
@@ -1661,7 +2166,7 @@ function StationTile({
           className="pointer-events-none absolute inset-0 animate-[beet-ignite_1s_ease-out]"
         />
       ) : null}
-      {loading ? (
+      {busy ? (
         <span className="absolute inset-0 grid place-items-center text-white/90">
           <svg className="animate-spin" width="30" height="30" viewBox="0 0 24 24" fill="none" aria-hidden>
             <circle cx="12" cy="12" r="9" stroke="currentColor" strokeOpacity="0.3" strokeWidth="3" />
@@ -1669,14 +2174,21 @@ function StationTile({
           </svg>
         </span>
       ) : (
-        <TilePlayButton label={label} desktop={desktop} onPlay={onPress} />
+        <CardPlayButton
+          label={`Play ${title}`}
+          persistent={!desktop || !!active}
+          playing={!!active && !!isPlaying}
+          onPlay={active && onToggle ? onToggle : onPress}
+        />
       )}
-      <span className="absolute inset-x-0 bottom-0 p-3 pr-14">
+      {/* pointer-events-none so a click on the play button underneath isn't
+          swallowed by this label overlay (which would open the page instead). */}
+      <span className="pointer-events-none absolute inset-x-0 bottom-0 p-3 pr-14">
         <span className="block text-[15px] font-semibold text-white">
-          {my ? 'My station' : 'Discovery station'}
+          {title}
         </span>
         <span className="block text-[11.5px] text-white/80">
-          {loading ? 'Starting…' : 'Endless'}
+          {loading ? 'Starting…' : opening ? 'Opening…' : 'Endless'}
         </span>
       </span>
     </div>
@@ -1691,14 +2203,21 @@ function MixTile({
   mix,
   cadence,
   desktop,
+  active,
+  isPlaying,
   onOpen,
   onPlay,
+  onToggle,
 }: {
   mix: MixData;
   cadence: string;
   desktop?: boolean;
+  /** This mix is the current playback source → persistent play/pause button. */
+  active?: boolean;
+  isPlaying?: boolean;
   onOpen: () => void;
   onPlay: () => void;
+  onToggle?: () => void;
 }) {
   const arts = mix.tracks
     .map((t) => t.album_art_url)
@@ -1747,9 +2266,15 @@ function MixTile({
         aria-hidden
         className="absolute inset-x-0 bottom-0 h-1/2 bg-gradient-to-t from-black/70 to-transparent"
       />
-      <TilePlayButton label={`Play ${mix.title}`} desktop={desktop} onPlay={onPlay} />
-      {/* pr-14 keeps a long title from running under the play button. */}
-      <span className="absolute inset-x-0 bottom-0 p-3 pr-14">
+      <CardPlayButton
+        label={`Play ${mix.title}`}
+        persistent={!desktop || !!active}
+        playing={!!active && !!isPlaying}
+        onPlay={active && onToggle ? onToggle : onPlay}
+      />
+      {/* pointer-events-none so a click on the play button underneath isn't
+          swallowed by this label (pr-14 only keeps the TEXT clear of it). */}
+      <span className="pointer-events-none absolute inset-x-0 bottom-0 p-3 pr-14">
         <span className="block text-[15px] font-semibold leading-tight text-white line-clamp-2">
           {mix.title}
         </span>
@@ -1766,6 +2291,8 @@ function Shelf({
   children,
   onShowAll,
   forceExpand,
+  desktop = false,
+  icon,
 }: {
   title: string;
   eyebrow?: string | null;
@@ -1778,6 +2305,11 @@ function Shelf({
   onShowAll?: () => void;
   /** Render the full wrapping grid with no toggle — used on the drill page. */
   forceExpand?: boolean;
+  /** Desktop chrome active. On phone the in-place "Show all" expand is hidden —
+   *  rows just scroll horizontally, like Spotify's mobile home. */
+  desktop?: boolean;
+  /** Optional round header thumbnail (the seed artist on a "More like {X}" row). */
+  icon?: string | null;
 }) {
   // "Show all" flips the scroll row into a wrapping grid (same pattern as
   // Discover's shelves). Only offered when there's actually more to see.
@@ -1785,17 +2317,28 @@ function Shelf({
   const count = Children.count(children);
   const showGrid = forceExpand || expanded;
   return (
-    <section className="mb-7 lg:mb-6">
-      <div className="px-4 mb-2.5 lg:mb-4 flex items-end justify-between gap-3">
-        <div className="min-w-0">
-          {eyebrow ? (
-            <p className="text-[11px] uppercase tracking-wide text-neutral-500">
-              {eyebrow}
-            </p>
+    <section className="mb-7 lg:mb-10">
+      <div className="px-4 lg:px-8 mb-2.5 lg:mb-4 flex items-end justify-between gap-3">
+        <div className="flex items-center gap-3 min-w-0">
+          {icon ? (
+            <img
+              src={icon}
+              alt=""
+              className="h-10 w-10 lg:h-12 lg:w-12 shrink-0 rounded-full object-cover"
+            />
           ) : null}
-          <h2 className="text-lg lg:text-2xl font-bold tracking-tight truncate">{title}</h2>
+          <div className="min-w-0">
+            {eyebrow ? (
+              <p className="text-[11px] uppercase tracking-wide text-neutral-500">
+                {eyebrow}
+              </p>
+            ) : null}
+            <h2 className="text-lg lg:text-2xl font-bold tracking-tight truncate">{title}</h2>
+          </div>
         </div>
-        {count > 4 && !forceExpand && (
+        {/* Desktop only: phone home rows just scroll (no in-place expand), like
+            Spotify's mobile home. Desktop keeps "Show all" (drill page or expand). */}
+        {count > 4 && !forceExpand && desktop && (
           <button
             type="button"
             onClick={onShowAll ?? (() => setExpanded((v) => !v))}
@@ -1806,7 +2349,7 @@ function Shelf({
         )}
       </div>
       {showGrid ? (
-        <div className="px-4 py-4 -my-4 flex flex-wrap gap-4 lg:gap-6">{children}</div>
+        <div className="px-4 lg:px-8 py-4 -my-4 flex flex-wrap gap-4 lg:gap-6">{children}</div>
       ) : (
         // Same Apple-Music-style hover ‹ › arrows as the artist page (ShelfRow,
         // shared). Desktop-only (sm:flex); the phone still swipes. The scroller
@@ -1815,7 +2358,7 @@ function Shelf({
         // goes on THIS outer wrapper, NOT the scroller — a negative margin on
         // the scroller collapses ShelfRow's positioning box and kills the arrows.
         <div className="-my-4">
-          <ShelfRow artClass={artClass} scrollerClassName="flex gap-4 lg:gap-6 overflow-x-auto overflow-y-clip px-4 py-4 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden">
+          <ShelfRow artClass={artClass} scrollerClassName="flex gap-4 lg:gap-6 overflow-x-auto overflow-y-clip px-4 lg:px-8 py-4 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden">
             {children}
           </ShelfRow>
         </div>
@@ -1831,6 +2374,7 @@ function HeroCard({
   eyebrow,
   title,
   subtitle,
+  subtitleShort,
   onClick,
   disabled = false,
   active = false,
@@ -1841,6 +2385,11 @@ function HeroCard({
   eyebrow?: string | null;
   title: string;
   subtitle?: string | null;
+  /** A trimmed subtitle for the phone, where the full one wraps. The spotlight
+   *  band's subtitle lists the result artists — redundant with the covers in
+   *  the row below — so on a narrow screen it collapses to just the count.
+   *  Omitted ⇒ the phone shows `subtitle` like the desktop. */
+  subtitleShort?: string | null;
   onClick: () => void;
   /** Non-downloaded lead track + hub unreachable → dim + inert (banner explains). */
   disabled?: boolean;
@@ -1876,9 +2425,9 @@ function HeroCard({
         <div className="absolute inset-0 bg-neutral-800" />
       )}
       <div className="absolute inset-0 bg-black/50" />
-      {/* Content: sharp full square cover · text · round play/pause button. */}
+      {/* Content: sharp full square cover · text · (desktop) round play/pause. */}
       <div className="relative flex items-center gap-4 p-4">
-        <div className="h-28 w-28 shrink-0 overflow-hidden rounded-xl bg-neutral-800 shadow-lg ring-1 ring-white/10 sm:h-36 sm:w-36">
+        <div className="relative h-28 w-28 shrink-0 overflow-hidden rounded-xl bg-neutral-800 shadow-lg ring-1 ring-white/10 sm:h-36 sm:w-36">
           {cover ? (
             <img
               src={cover}
@@ -1887,19 +2436,44 @@ function HeroCard({
               draggable={false}
             />
           ) : null}
+          {/* Phone: the round play button is hidden below to give the title its
+              width back, so the artwork carries the play/pause state instead —
+              the same marker every other phone list already uses. */}
+          <div className="sm:hidden">
+            <NowPlayingCover current={active} playing={isPlaying} />
+          </div>
         </div>
         <div className="min-w-0 flex-1">
           {eyebrow ? (
-            <div className="mb-0.5 text-[11px] text-white/70">{eyebrow}</div>
+            <div className="mb-0.5 hidden text-[11px] text-white/70 sm:block">
+              {eyebrow}
+            </div>
           ) : null}
           <div className="line-clamp-2 text-2xl font-bold tracking-tight leading-tight text-white">
             {title}
           </div>
           {subtitle ? (
-            <div className="mt-1 line-clamp-1 text-xs text-white/70">{subtitle}</div>
+            // line-clamp-1 everywhere: the phone used to get TWO lines here while
+            // the roomier desktop got one — backwards. Now the phone shows the
+            // short variant (when given) on one line; the desktop shows the full
+            // subtitle on one line.
+            <div className="mt-1 line-clamp-1 text-xs text-white/70">
+              {subtitleShort ? (
+                <>
+                  <span className="sm:hidden">{subtitleShort}</span>
+                  <span className="hidden sm:inline">{subtitle}</span>
+                </>
+              ) : (
+                subtitle
+              )}
+            </div>
           ) : null}
         </div>
-        <div className="grid h-12 w-12 shrink-0 place-items-center rounded-full bg-white text-neutral-950 shadow-[0_8px_16px_rgba(0,0,0,0.45)] transition duration-200 group-hover:scale-105 group-active:scale-95">
+        {/* Desktop only: the card is far wider there, so the round ▶/⏸ costs
+            nothing. On the phone it ate 64px (button + gap) of a 311px row and
+            squeezed the title to 119px — the artwork shows the state instead.
+            Purely decorative either way: the whole card is the button. */}
+        <div className="hidden h-12 w-12 shrink-0 place-items-center rounded-full bg-white text-neutral-950 shadow-[0_8px_16px_rgba(0,0,0,0.45)] transition duration-200 group-hover:scale-105 group-active:scale-95 sm:grid">
           {active && isPlaying ? (
             <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
               <rect x="6" y="5" width="4" height="14" rx="1" />
@@ -1946,8 +2520,8 @@ function TrackCard({
   // playing on tap (the connection banner explains why).
   useHubReachable();
   const playableNow = canPlayNow(track);
-  const box = size === 'lg' ? 'w-40' : 'w-32';
-  const art = size === 'lg' ? 'h-40 w-40' : 'h-32 w-32';
+  const box = size === 'lg' ? 'w-40 lg:w-44' : 'w-32 lg:w-44';
+  const art = size === 'lg' ? 'h-40 w-40 lg:h-44 lg:w-44' : 'h-32 w-32 lg:h-44 lg:w-44';
   const activate = () => {
     if (lp.fired.current) {
       lp.fired.current = false;
@@ -1999,7 +2573,7 @@ function TrackCard({
             />
           ) : null}
         </div>
-        <Marquee text={track.title} className="mt-1.5 text-sm" />
+        <Marquee text={track.title} className="mt-1.5 lg:mt-2.5 text-sm" />
         <div className="truncate text-xs text-neutral-500">
           {track.artists.join(', ')}
         </div>
@@ -2029,8 +2603,8 @@ function AlbumCard({
   onToggle?: () => void;
 }) {
   const lp = useLongPress(() => onLongPress?.());
-  const box = size === 'lg' ? 'w-40' : 'w-32';
-  const art = size === 'lg' ? 'h-40 w-40' : 'h-32 w-32';
+  const box = size === 'lg' ? 'w-40 lg:w-44' : 'w-32 lg:w-44';
+  const art = size === 'lg' ? 'h-40 w-40 lg:h-44 lg:w-44' : 'h-32 w-32 lg:h-44 lg:w-44';
   const activate = () => {
     if (lp.fired.current) {
       lp.fired.current = false;
@@ -2081,7 +2655,7 @@ function AlbumCard({
             playing={isPlaying}
           />
         </div>
-        <Marquee text={album.name} className="mt-1.5 text-sm" />
+        <Marquee text={album.name} className="mt-1.5 lg:mt-2.5 text-sm" />
         <div className="truncate text-xs text-neutral-500">
           {album.artists.join(', ')}
         </div>
@@ -2099,6 +2673,7 @@ function ArtistCard({
   active = false,
   isPlaying = false,
   onToggle,
+  matchAlbumSize = false,
 }: {
   artist: SearchArtistResult;
   onClick: () => void;
@@ -2109,10 +2684,28 @@ function ArtistCard({
   active?: boolean;
   isPlaying?: boolean;
   onToggle?: () => void;
+  /** In a MIXED row, size the circle to match the album/playlist squares so
+   *  every label below lines up. Homogeneous artist shelves leave this off and
+   *  keep the slightly smaller circle (the usual music-UI convention). */
+  matchAlbumSize?: boolean;
 }) {
   const lp = useLongPress(() => onLongPress?.());
-  const box = size === 'lg' ? 'w-36' : 'w-28';
-  const art = size === 'lg' ? 'h-36 w-36' : 'h-28 w-28';
+  // Match AlbumCard's box (w-40/w-32) + art (h-40/h-32) when asked, so a circle
+  // and a square in the same row share a height and their captions align.
+  const box = matchAlbumSize
+    ? size === 'lg'
+      ? 'w-40 lg:w-44'
+      : 'w-32 lg:w-44'
+    : size === 'lg'
+      ? 'w-36 lg:w-40'
+      : 'w-28 lg:w-40';
+  const art = matchAlbumSize
+    ? size === 'lg'
+      ? 'h-40 w-40 lg:h-44 lg:w-44'
+      : 'h-32 w-32 lg:h-44 lg:w-44'
+    : size === 'lg'
+      ? 'h-36 w-36 lg:h-40 lg:w-40'
+      : 'h-28 w-28 lg:h-40 lg:w-40';
   const activate = () => {
     if (lp.fired.current) {
       lp.fired.current = false;
@@ -2160,8 +2753,7 @@ function ArtistCard({
             playing={isPlaying}
           />
         </div>
-        <div className="mt-1.5 truncate text-sm">{artist.name}</div>
-        <div className="text-xs text-neutral-500">Artist</div>
+        <div className="mt-1.5 lg:mt-2.5 truncate text-sm">{artist.name}</div>
       </div>
     </div>
   );

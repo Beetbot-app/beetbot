@@ -22,6 +22,7 @@ import {
   type StreamTrack,
 } from '@shared/api';
 import { useHubReachable } from '@shared/useHubReachable';
+import { useToast } from '@shared/useToast';
 import {
   cn,
   SCRIM,
@@ -32,14 +33,18 @@ import {
   INPUT,
   CALLOUT_INFO,
   CALLOUT_ERROR,
+  EYEBROW_ON_ART,
 } from '@shared/ui';
 import { SwipeRow } from '@shared/components/SwipeRow';
+import { Toast } from '@shared/components/Toast';
 import { HeroWash } from '@shared/components/HeroWash';
+import { EqualizerBars } from '@shared/components/EqualizerBars';
 import { useCondensedHeader } from '@shared/components/StickyHeader';
-import { AddToPlaylistModal } from '@shared/components/SearchScreen';
+import { AddToPlaylistModal } from '@shared/components/modals/AddToPlaylistModal';
 import { canStream, currentTrack, usePlayerStore, useCatalogNav } from '../store';
 import { TrackActionSheet } from './TrackActionSheet';
-import { streamToSearchResult } from './Player';
+import { streamToSearchResult } from '@shared/trackAdapter';
+import { notifyLibraryChanged } from '@shared/libraryChanged';
 
 interface Props {
   token: string;
@@ -79,13 +84,7 @@ export function PlaylistScreen({ token, playlistId, profileId, onBack }: Props) 
   const [error, setError] = useState<string | null>(null);
   const [cachedIds, setCachedIds] = useState<Set<number>>(new Set());
   // Transient confirmation for swipe gestures.
-  const [toast, setToast] = useState<string | null>(null);
-  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const showToast = useCallback((msg: string) => {
-    setToast(msg);
-    if (toastTimer.current) clearTimeout(toastTimer.current);
-    toastTimer.current = setTimeout(() => setToast(null), 1600);
-  }, []);
+  const { toast, showToast } = useToast();
   const enqueue = usePlayerStore((s) => s.enqueue);
   // Per-track "⋯" action sheet (Apple Music-style) + its add-to-playlist modal.
   const [sheetTrack, setSheetTrack] = useState<StreamTrack | null>(null);
@@ -114,7 +113,12 @@ export function PlaylistScreen({ token, playlistId, profileId, onBack }: Props) 
   const onSwipeSave = useCallback(
     (t: StreamTrack) => {
       void setTrackLiked(token, t.id, true, profileId)
-        .then(() => showToast('Added to Favorites'))
+        .then(() => {
+          showToast('Added to Favorites');
+          // So the now-playing star (if this is the current track), the Home
+          // Favorites shelf, and the Library counts refresh live.
+          notifyLibraryChanged();
+        })
         .catch(() => showToast("Couldn't save"));
     },
     [token, profileId, showToast],
@@ -162,6 +166,8 @@ export function PlaylistScreen({ token, playlistId, profileId, onBack }: Props) 
   const [renameError, setRenameError] = useState<string | null>(null);
   const setQueue = usePlayerStore((s) => s.setQueue);
   const playing = usePlayerStore(currentTrack);
+  const isPlaying = usePlayerStore((s) => s.isPlaying);
+  const playPause = usePlayerStore((s) => s.playPause);
   const toggleShuffle = usePlayerStore((s) => s.toggleShuffle);
 
   // Mark the playlist as opened-just-now so the Library grid can
@@ -422,6 +428,13 @@ export function PlaylistScreen({ token, playlistId, profileId, onBack }: Props) 
   const playable = detail.tracks.filter(canStream);
   // Play/Shuffle enable whenever a track is playable (local file or live).
   const streamableCount = detail.tracks.filter(canStream).length;
+  // Whether THIS playlist is the current playback source — so the hero + sticky
+  // play buttons reflect ⏸ while it plays and toggle play/pause (instead of
+  // always restarting). When a track from another source is current, the button
+  // plays this playlist from the top.
+  const playlistActive = !!playing && detail.tracks.some((t) => t.id === playing.id);
+  const playlistPlaying = playlistActive && isPlaying;
+  const togglePlay = () => (playlistActive ? playPause() : playAll());
   const cachedInPlaylist = playable.filter((t) => cachedIds.has(t.id)).length;
   // A saved album is stored as a playlist but is really an *album* — the page's
   // copy (delete / rename / offline tooltips) calls it that, not "playlist".
@@ -502,15 +515,22 @@ export function PlaylistScreen({ token, playlistId, profileId, onBack }: Props) 
         <button
           type="button"
           disabled={streamableCount === 0}
-          onClick={playAll}
-          aria-label={`Play ${detail.name}`}
+          onClick={togglePlay}
+          aria-label={playlistPlaying ? 'Pause' : `Play ${detail.name}`}
           className={`grid h-8 w-8 shrink-0 place-items-center rounded-full bg-white text-neutral-950 transition active:scale-95 disabled:bg-neutral-800 disabled:text-neutral-500 ${
             condensed ? 'opacity-100' : 'pointer-events-none opacity-0'
           }`}
         >
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-            <path d="M7 4.5v15l12-7.5z" />
-          </svg>
+          {playlistPlaying ? (
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+              <rect x="6" y="5" width="4" height="14" rx="1" />
+              <rect x="14" y="5" width="4" height="14" rx="1" />
+            </svg>
+          ) : (
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+              <path d="M7 4.5v15l12-7.5z" />
+            </svg>
+          )}
         </button>
         {/* Rename lives on the title tap and Delete lives in the action row
             below (Spotify-style, same as desktop) — so the sticky bar stays
@@ -543,6 +563,8 @@ export function PlaylistScreen({ token, playlistId, profileId, onBack }: Props) 
           )}
         </div>
         <div className="mt-4 w-full min-w-0 flex flex-col items-center">
+          {/* Kind eyebrow — matches the catalog album / playlist heroes. */}
+          <p className={cn(EYEBROW_ON_ART, 'mb-1')}>{isAlbum ? 'Album' : 'Playlist'}</p>
           {/* Tap the title to rename (Spotify-style, same as desktop). Gated
               on reachability — renaming is a hub write; when the desktop is
               unreachable the title stays readable but isn't a rename trigger. */}
@@ -570,7 +592,7 @@ export function PlaylistScreen({ token, playlistId, profileId, onBack }: Props) 
           <div ref={heroSentinelRef} className="h-px w-px" aria-hidden />
           {/* h1 above is the sentinel anchor; keep the meta line below it. */}
           <p className="mt-1 text-xs text-neutral-400">
-            {detail.tracks.length} tracks · {playable.length} downloaded
+            {detail.tracks.length} songs · {playable.length} downloaded
             {cachedInPlaylist > 0 ? (
               <>
                 {' '}· {cachedInPlaylist} offline
@@ -614,13 +636,20 @@ export function PlaylistScreen({ token, playlistId, profileId, onBack }: Props) 
             <button
               type="button"
               disabled={streamableCount === 0}
-              onClick={playAll}
-              aria-label={`Play ${detail.name}`}
+              onClick={togglePlay}
+              aria-label={playlistPlaying ? 'Pause' : `Play ${detail.name}`}
               className="grid h-14 w-14 shrink-0 place-items-center rounded-full bg-neutral-100 text-neutral-950 shadow-lg transition active:scale-95 disabled:bg-neutral-800 disabled:text-neutral-500"
             >
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-                <path d="M8 5v14l11-7z" />
-              </svg>
+              {playlistPlaying ? (
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                  <rect x="6" y="5" width="4" height="14" rx="1" />
+                  <rect x="14" y="5" width="4" height="14" rx="1" />
+                </svg>
+              ) : (
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                  <path d="M8 5v14l11-7z" />
+                </svg>
+              )}
             </button>
             {offlineCacheAvailable() && (
               <OfflineToggle
@@ -680,7 +709,7 @@ export function PlaylistScreen({ token, playlistId, profileId, onBack }: Props) 
         </div>
       )}
 
-      <ul className="divide-y divide-white/5">
+      <ul>
         {detail.tracks.map((t, i) => {
           const isCurrent = playing?.id === t.id;
           // A saved *album* (isAlbum, above) shares one cover across every
@@ -721,13 +750,13 @@ export function PlaylistScreen({ token, playlistId, profileId, onBack }: Props) 
                   }`}
                 >
                   {isAlbum ? (
-                    // Album: a number gutter. The now-playing row swaps the
-                    // number for a ♪ so the marker reads regardless of the
-                    // art-derived accent tint (which can resolve to white).
+                    // Album: a number gutter. The current row swaps the number
+                    // for the equalizer while playing (a static ♪ when paused) —
+                    // matching the catalog album gutter and the playlist covers.
                     <div className="w-7 shrink-0 grid place-items-center text-sm tabular-nums text-neutral-500">
                       {isCurrent ? (
                         <span className="text-accent" aria-hidden>
-                          ♪
+                          {isPlaying ? <EqualizerBars className="text-accent" /> : '♪'}
                         </span>
                       ) : (
                         i + 1
@@ -746,23 +775,24 @@ export function PlaylistScreen({ token, playlistId, profileId, onBack }: Props) 
                           loading="lazy"
                         />
                       ) : null}
-                      {/* Accent-independent now-playing marker: the title's
-                          text-accent tint can resolve to plain white (grayscale
-                          or missing artwork), so the ♪ scrim on the thumb is the
-                          signal that always reads. */}
+                      {/* Now-playing marker on the cover: the moving equalizer
+                          bars while it's actually playing (matching the genre
+                          rows), falling back to a static ♪ when paused — an
+                          accent-independent signal that always reads (the title's
+                          text-accent tint can resolve to plain white). */}
                       {isCurrent && (
                         <div
                           className="absolute inset-0 grid place-items-center bg-black/55 text-sm text-white"
                           aria-hidden
                         >
-                          ♪
+                          {isPlaying ? <EqualizerBars className="text-white" /> : '♪'}
                         </div>
                       )}
                     </div>
                   )}
                   <div className="flex-1 min-w-0">
                     <div
-                      className={`text-sm font-medium truncate ${isCurrent ? 'text-accent' : ''}`}
+                      className={`text-sm font-medium truncate ${isCurrent ? 'text-accent' : 'text-neutral-300'}`}
                     >
                       {t.title}
                     </div>
@@ -914,14 +944,7 @@ export function PlaylistScreen({ token, playlistId, profileId, onBack }: Props) 
           />,
           document.body,
         )}
-      {toast && (
-        <div
-          className="fixed left-1/2 -translate-x-1/2 z-50 px-4 py-2 rounded-full bg-neutral-800 text-sm text-neutral-100 shadow-lg pointer-events-none"
-          style={{ bottom: 'calc(var(--overlay-bottom, 146px) + 0.5rem)' }}
-        >
-          {toast}
-        </div>
-      )}
+      {toast && <Toast message={toast} />}
     </div>
   );
 }
@@ -984,9 +1007,6 @@ function DeleteConfirmModal({
           <p className="text-xs text-neutral-500 mt-3">
             Songs in the {isAlbum ? 'album' : 'playlist'} stay in your library
             and on disk — only this collection goes away.
-            {isAlbum
-              ? ''
-              : ' If it was synced from Spotify, the next sync will bring it back.'}
           </p>
           {error && (
             <div className={cn(CALLOUT_ERROR, 'mt-3 text-xs break-words')}>
@@ -1120,12 +1140,6 @@ function RenameModal({
               className={cn(INPUT, 'mt-3 w-full resize-none text-sm')}
               disabled={isSaving}
             />
-          )}
-          {source === 'spotify' && (
-            <p className="mt-2 text-xs text-amber-300/80">
-              This playlist syncs from Spotify — a future sync will restore its
-              original name.
-            </p>
           )}
           {error && (
             <div className={cn(CALLOUT_ERROR, 'mt-3 text-xs break-words')}>

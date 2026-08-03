@@ -29,7 +29,7 @@ pub mod protocol;
 pub mod session;
 
 pub use session::{
-    CastCommand, CastError, CastHandle, CastSession, CastStatus, MediaPayload,
+    CastCommand, CastHandle, CastSession, CastStatus, MediaPayload,
 };
 
 use std::collections::HashMap;

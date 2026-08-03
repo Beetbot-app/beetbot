@@ -81,19 +81,6 @@ export interface PlaylistDetail {
   total_duration_ms: number;
 }
 
-export interface TrackSearchResult {
-  id: number;
-  title: string;
-  artists: string[];
-  album: string | null;
-  album_art_url: string | null;
-  duration_ms: number;
-  local_path: string | null;
-  status: string;
-  playlist_id: number | null;
-  playlist_name: string | null;
-}
-
 export interface PlaylistTrack {
   id: number;
   spotify_id: string;
@@ -122,6 +109,31 @@ export interface LibraryAlbum {
 export interface BackupSummary {
   playlists: number;
   tracks: number;
+}
+
+/** Manifest of a portable full-server backup zip (read without importing). */
+export interface PortableManifest {
+  format: string;
+  version: number;
+  exportedAt: number;
+  appVersion: string;
+  audioIncluded: boolean;
+  profiles: number;
+  playlists: number;
+  tracks: number;
+  audioFiles: number;
+}
+
+/** Result of a portable full-server export or staged import. */
+export interface PortableSummary {
+  profiles: number;
+  playlists: number;
+  tracks: number;
+  audioFiles: number;
+  audioIncluded: boolean;
+  /** Import only: tracks whose audio neither travelled nor already existed —
+   * they were handed back to the downloader. */
+  audioMissing: number;
 }
 
 /** One distinct primary artist in the library (Daft-style Artists view). */
@@ -162,9 +174,6 @@ export const ipc = {
   verifyProfilePin: (id: number, pin: string) =>
     invoke<boolean>('verify_profile_pin', { id, pin }),
   deleteProfile: (id: number) => invoke<void>('delete_profile', { id }),
-  /** Copy a chosen image into the app and set it as the profile's photo. */
-  setProfileAvatar: (id: number, sourcePath: string) =>
-    invoke<Profile>('set_profile_avatar', { id, sourcePath }),
   /** Read a picked image as a data: URL so the in-app cropper can load it. */
   readImageDataUrl: (sourcePath: string) =>
     invoke<string>('read_image_data_url', { sourcePath }),
@@ -189,8 +198,6 @@ export const ipc = {
   /** Fetch one track row (with local_path) by id, no playlist needed. */
   getTrack: (trackId: number) =>
     invoke<PlaylistTrack | null>('get_track', { trackId }),
-  searchTracks: (query: string, limit = 50) =>
-    invoke<TrackSearchResult[]>('search_tracks', { query, limit }),
 
   // ---- Library views (Daft-style Artists / Albums / Songs) ----
   /** Every track in the active profile's saved library, flat. */
@@ -210,6 +217,17 @@ export const ipc = {
   /** Restore (merge) a JSON backup file into this profile. */
   importLibraryBackup: (profileId: number, path: string) =>
     invoke<BackupSummary>('import_library_backup', { profileId, path }),
+
+  // ---- Portable full-server backup (every profile, as one zip) ----
+  /** Export the whole server to a zip at `path`. */
+  portableExport: (path: string, includeAudio: boolean) =>
+    invoke<PortableSummary>('portable_export', { path, includeAudio }),
+  /** Read a backup's manifest without changing anything. */
+  portablePeek: (path: string) => invoke<PortableManifest>('portable_peek', { path }),
+  /** Validate and stage a backup; the swap happens on the next launch. */
+  portableImport: (path: string) => invoke<PortableSummary>('portable_import', { path }),
+  /** Restart the app to finish a staged import. */
+  portableRestart: () => invoke<void>('portable_restart'),
 
   // Last.fm API key (free; powers genre-accurate Browse charts).
   lastfmGetKey: () => invoke<string | null>('lastfm_get_key'),
@@ -322,7 +340,81 @@ export const ipc = {
     invoke<void>('remote_streaming_set_enabled', { enabled }),
   upnpStatus: () => invoke<UpnpStatus>('upnp_status'),
   getSecurityLogPath: () => invoke<string>('get_security_log_path'),
+
+  /**
+   * Playback capabilities of THIS build — currently just whether a catalog
+   * track can play without the user attaching an audio file (a streaming
+   * playback path). The `app_capabilities` command exists ONLY on a build that
+   * ships such a path; the plain open-core build lacks it, so we resolve to the
+   * local-first default (`streamingPlayback: false`) and onboarding shows the
+   * "add your own files" flow. A dev override —
+   * `localStorage['beetbot.dev.streamingPlayback']` = `'1'` | `'0'` — wins, so
+   * both wizard variants can be previewed from one build.
+   */
+  appCapabilities: async (): Promise<AppCapabilities> => {
+    try {
+      const dev = localStorage.getItem('beetbot.dev.streamingPlayback');
+      // A build that can stream can also save a local copy, so the dev override
+      // flips both together (matches the full shell, which grants both).
+      if (dev === '1') return { streamingPlayback: true, canDownload: true };
+      if (dev === '0') return { streamingPlayback: false, canDownload: false };
+    } catch {
+      // localStorage may be unavailable; fall through to the real query.
+    }
+    return invoke<AppCapabilities>('app_capabilities').catch(() => ({
+      streamingPlayback: false,
+      canDownload: false,
+    }));
+  },
+
+  // ---- downloads (full build only; gated by `canDownload`) ----------------
+  // The commands live in the private engine, so the open-core build never has
+  // them — every caller is behind a `canDownload` capability check.
+  downloadTrack: (trackId: number) =>
+    invoke<string>('download_track', { trackId, auto: false }),
+  downloadPlaylist: (playlistId: number) =>
+    invoke<PlaylistDownloadSummary>('download_playlist', { playlistId }),
+  /** Record that a profile saved this track (per-profile download ownership). */
+  markDownload: (profileId: number, trackId: number) =>
+    invoke<void>('mark_download', { profileId, trackId }),
+  /** Attribute every downloaded track in a playlist to a profile (Download all). */
+  markPlaylistDownloads: (profileId: number, playlistId: number) =>
+    invoke<void>('mark_playlist_downloads', { profileId, playlistId }),
+  /** Drop a profile's ownership; the shared file is deleted only when no profile
+   *  owns it anymore. */
+  removeDownload: (profileId: number, trackId: number) =>
+    invoke<void>('remove_download', { profileId, trackId }),
+  /** Tracks THIS profile saved to disk (the Downloaded tab, isolated per profile). */
+  listDownloadedSongs: (profileId: number) =>
+    invoke<PlaylistTrack[]>('list_downloaded_songs', { profileId }),
+  /** Reveal a downloaded (or attached) file in Finder / Explorer. */
+  revealInFinder: (path: string) =>
+    invoke<void>('reveal_in_finder', { path }),
+  getAutoDownload: () => invoke<boolean>('get_auto_download'),
+  setAutoDownload: (enabled: boolean) =>
+    invoke<void>('set_auto_download', { enabled }),
 };
+
+/**
+ * What THIS build can do at runtime. Brand-neutral: the open core never
+ * describes *how* a streaming build plays unattached tracks — it only reads
+ * these booleans and adapts the UI.
+ */
+export interface AppCapabilities {
+  /** True when a catalog track can play without a user-attached local file. */
+  streamingPlayback: boolean;
+  /** True when a catalog track can be saved as a permanent local file. Only a
+   *  full build sets this; the OSS build reads false and hides download. */
+  canDownload: boolean;
+}
+
+/** Result of downloading a whole playlist (from the full build's engine). */
+export interface PlaylistDownloadSummary {
+  tracks_processed: number;
+  tracks_downloaded: number;
+  tracks_needs_review: number;
+  tracks_failed: number;
+}
 
 export interface UpnpStatus {
   mapped: boolean;
@@ -368,8 +460,12 @@ export interface NgrokStatus {
   last_error: string | null;
 }
 
-/** Lifecycle of an optional external sharing route. */
-export type ExternalSharingState = 'off' | 'pending' | 'live';
+/**
+ * Lifecycle of an optional external sharing route. `conflict` means the route
+ * is approved here but another device on the same account currently holds the
+ * public address — visitors reach that device's library, not this one.
+ */
+export type ExternalSharingState = 'off' | 'pending' | 'live' | 'conflict';
 
 /**
  * Status of the optional external sharing provider. Every provider-specific
@@ -381,7 +477,7 @@ export interface ExternalSharingStatus {
   state: ExternalSharingState;
   /** The provider's display name, used verbatim in generic copy. */
   providerName: string;
-  /** The public URL once `live`, else null. */
+  /** The public URL once `live` (or contested, when `conflict`), else null. */
   url: string | null;
 }
 

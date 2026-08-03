@@ -28,7 +28,7 @@ export function setApiBase(base: string): void {
 }
 
 /** Prefix a path with the configured base. Returns the input unchanged when no base is set. */
-function apiUrl(path: string): string {
+export function apiUrl(path: string): string {
   return API_BASE ? `${API_BASE}${path}` : path;
 }
 
@@ -57,7 +57,13 @@ export function coverSrc(
  */
 let ACTIVE_PROFILE_ID: number | null = null;
 export function setActiveProfileId(id: number | null | undefined): void {
-  ACTIVE_PROFILE_ID = id ?? null;
+  const next = id ?? null;
+  const changed = next !== ACTIVE_PROFILE_ID;
+  ACTIVE_PROFILE_ID = next;
+  // Pull this profile's shared "recently played playlists" from the hub so the
+  // Library / Home order reflects what was played on the user's other device.
+  // Fire-and-forget; guarded on a real change so re-renders don't spam the hub.
+  if (changed && next != null) void syncRecentlyPlayedPlaylists();
 }
 /** Suffix a localStorage base key with a profile, so per-user UI state (search
  *  recents, recently-played order, offline flags, pinned playlists, the
@@ -80,7 +86,7 @@ export interface PlaylistRow {
   name: string;
   track_count: number;
   cover_url: string | null;
-  source: 'csv' | 'spotify' | 'liked' | 'local' | 'album';
+  source: 'csv' | 'spotify' | 'liked' | 'local' | 'album' | 'soundcloud' | 'apple';
   /**
    * For album imports, the album artist (rendered "Album · Artist"); for
    * upstream playlists, the owner. Optional so older cached responses parse.
@@ -113,8 +119,9 @@ export interface PlaylistDetail {
   /** User-editable blurb (local playlists); null for most. */
   description?: string | null;
   cover_url: string | null;
-  /** Where the playlist came from (local/spotify/liked/album/csv/...). The
-   *  rename UI uses this to warn that a synced playlist's name reverts. */
+  /** Where the playlist came from (local/spotify/liked/album/csv/...). Imported
+   *  playlists carry a synthetic import id, so re-importing the same archive
+   *  updates them in place instead of duplicating. */
   source: string;
   tracks: StreamTrack[];
 }
@@ -170,6 +177,34 @@ export function setSessionExpiredHandler(fn: (() => void) | null): void {
 export function notifyUnauthorized(): void {
   clearStoredToken();
   sessionExpiredHandler?.();
+}
+
+// A background re-mint (see `reissuePhoneSession`) swaps in a fresh token with
+// no user action. The app registers a handler so it can update the token it
+// holds in memory -- otherwise it keeps handing the stale one to every request,
+// each of which then 401s and re-mints again (still correct, just wasteful).
+let sessionRefreshedHandler: ((token: string) => void) | null = null;
+
+export function setSessionRefreshedHandler(
+  fn: ((token: string) => void) | null,
+): void {
+  sessionRefreshedHandler = fn;
+}
+
+// How the host mints a fresh token when the current one is rejected mid-session.
+// The desktop registers this — it issues tokens on demand from /api/session, so
+// a revoked token (e.g. its session pruned as a stale loopback row) can be
+// re-minted silently instead of leaving the app dead until relaunch. The phone
+// leaves it unset: its token comes from pairing, so a 401 falls through to the
+// re-pair path. The reissuer is handed the token that just failed so it can
+// no-op when another in-flight request already re-minted.
+let tokenReissuer: ((failedToken: string) => Promise<string | null>) | null =
+  null;
+
+export function setTokenReissuer(
+  fn: ((failedToken: string) => Promise<string | null>) | null,
+): void {
+  tokenReissuer = fn;
 }
 
 /**
@@ -245,7 +280,10 @@ let liveStreamCapable = ((): boolean => {
   }
 })();
 
-function setLiveStreamCapable(v: boolean): void {
+/** Record whether this build can live-stream (from a session response's
+ *  `live_stream`). Exported for the desktop's own session layer (src/lib/
+ *  session.ts), which mints tokens outside ensureSession/submitPairing. */
+export function setLiveStreamCapable(v: boolean): void {
   liveStreamCapable = v;
   try {
     localStorage.setItem(LIVE_STREAM_KEY, v ? '1' : '0');
@@ -378,6 +416,43 @@ export async function ensureSession(): Promise<string> {
 }
 
 /**
+ * Re-mint a session token after a mid-session 401, for a client whose token is
+ * issued by `/api/session` (the phone / web-player PWA). Mirrors the desktop's
+ * `reissueDesktopSession`: if another in-flight request already re-minted, hand
+ * that back; otherwise fetch a fresh one. Returns null when the server won't
+ * issue a token without pairing (a genuine remote visitor -- the caller then
+ * falls through to the pairing screen) or when offline.
+ *
+ * Why the phone needs a reissuer at all: through a trusted local proxy (a
+ * provider-served phone) the visitor reaches the hub over loopback and is exempt
+ * from pairing, so `/api/session` mints a token WITHOUT a code. But that token
+ * is a loopback session row, which the desktop prunes as stale -- so a proxied
+ * phone's token gets revoked mid-session. Without this, the next request 401'd
+ * straight to the 6-digit pairing screen even though pairing was never required;
+ * with it, the phone silently re-mints and the code never flashes.
+ */
+export async function reissuePhoneSession(
+  failedToken: string,
+): Promise<string | null> {
+  const current = getStoredToken();
+  if (current && current !== failedToken) return current;
+  let res: Response;
+  try {
+    res = await fetch(apiUrl('/api/session'));
+  } catch {
+    return null; // offline -- nothing to re-mint with
+  }
+  // 402/403 (pairing genuinely required) or any error -> fall through to the
+  // caller's re-pair path. Only a real token counts as a silent recovery.
+  if (!res.ok) return null;
+  const body = (await res.json()) as SessionResponse;
+  setStoredToken(body.session_token);
+  setLiveStreamCapable(body.live_stream ?? false);
+  sessionRefreshedHandler?.(body.session_token);
+  return body.session_token;
+}
+
+/**
  * Background prefetch: warm the service-worker API cache for a set of
  * playlists. Used by the Library screen so that any playlist the user
  * can see is also browseable offline (the SW caches each /api/playlists/:id
@@ -403,10 +478,20 @@ export function prefetchPlaylistDetails(
 
 async function jsonGet<T>(path: string, token: string): Promise<T> {
   const sep = path.includes('?') ? '&' : '?';
-  const res = await fetch(apiUrl(`${path}${sep}t=${encodeURIComponent(token)}`));
+  let res = await fetch(apiUrl(`${path}${sep}t=${encodeURIComponent(token)}`));
+  if (res.status === 401 && tokenReissuer) {
+    // The token was revoked out from under us. On the desktop that happens when
+    // its session is pruned as a stale loopback row while it sat idle; it can
+    // mint a new one on demand, so re-mint once and retry before giving up —
+    // silent recovery instead of a dead app until relaunch.
+    const fresh = await tokenReissuer(token).catch(() => null);
+    if (fresh && fresh !== token) {
+      res = await fetch(apiUrl(`${path}${sep}t=${encodeURIComponent(fresh)}`));
+    }
+  }
   if (res.status === 401) {
-    // Token revoked/expired — drop it and re-pair instead of showing a broken
-    // empty screen with a stale "logged in" state.
+    // Still unauthorized (no reissuer, or the retry also failed) — drop the
+    // token and re-pair instead of showing a broken "logged in" empty screen.
     notifyUnauthorized();
     const err = new Error('session expired');
     err.name = 'SessionExpiredError';
@@ -423,6 +508,19 @@ export function listPlaylists(
   const path =
     profileId != null ? `/api/playlists?profile_id=${profileId}` : '/api/playlists';
   return jsonGet<PlaylistRow[]>(path, token);
+}
+
+/** Every track in the profile's library as a flat, title-sorted list — powers
+ *  the phone's Library › Songs tab. Same set the desktop reads over IPC. */
+export function listLibrarySongs(
+  token: string,
+  profileId?: number | null,
+): Promise<StreamTrack[]> {
+  const path =
+    profileId != null
+      ? `/api/library/songs?profile_id=${profileId}`
+      : '/api/library/songs';
+  return jsonGet<StreamTrack[]>(path, token);
 }
 
 /** A Netflix-style user profile. Owns playlists; the music library is shared. */
@@ -445,6 +543,20 @@ export function getProfiles(token: string): Promise<Profile[]> {
 /** URL for a profile's custom photo (only meaningful when avatar_path is set). */
 export function profileAvatarUrl(profileId: number, token: string): string {
   return apiUrl(`/api/profiles/${profileId}/avatar?t=${encodeURIComponent(token)}`);
+}
+
+/** Delete a profile. A paired device may only delete the profile its session
+ *  is bound to (bindSessionProfile); the server refuses to delete the last
+ *  remaining profile. Throws with the server's message on refusal. */
+export async function deleteProfile(profileId: number, token: string): Promise<void> {
+  const res = await fetch(
+    apiUrl(`/api/profiles/${profileId}?t=${encodeURIComponent(token)}`),
+    { method: 'DELETE' },
+  );
+  if (!res.ok) {
+    const msg = await res.text().catch(() => '');
+    throw new Error(msg || `delete profile → ${res.status}`);
+  }
 }
 
 /** Verify a profile's PIN. Returns true for a correct PIN or no PIN set. */
@@ -501,9 +613,9 @@ export function getPlaylist(id: number, token: string): Promise<PlaylistDetail> 
  * preserved (they might be in other playlists; their audio files stay
  * on disk regardless).
  *
- * Caveat the caller should warn the user about: Spotify-mirrored
- * playlists will be re-created on the next sync. Local-only ones
- * (synthetic `local:` ids) stay gone.
+ * Caveat: an imported playlist is keyed by a synthetic import id, so
+ * re-importing the same archive re-creates it. Local-only ones (synthetic
+ * `local:` ids) can't be re-imported and stay gone.
  */
 export async function deletePlaylist(id: number, token: string): Promise<void> {
   const res = await timedFetch(
@@ -519,7 +631,7 @@ export async function deletePlaylist(id: number, token: string): Promise<void> {
 }
 
 /** Rename a playlist (display name only). The host updates the `name` column;
- *  a Spotify-mirrored playlist's name reverts on the next sync. */
+ *  re-importing an imported playlist would restore its original name. */
 export async function renamePlaylist(
   id: number,
   name: string,
@@ -907,11 +1019,6 @@ export type CatalogOpenRequest =
   | { kind: 'artist'; name: string }
   | { kind: 'album'; name: string; artist?: string | null };
 
-export interface AddTrackResult {
-  track_id: number;
-  inserted: boolean;
-}
-
 // --- Phone-direct discovery (hub-independent) -------------------------
 //
 // Catalog reads normally route through the desktop hub (which proxies Deezer
@@ -1139,6 +1246,7 @@ export type SearchTypes =
   | 'track'
   | 'album'
   | 'artist'
+  | 'playlist'
   | 'track,album'
   | 'track,album,artist'
   | 'track,album,artist,playlist';
@@ -1345,10 +1453,31 @@ export function getBrowse(
   return jsonGet<BrowseResults>(path, token);
 }
 
+/** A genre's top artists (Deezer `/genre/{id}/artists`) — genre-accurate and
+ *  already carrying portraits, in ONE call. The onboarding taste grid uses this
+ *  instead of deriving names from the full Browse assembly and re-resolving each
+ *  name to a portrait (which funneled ~100 throttled Deezer calls through one
+ *  gate and made the artist step take 30-45s). */
+export function getGenreArtists(
+  genreId: number,
+  token: string,
+): Promise<SearchArtistResult[]> {
+  return jsonGet<SearchArtistResult[]>(`/api/genres/${genreId}/artists`, token);
+}
+
 /** One Home-feed shelf. `kind` is a render hint (currently only 'track_row'). */
+/** One card in a heterogeneous `mixed_row` shelf (Spotify's "More like {X}"
+ *  blend). Wrapper-tagged by `type` so it maps 1:1 onto the artist / album /
+ *  playlist cards. */
+export type MixedItem =
+  | { type: 'artist'; artist: SearchArtistResult }
+  | { type: 'album'; album: SearchAlbumResult }
+  | { type: 'playlist'; playlist: CatalogPlaylistSummary };
+
 export interface HomeShelf {
   /** "track_row" (catalog tracks) | "album_row" (catalog albums) |
-   *  "stat_row" (local library tracks) | "artist_row" (catalog artists). */
+   *  "stat_row" (local library tracks) | "artist_row" (catalog artists) |
+   *  "playlist_row" (editorial playlists) | "mixed_row" (heterogeneous blend). */
   kind: string;
   title: string;
   eyebrow?: string | null;
@@ -1358,6 +1487,10 @@ export interface HomeShelf {
   artists?: SearchArtistResult[];
   /** "playlist_row" — catalog editorial playlists, tap opens the playlist. */
   playlists?: CatalogPlaylistSummary[];
+  /** "mixed_row" — an ordered blend of artist/album/playlist cards in one row. */
+  items?: MixedItem[];
+  /** Round header thumbnail (the seed artist's photo on a "More like {X}" row). */
+  seed_art?: string;
   /** Server display hint (P1): 'rail' → render as a "Made for you" portrait tile
    *  (the mixes); 'spotlight' → render as the mid-feed full-width band. Absent on
    *  older bundled servers → the client just renders a normal row. */
@@ -1382,6 +1515,16 @@ export interface HomeFeed {
    *  as an honest "Updated …" caption. Absent on older servers → static
    *  fallback. */
   discovery_age_secs?: number;
+  /** False when the profile has no play history yet, so the endless stations
+   *  have nothing to seed from and would build an empty queue. The client hides
+   *  the station tiles. Absent on older servers → treated as ready, which is
+   *  their existing behaviour (check `=== false`, never falsiness). */
+  station_ready?: boolean;
+  /** True only on a `fast` response: the cheap subset of shelves, sent so the
+   *  page can paint while the expensive ones are still resolving. The caller
+   *  shows it at once and APPENDS the full feed's extra shelves when they land.
+   *  Absent on older servers → the feed is complete, which for them it is. */
+  partial?: boolean;
 }
 
 /** Personalized Home shelves (e.g. "More like your favorites") for a profile.
@@ -1394,10 +1537,15 @@ export function getHome(
   token: string,
   profileId?: number | null,
   visit?: string,
+  fast?: boolean,
 ): Promise<HomeFeed> {
   const params = new URLSearchParams();
   if (profileId != null) params.set('profile_id', String(profileId));
   if (visit) params.set('v', visit);
+  // `fast` skips the four shelves that own a cold build's wall clock, so the
+  // page can paint in seconds instead of waiting out the whole thing. Never
+  // cached server-side; always a strict subset of the full feed.
+  if (fast) params.set('fast', '1');
   const qs = params.toString();
   return jsonGet<HomeFeed>(qs ? `/api/home?${qs}` : '/api/home', token);
 }
@@ -1596,6 +1744,10 @@ export interface ArtistBio {
   extract: string;
   title: string;
   url: string;
+  /** Apple-style About facts, best-effort from Wikidata; absent when unknown. */
+  born?: string | null;
+  from?: string | null;
+  genre?: string | null;
 }
 
 /** A short Wikipedia "About" blurb for an artist (free, name-matched,
@@ -1612,6 +1764,25 @@ export async function getArtistBio(
     return (await res.json()) as ArtistBio | null;
   } catch {
     return null;
+  }
+}
+
+/** Albums by OTHER artists that feature this one (Apple Music's "Appears On").
+ *  A server-side search heuristic — best-effort, empty on any failure so the
+ *  caller just hides the rail. */
+export async function getArtistAppearsOn(
+  name: string,
+  token: string,
+): Promise<SearchAlbumResult[]> {
+  try {
+    const params = new URLSearchParams({ name, t: token });
+    const res = await fetch(
+      apiUrl(`/api/artists/appears-on?${params.toString()}`),
+    );
+    if (!res.ok) return [];
+    return (await res.json()) as SearchAlbumResult[];
+  } catch {
+    return [];
   }
 }
 
@@ -1690,12 +1861,11 @@ export interface CreatedPlaylist {
 
 /**
  * Create a new local-only playlist. The host mints a synthetic
- * `local:{uuid}` spotify_id so it survives across Spotify syncs (sync
- * only touches rows whose spotify_id corresponds to a real Spotify
- * playlist).
+ * `local:{uuid}` id (in the legacy-named `spotify_id` column) so it reads as
+ * NOT imported — re-importing an archive never touches or clobbers it.
  *
- * Caller typically follows up with `addTrackToPlaylist(newId, ...)` so
- * the user lands on a populated playlist rather than an empty one.
+ * Caller typically follows up with a track-add so the user lands on a
+ * populated playlist rather than an empty one.
  */
 export async function createPlaylist(
   name: string,
@@ -1848,14 +2018,6 @@ export async function importPlaylist(
   return (await res.json()) as ImportAlbumResult;
 }
 
-/**
- * Append a catalog track to one of the user's playlists. The host
- * upserts the track row (deduped by ISRC if available) and links it with
- * locally_added=1 so future syncs preserve it.
- *
- * Returns immediately. Caller should refetch the playlist to see the
- * new row (it'll appear at the end with status='matching').
- */
 export interface ResolvedTrack {
   track_id: number;
   status: string;
@@ -1959,35 +2121,6 @@ export async function fetchRadioStreamTracks(
     console.warn('[beetbot] radio fetch failed', e);
     return [];
   }
-}
-
-export async function addTrackToPlaylist(
-  playlistId: number,
-  track: SearchTrackResult,
-  token: string,
-): Promise<AddTrackResult> {
-  const res = await timedFetch(
-    apiUrl(`/api/playlists/${playlistId}/tracks?t=${encodeURIComponent(token)}`),
-    {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(track),
-    },
-  );
-  if (!res.ok) {
-    let detail = '';
-    try {
-      const body = (await res.json()) as { message?: string };
-      detail = body.message ?? '';
-    } catch {
-      /* ignore */
-    }
-    throw new Error(
-      `add to playlist failed (${res.status})${detail ? `: ${detail}` : ''}`,
-    );
-  }
-  clearSearchCache();
-  return (await res.json()) as AddTrackResult;
 }
 
 // --- Chromecast (server-side Cast) -------------------------------------
@@ -2142,7 +2275,39 @@ export interface NowPlayingInfo {
   artists: string[];
   album_art_url: string | null;
   is_playing: boolean;
+  /** Playhead and track length, so another device can draw a live progress
+   *  bar for this one. Optional — a device on an older build reports neither,
+   *  and readers just render no progress line. */
+  position_ms?: number | null;
+  duration_ms?: number | null;
+  /** Library track id. `album_art_url` is null for most library tracks — the
+   *  cover lives behind `/api/tracks/{id}/art`, which needs a token — so the
+   *  id is what actually lets the READING device show artwork, signed with
+   *  its own token (ours would be useless to it). */
+  track_id?: number | null;
+  /** The album the current track belongs to. Carried so a reader can offer
+   *  "Go to album" for what another device is playing — without it that menu
+   *  item has nothing to navigate to. */
+  album?: string | null;
+  /** What this device plays next — shuffle-aware, so it's the order the device
+   *  will really use rather than the raw array. Capped at HEARTBEAT_QUEUE_MAX
+   *  because this rides a 2-second heartbeat and nobody reads past the first
+   *  screenful; `queue_len` carries the true remaining count so a reader can
+   *  still say "and 40 more". Optional — a device on an older build reports
+   *  neither, and readers show no queue rather than an empty one. */
+  queue?: NowPlayingQueueItem[] | null;
+  queue_len?: number | null;
 }
+
+/** One upcoming row, trimmed to what a remote list actually draws. */
+export interface NowPlayingQueueItem {
+  id: number;
+  title: string;
+  artists: string[];
+}
+
+/** How many upcoming tracks a device publishes on its heartbeat. */
+export const HEARTBEAT_QUEUE_MAX = 20;
 
 export interface RemoteDevice {
   device_id: string;
@@ -2192,7 +2357,10 @@ const HEARTBEAT_TIMEOUT_MS = 4000;
  *  connection banner with no extra traffic. */
 export async function sendHeartbeat(
   token: string,
-  label: string,
+  /** Pass null to let the hub name this device — it knows the machine's
+   *  hostname and the session's User-Agent, so it names devices better (and
+   *  distinguishably) than a client constant ever could. */
+  label: string | null,
   kind: string,
   nowPlaying?: NowPlayingInfo | null,
   profileId?: number | null,
@@ -2255,7 +2423,13 @@ export async function pingHub(token: string): Promise<boolean> {
   }
 }
 
-/** Queue a transport action for another device (its banner buttons). */
+/** Queue a transport action for another device (its banner buttons).
+ *
+ *  Carries the active profile like [`listDevices`] does: remote control and
+ *  handoff are scoped to one account, so the server files these per profile and
+ *  a device only ever drains its own. (A paired phone's claim is ignored in
+ *  favour of its session; this is what tells the DESKTOP, which has no
+ *  session-bound profile, which of its profiles is acting.) */
 export async function postRemoteCommand(
   token: string,
   targetDeviceId: string,
@@ -2263,7 +2437,7 @@ export async function postRemoteCommand(
 ): Promise<void> {
   try {
     await fetch(
-      apiUrl(`/api/remote-command?t=${encodeURIComponent(token)}`),
+      apiUrl(`/api/remote-command?t=${encodeURIComponent(token)}${profileParam()}`),
       {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -2280,6 +2454,7 @@ export async function postRemoteCommand(
 export async function pollRemoteCommands(token: string): Promise<string[]> {
   try {
     const params = new URLSearchParams({ device_id: getDeviceId(), t: token });
+    if (ACTIVE_PROFILE_ID != null) params.set('profile_id', String(ACTIVE_PROFILE_ID));
     const res = await fetch(apiUrl(`/api/remote-command?${params.toString()}`));
     if (!res.ok) return [];
     return (await res.json()) as string[];
@@ -2296,14 +2471,17 @@ export async function requestHandoff(
   targetDeviceId: string,
 ): Promise<void> {
   try {
-    await fetch(apiUrl(`/api/remote-command?t=${encodeURIComponent(token)}`), {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        target_device_id: targetDeviceId,
-        action: `handoff:${getDeviceId()}`,
-      }),
-    });
+    await fetch(
+      apiUrl(`/api/remote-command?t=${encodeURIComponent(token)}${profileParam()}`),
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          target_device_id: targetDeviceId,
+          action: `handoff:${getDeviceId()}`,
+        }),
+      },
+    );
   } catch {
     /* best-effort */
   }
@@ -2322,14 +2500,16 @@ export async function listDevices(
   return (await res.json()) as RemoteDevice[];
 }
 
-/** Hand the current snapshot to `targetDeviceId`. */
+/** Hand the current snapshot to `targetDeviceId`. Profile-scoped: a handoff
+ *  carries your queue and now-playing, so it's filed per account and only a
+ *  device on that account can claim it. */
 export async function postHandoff(
   token: string,
   targetDeviceId: string,
   payload: HandoffPayload,
 ): Promise<void> {
   const res = await fetch(
-    apiUrl(`/api/handoff?t=${encodeURIComponent(token)}`),
+    apiUrl(`/api/handoff?t=${encodeURIComponent(token)}${profileParam()}`),
     {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -2349,6 +2529,7 @@ export async function pollHandoff(
 ): Promise<HandoffPayload | null> {
   try {
     const params = new URLSearchParams({ device_id: getDeviceId(), t: token });
+    if (ACTIVE_PROFILE_ID != null) params.set('profile_id', String(ACTIVE_PROFILE_ID));
     const res = await fetch(apiUrl(`/api/handoff?${params.toString()}`));
     if (!res.ok) return null;
     return (await res.json()) as HandoffPayload | null;
@@ -2368,7 +2549,7 @@ export async function pollHandoff(
 // The version was bumped to v2 to evict pre-embedded-art m4a files so
 // AirPlay receivers can pick up the freshly-embedded `covr` atom.
 
-const AUDIO_CACHE_NAME = 'beetbot-audio-v2';
+export const AUDIO_CACHE_NAME = 'beetbot-audio-v2';
 const OFFLINE_PLAYLISTS_KEY = 'beetbot.offline_playlists';
 
 /**
@@ -2397,14 +2578,6 @@ export function cacheKeyFor(trackId: number): string {
   return `${location.origin}/stream/${trackId}`;
 }
 
-/** True iff the audio cache currently holds a response for this track. */
-export async function isTrackCached(trackId: number): Promise<boolean> {
-  if (!offlineCacheAvailable()) return false;
-  const cache = await caches.open(AUDIO_CACHE_NAME);
-  const hit = await cache.match(cacheKeyFor(trackId));
-  return Boolean(hit);
-}
-
 /** Set of track ids currently in the offline cache. */
 export async function getCachedTrackIds(): Promise<Set<number>> {
   if (!offlineCacheAvailable()) return new Set();
@@ -2416,6 +2589,33 @@ export async function getCachedTrackIds(): Promise<Set<number>> {
     if (m) ids.add(Number(m[1]));
   }
   return ids;
+}
+
+/**
+ * Ask the browser to keep our offline audio around. By default the Cache API
+ * lives in "best-effort" storage that the OS — iOS especially — silently evicts
+ * under space pressure, so a user's saved songs can vanish with no warning.
+ * `navigator.storage.persist()` promotes the whole origin to "persistent"
+ * storage, which browsers won't auto-evict; on an installed (home-screen) PWA
+ * it's typically granted without a prompt. Idempotent and cheap: it no-ops once
+ * already persisted, and fires the actual request at most once per session so a
+ * batch download doesn't spam it. Best-effort — a denial just leaves us on the
+ * old evictable footing, so callers fire-and-forget.
+ */
+let persistentStorageRequested = false;
+export async function ensurePersistentStorage(): Promise<boolean> {
+  if (typeof navigator === 'undefined' || !navigator.storage) return false;
+  try {
+    if (navigator.storage.persisted && (await navigator.storage.persisted())) {
+      return true;
+    }
+    if (persistentStorageRequested) return false;
+    persistentStorageRequested = true;
+    if (navigator.storage.persist) return await navigator.storage.persist();
+  } catch {
+    /* persistence is a nice-to-have; a failure just keeps the old behaviour */
+  }
+  return false;
 }
 
 /**
@@ -2442,6 +2642,10 @@ export async function cacheTrack(
       'Offline caching needs a secure context (HTTPS). Browsers block the Cache API on plain http:// LAN addresses.',
     );
   }
+  // Promote to eviction-resistant storage before the first track lands, so a
+  // user's saved songs aren't silently reclaimed by the OS. Fire-and-forget:
+  // it's idempotent and a denial just leaves the cache on best-effort footing.
+  void ensurePersistentStorage();
   const res = await fetch(streamUrl(trackId, token), { cache: 'no-store' });
   if (!res.ok) {
     // Shaped so friendlyError() classifies it as a host-error (not raw text).
@@ -2520,7 +2724,8 @@ export type RecentItem =
   | { kind: 'query'; text: string }
   | { kind: 'track'; track: SearchTrackResult }
   | { kind: 'artist'; artist: SearchArtistResult }
-  | { kind: 'album'; album: SearchAlbumResult };
+  | { kind: 'album'; album: SearchAlbumResult }
+  | { kind: 'playlist'; playlist: CatalogPlaylistSummary };
 
 const RECENT_ITEMS_KEY = 'beetbot.recent_items';
 const LEGACY_RECENT_KEY = 'beetbot.recent_searches';
@@ -2537,6 +2742,8 @@ function recentKey(it: RecentItem): string {
       return `a:${it.artist.source_id}`;
     case 'album':
       return `al:${it.album.source_id}`;
+    case 'playlist':
+      return `pl:${it.playlist.source_id}`;
   }
 }
 
@@ -2556,6 +2763,8 @@ function isValidRecentItem(it: unknown): it is RecentItem {
       const a = r.album as { source_id?: unknown; artists?: unknown } | undefined;
       return !!a?.source_id && Array.isArray(a.artists);
     }
+    case 'playlist':
+      return !!(r.playlist as { source_id?: unknown } | undefined)?.source_id;
     default:
       return false;
   }
@@ -2627,6 +2836,23 @@ export function addRecentAlbum(album: SearchAlbumResult): RecentItem[] {
   return pushRecentItem({ kind: 'album', album });
 }
 
+export function addRecentPlaylist(playlist: CatalogPlaylistSummary): RecentItem[] {
+  return pushRecentItem({ kind: 'playlist', playlist });
+}
+
+/** Drop a single recent entry (its ✕ button), leaving the rest. Returns the
+ *  remaining list so the caller can update state without a re-read. */
+export function removeRecentItem(it: RecentItem): RecentItem[] {
+  const key = recentKey(it);
+  const next = getRecentItems().filter((x) => recentKey(x) !== key);
+  try {
+    localStorage.setItem(profileScopedKey(RECENT_ITEMS_KEY), JSON.stringify(next));
+  } catch {
+    /* localStorage may be blocked (private mode); ignore */
+  }
+  return next;
+}
+
 export function clearRecentSearches(): void {
   try {
     localStorage.removeItem(profileScopedKey(RECENT_ITEMS_KEY));
@@ -2638,14 +2864,45 @@ export function clearRecentSearches(): void {
 
 // --- Recently played playlists ---------------------------------------
 //
-// Per-device "last opened at" timestamp per playlist, used to order the
-// Library grid Spotify-style (most recently visited first). Stored in
-// localStorage so it survives PWA reloads, and tracked per device
-// (phone vs desktop) since "recently played" is inherently a
-// per-listener concept. Opening a playlist counts as a play — same
-// heuristic Spotify uses; it's what users intuitively expect.
+// "Last opened at" timestamp per playlist, used to order the Library grid and
+// Home's quick-access tiles Spotify-style (most recently visited first).
+// Opening a playlist counts as a play — the same heuristic Spotify uses.
+//
+// This follows the PROFILE, not the device: the profile already is the
+// "listener", so splitting a single listener's history between their phone and
+// their desktop just fragmented it (you'd play something on the phone and the
+// Mac's order wouldn't budge). localStorage is the fast local cache — it keeps
+// the read synchronous and works offline — while the hub's per-profile KV is
+// the shared source of truth, exactly like `pins.ts` / `saved.ts`.
+//
+// Reads seed from the cache and hydrate from the hub; writes are write-through
+// (local first, then a best-effort PUT). Pull and push both MERGE by keeping
+// the newest timestamp per playlist, so a play on one device can never erase a
+// play on the other — important when a device was offline for a while.
 
 const RECENT_PLAYLISTS_KEY = 'beetbot.recently_played_playlists';
+/** Per-profile KV key on the hub holding the shared id → timestamp map. */
+const RECENT_PLAYLISTS_KV_KEY = 'recent_playlists';
+
+// Bumped whenever the local cache changes (a play, or a merge from the hub), so
+// components sorting by recency can re-render — localStorage isn't reactive.
+let recentPlaylistsVersion = 0;
+const recentPlaylistsListeners = new Set<() => void>();
+/** Subscribe to recency changes (useSyncExternalStore-shaped). */
+export function subscribeRecentlyPlayedPlaylists(fn: () => void): () => void {
+  recentPlaylistsListeners.add(fn);
+  return () => {
+    recentPlaylistsListeners.delete(fn);
+  };
+}
+/** Snapshot for useSyncExternalStore — changes identity when recency changes. */
+export function getRecentlyPlayedPlaylistsVersion(): number {
+  return recentPlaylistsVersion;
+}
+function bumpRecentPlaylists(): void {
+  recentPlaylistsVersion += 1;
+  for (const fn of recentPlaylistsListeners) fn();
+}
 // Cap the persisted map so a power user with hundreds of playlists
 // doesn't bloat localStorage. Everything past this many entries gets
 // dropped on the next write — those playlists fall to the "never
@@ -2672,35 +2929,113 @@ export function getRecentlyPlayedPlaylists(): Map<number, number> {
   }
 }
 
-/** Mark `playlistId` as played-just-now. */
-export function markPlaylistPlayed(playlistId: number): void {
-  if (!Number.isFinite(playlistId)) return;
-  const existing = getRecentlyPlayedPlaylists();
-  existing.set(playlistId, Date.now());
-  // If we're past the cap, drop the oldest entries.
-  if (existing.size > RECENT_PLAYLISTS_LIMIT) {
-    const sorted = [...existing.entries()].sort((a, b) => b[1] - a[1]);
-    existing.clear();
-    for (const [id, ts] of sorted.slice(0, RECENT_PLAYLISTS_LIMIT)) {
-      existing.set(id, ts);
-    }
+/** Newest-wins union of two id → timestamp maps. Merging (rather than letting
+ *  either side overwrite) is what makes two devices converge: whichever played
+ *  a playlist more recently supplies its timestamp, and neither can drop the
+ *  other's plays made while it was offline. */
+function mergeRecentPlaylists(
+  a: Map<number, number>,
+  b: Map<number, number>,
+): Map<number, number> {
+  const out = new Map(a);
+  for (const [id, ts] of b) {
+    const cur = out.get(id);
+    if (cur == null || ts > cur) out.set(id, ts);
   }
+  return out;
+}
+
+/** Keep only the newest RECENT_PLAYLISTS_LIMIT entries. */
+function capRecentPlaylists(m: Map<number, number>): Map<number, number> {
+  if (m.size <= RECENT_PLAYLISTS_LIMIT) return m;
+  return new Map(
+    [...m.entries()]
+      .sort((x, y) => y[1] - x[1])
+      .slice(0, RECENT_PLAYLISTS_LIMIT),
+  );
+}
+
+function writeRecentPlaylists(m: Map<number, number>, profileId: number | null): void {
   try {
     localStorage.setItem(
-      profileScopedKey(RECENT_PLAYLISTS_KEY),
-      JSON.stringify(Object.fromEntries(existing)),
+      profileScopedKey(RECENT_PLAYLISTS_KEY, profileId),
+      JSON.stringify(Object.fromEntries(m)),
     );
   } catch {
     /* private-mode / quota — ignore, sort just falls back to default order */
   }
 }
 
+/** Best-effort push of the merged map to the hub. Silent on failure — the local
+ *  cache stands and the next successful sync reconciles. */
+function pushRecentPlaylists(m: Map<number, number>, profileId: number | null): void {
+  void ensureSession()
+    .then((token) =>
+      putProfileKv(RECENT_PLAYLISTS_KV_KEY, Object.fromEntries(m), token, profileId),
+    )
+    .catch(() => {});
+}
+
+/**
+ * Pull the hub's copy for the active profile and merge it into the local cache.
+ * Fire-and-forget: called on every profile switch (see `setActiveProfileId`), so
+ * the order a device shows reflects what you played on the other one.
+ */
+export async function syncRecentlyPlayedPlaylists(): Promise<void> {
+  const profileId = ACTIVE_PROFILE_ID;
+  try {
+    const token = await ensureSession();
+    const server = await getProfileKv<Record<string, number>>(
+      RECENT_PLAYLISTS_KV_KEY,
+      token,
+      profileId,
+    );
+    // The profile may have changed while the fetch was in flight — don't write
+    // one profile's history into another's cache.
+    if (ACTIVE_PROFILE_ID !== profileId) return;
+    if (!server || typeof server !== 'object') return;
+    const remote = new Map<number, number>();
+    for (const [k, v] of Object.entries(server)) {
+      const id = Number(k);
+      if (Number.isFinite(id) && typeof v === 'number' && Number.isFinite(v)) {
+        remote.set(id, v);
+      }
+    }
+    const local = getRecentlyPlayedPlaylists();
+    const merged = capRecentPlaylists(mergeRecentPlaylists(local, remote));
+    writeRecentPlaylists(merged, profileId);
+    bumpRecentPlaylists();
+    // If we knew plays the hub didn't (offline on this device), hand them back.
+    for (const [id, ts] of local) {
+      if ((remote.get(id) ?? -1) < ts) {
+        pushRecentPlaylists(merged, profileId);
+        break;
+      }
+    }
+  } catch {
+    /* offline / older server / unpaired — local cache stands */
+  }
+}
+
+/** Mark `playlistId` as played-just-now: local cache first (instant + offline
+ *  safe), then a best-effort push so the other device picks it up. */
+export function markPlaylistPlayed(playlistId: number): void {
+  if (!Number.isFinite(playlistId)) return;
+  const profileId = ACTIVE_PROFILE_ID;
+  const next = capRecentPlaylists(
+    getRecentlyPlayedPlaylists().set(playlistId, Date.now()),
+  );
+  writeRecentPlaylists(next, profileId);
+  bumpRecentPlaylists();
+  pushRecentPlaylists(next, profileId);
+}
+
 /**
  * Re-order `playlists` so the most recently opened ones come first.
- * Playlists never opened on this device keep their relative order at
- * the bottom of the list — that's important so a brand-new install
- * still shows the user's library in a sensible order before they've
- * tapped anything.
+ * Playlists this profile has never opened (on any device) keep their
+ * relative order at the bottom of the list — that's important so a
+ * brand-new install still shows the user's library in a sensible order
+ * before they've tapped anything.
  */
 export function sortPlaylistsByRecent<T extends { id: number }>(
   playlists: T[],

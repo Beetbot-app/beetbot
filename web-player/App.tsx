@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
   bindSessionProfile,
@@ -7,24 +7,35 @@ import {
   getProfiles,
   notifyUnauthorized,
   profileAvatarUrl,
+  reissuePhoneSession,
   resolveCatalogTrack,
   resolveCatalogTracks,
   setActiveProfileId,
   setSessionExpiredHandler,
+  setSessionRefreshedHandler,
+  setTokenReissuer,
   setTrackLiked,
   submitPairing,
+  type Genre,
   type ResolvedTrack,
   type SearchTrackResult,
   type StreamTrack,
 } from '@shared/api';
-import { SearchScreen, AddToPlaylistModal } from '@shared/components/SearchScreen';
+import {
+  SearchScreen,
+  type SavedArtistController,
+} from '@shared/components/SearchScreen';
+import { AddToPlaylistModal } from '@shared/components/modals/AddToPlaylistModal';
+import { isArtistSaved, useSavedStore } from '@/lib/saved';
 import { TrackActionSheet } from './components/TrackActionSheet';
 import { BrowseScreen } from '@shared/components/BrowseScreen';
 import { LibraryScreen } from './components/LibraryScreen';
+import { FastScroller } from './components/FastScroller';
 import { PlaylistScreen } from './components/PlaylistScreen';
 import { ProfileGate } from './components/ProfileGate';
 import { Player } from './components/Player';
 import { ConnectionBanner } from './components/ConnectionBanner';
+import { InstallSheet } from './components/InstallSheet';
 import { useConnectivity } from './lib/useConnectivity';
 import { StatsScreen } from '@shared/components/StatsScreen';
 import { HomeScreen } from '@shared/components/HomeScreen';
@@ -122,9 +133,13 @@ type View =
   | { name: 'home' }
   | { name: 'library' }
   | { name: 'search' }
-  | { name: 'browse' }
-  | { name: 'stats' }
-  | { name: 'settings' }
+  // `from` = the view to return to on Back (there's no history stack), so
+  // Settings/Stats go back to wherever they were opened from (Home vs Library).
+  | { name: 'stats'; from: View }
+  | { name: 'settings'; from: View }
+  // A single genre feed opened from the Search "Browse all" grid — its own page
+  // (no search bar on top); Back returns to Search.
+  | { name: 'browse'; genre: Genre }
   | { name: 'playlist'; id: number };
 
 type SessionState =
@@ -272,6 +287,20 @@ export default function App() {
   // Set during render so it's current before any screen's fetch effect runs.
   setActiveProfileId(profileId);
 
+  // Saved artists (Library › Artists) — KV-backed, syncs with the desktop.
+  useEffect(() => {
+    useSavedStore.getState().setProfile(profileId);
+  }, [profileId]);
+  const savedArtists = useSavedStore((s) => s.artists);
+  const toggleSavedArtist = useSavedStore((s) => s.toggleArtist);
+  const saveController = useMemo<SavedArtistController>(
+    () => ({
+      isSaved: (name) => isArtistSaved(savedArtists, name),
+      toggle: (a) => toggleSavedArtist(a),
+    }),
+    [savedArtists, toggleSavedArtist],
+  );
+
   // The bottom nav is PERSISTENT on every screen (iOS tab-bar convention:
   // Spotify/Apple keep it on playlist/album/artist detail and pushed pages;
   // only the full-screen Now Playing covers it). It's the bottom-most element,
@@ -286,6 +315,25 @@ export default function App() {
   const homeIsPlaying = usePlayerStore((s) => s.isPlaying);
   const homeNowPlayingKey = usePlayerStore((s) => s.nowPlayingKey);
   const homeNowPlayingTrackId = usePlayerStore(currentTrack)?.id ?? null;
+  // Now-playing awareness for the genre page: a catalog row carries no library
+  // id until it's played, so match by id, then title+artist (the phone track
+  // has no ISRC). Lets the genre "Top songs" rows show the equalizer marker on
+  // the current track's cover, matching the playlist.
+  const nowPlayingTrack = usePlayerStore(currentTrack);
+  const isBrowseTrackCurrent = useCallback(
+    (t: SearchTrackResult) => {
+      const np = nowPlayingTrack;
+      if (!np) return false;
+      if (t.local_track_id != null && t.local_track_id === np.id) return true;
+      const norm = (s?: string | null) => (s ?? '').trim().toLowerCase();
+      return (
+        !!np.title &&
+        norm(t.title) === norm(np.title) &&
+        norm(t.artists?.[0]) === norm(np.artists?.[0])
+      );
+    },
+    [nowPlayingTrack],
+  );
   // Minimal shape for the live "Recently played" prepend. Sourced from the LAST
   // LOGGED play (crossed the ~20s "counts as a play" threshold), NOT the
   // currently-playing track — so the optimistic shelf only shows songs the
@@ -401,15 +449,35 @@ export default function App() {
     }
   }, [session, profileId]);
 
-  // If any authenticated request 401s (token revoked/expired server-side),
-  // drop back to the pairing screen instead of sitting in a broken state.
+  // If an authenticated request 401s AFTER we were established (token
+  // revoked/expired server-side), drop back to the pairing screen. Only when
+  // already `ready`, though: during the initial load a STALE stored token (e.g.
+  // from a prior pairing on this device) makes a concurrent call 401 before
+  // ensureSession() swaps in a fresh one — that transient 401 must NOT flash the
+  // pairing screen (it self-heals to `ready`, which is why a refresh "fixed" it).
+  // ensureSession() owns the first-load decision; a genuine remote pairing
+  // requirement still surfaces via its PairingRequiredError.
   useEffect(() => {
-    setSessionExpiredHandler(() => {
-      setSession((s) =>
-        s.kind === 'pairing-required' ? s : { kind: 'pairing-required' },
-      );
+    // Silent recovery for a provider-proxied phone: a mid-session 401 re-mints
+    // a token from /api/session instead of flashing the pairing code. The code
+    // only appears if the server GENUINELY requires pairing (a real remote
+    // visitor makes /api/session refuse) -- see reissuePhoneSession.
+    setTokenReissuer(reissuePhoneSession);
+    // When a re-mint swaps the token in, adopt it so children stop handing the
+    // stale one to every request.
+    setSessionRefreshedHandler((token) => {
+      setSession((s) => (s.kind === 'ready' ? { kind: 'ready', token } : s));
     });
-    return () => setSessionExpiredHandler(null);
+    // A 401 that could NOT be re-minted (pairing genuinely required, or offline)
+    // drops an established session back to the pairing screen.
+    setSessionExpiredHandler(() => {
+      setSession((s) => (s.kind === 'ready' ? { kind: 'pairing-required' } : s));
+    });
+    return () => {
+      setTokenReissuer(null);
+      setSessionRefreshedHandler(null);
+      setSessionExpiredHandler(null);
+    };
   }, []);
 
   useEffect(() => {
@@ -497,6 +565,9 @@ export default function App() {
       className="h-full flex flex-col relative"
       style={{ ['--overlay-bottom' as string]: overlayBottom }}
     >
+      {/* First visit on a phone: how to keep this on the home screen. Shown once,
+          and never when it is already installed — see InstallSheet. */}
+      <InstallSheet />
       {/* B6: pull-to-refresh spinner — rides down with the pull, then spins
           while refreshing. Only shown on Home. */}
       {view.name === 'home' && (pullDist > 0 || refreshing) && (
@@ -566,6 +637,7 @@ export default function App() {
           <HomeScreen
             token={session.token}
             activeProfileId={profileId}
+            save={saveController}
             refreshKey={homeRefreshKey}
             resetSignal={resetNonce}
             onPlayTrack={playSearchResultPhone}
@@ -573,11 +645,12 @@ export default function App() {
             nowPlayingTrackId={homeNowPlayingTrackId}
             nowPlayingTrack={homeNowPlayingTrack}
             isPlaying={homeIsPlaying}
+            isTrackCurrent={isBrowseTrackCurrent}
             onTogglePlay={homeTogglePlay}
             onPlayedFrom={homeSetNowPlayingKey}
             onOpenPlaylist={(id) => setView({ name: 'playlist', id })}
-            onOpenBrowse={() => setView({ name: 'browse' })}
-            onOpenSettings={() => setView({ name: 'settings' })}
+            onOpenSearch={() => setView({ name: 'search' })}
+            onOpenSettings={() => setView({ name: 'settings', from: { name: 'home' } })}
             onWinBack={setWinBack}
             onShowTrackSheet={setAlbumSheetTrack}
             onAlbumAddToQueue={queueCatalogTrack}
@@ -588,7 +661,8 @@ export default function App() {
           <SettingsScreen
             token={session.token}
             profileId={profileId}
-            onBack={() => setView({ name: 'home' })}
+            onBack={() => setView(view.from)}
+            onOpenStats={() => setView({ name: 'stats', from: view })}
             onSwitchProfile={() => {
               // Back to the "Who's listening?" gate; land on Home after picking.
               setView({ name: 'home' });
@@ -607,16 +681,15 @@ export default function App() {
           <LibraryScreen
             token={session.token}
             profileId={profileId}
-            onSwitchProfile={() => selectProfile(null)}
             onOpen={(id) => setView({ name: 'playlist', id })}
-            onOpenStats={() => setView({ name: 'stats' })}
+            onOpenSettings={() => setView({ name: 'settings', from: { name: 'library' } })}
           />
         )}
         {view.name === 'stats' && (
           <StatsScreen
             token={session.token}
             profileId={profileId}
-            onBack={() => setView({ name: 'library' })}
+            onBack={() => setView(view.from)}
           />
         )}
         {view.name === 'search' && (
@@ -624,12 +697,35 @@ export default function App() {
             token={session.token}
             onPlayTrack={playSearchResultPhone}
             activeProfileId={profileId}
+            onOpenSettings={() => setView({ name: 'settings', from: { name: 'search' } })}
+            onOpenLibraryPlaylist={(id) => setView({ name: 'playlist', id })}
+            onPlayLibrarySong={(t) => usePlayerStore.getState().setQueue([t], 0)}
+            save={saveController}
             openRequest={catalogRequest}
             onRequestHandled={clearCatalogNav}
             resetSignal={resetNonce}
             onShowTrackSheet={setAlbumSheetTrack}
             onAlbumAddToQueue={queueCatalogTrack}
             onAlbumSaveToLiked={favoriteCatalogTrack}
+            isTrackCurrent={isBrowseTrackCurrent}
+            isNowPlaying={homeIsPlaying}
+            onTogglePlay={homeTogglePlay}
+            browseSlot={
+              <BrowseScreen
+                token={session.token}
+                onPlayTrack={playSearchResultPhone}
+                activeProfileId={profileId}
+                save={saveController}
+                onShowTrackSheet={setAlbumSheetTrack}
+                onAlbumAddToQueue={queueCatalogTrack}
+                onAlbumSaveToLiked={favoriteCatalogTrack}
+                titleVariant="eyebrow"
+                onOpenGenre={(genre) => setView({ name: 'browse', genre })}
+                isTrackCurrent={isBrowseTrackCurrent}
+                isNowPlaying={homeIsPlaying}
+                onTogglePlay={homeTogglePlay}
+              />
+            }
           />
         )}
         {view.name === 'browse' && (
@@ -637,9 +733,15 @@ export default function App() {
             token={session.token}
             onPlayTrack={playSearchResultPhone}
             activeProfileId={profileId}
+            save={saveController}
             onShowTrackSheet={setAlbumSheetTrack}
             onAlbumAddToQueue={queueCatalogTrack}
             onAlbumSaveToLiked={favoriteCatalogTrack}
+            initialGenre={view.genre}
+            onExitGenre={() => setView({ name: 'search' })}
+            isTrackCurrent={isBrowseTrackCurrent}
+            isNowPlaying={homeIsPlaying}
+            onTogglePlay={homeTogglePlay}
           />
         )}
         {view.name === 'playlist' && (
@@ -651,6 +753,10 @@ export default function App() {
           />
         )}
       </main>
+      {/* Fast-scroll thumb for long lists — drag the right-edge grip to scrub.
+          Library-only for now (that's where lists run long); reads/drives the
+          shared <main> scroll container. */}
+      <FastScroller scrollRef={mainRef} active={view.name === 'library'} />
       {/* Floating bar + nav: lifted out of the flex flow and pinned over the
           scroll area, so content shows THROUGH the transparent gaps around them
           (Spotify-style). `main` reserves matching bottom padding so its last
@@ -677,6 +783,7 @@ export default function App() {
             profileId={profileId}
             bottomInset={false}
             flushTop={bannerPresent && hasTrack}
+            connBannerShown={bannerShown}
           />
           {/* Persistent bottom nav — on every screen, iOS-style. */}
           {showBottomNav && (
@@ -811,9 +918,9 @@ function BottomNav({
       >
       <div className="flex">
         <NavBtn
-          active={current === 'home' || current === 'browse' || current === 'settings'}
+          active={current === 'home' || current === 'settings'}
           compact={compact}
-          badge={winBack && current !== 'home' && current !== 'browse'}
+          badge={winBack && current !== 'home'}
           label="Home"
           icon={
             <svg
@@ -834,7 +941,7 @@ function BottomNav({
           onClick={() => onChange('home')}
         />
         <NavBtn
-          active={current === 'search'}
+          active={current === 'search' || current === 'browse'}
           compact={compact}
           label="Search"
           icon={

@@ -198,7 +198,7 @@ pub async fn run_audio_enrich(db: Arc<Mutex<Connection>>) {
             }
         };
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut unreported = 0usize;
+        let unreported: usize;
         {
             let conn = db.lock().expect("db mutex poisoned");
             let mut handled: std::collections::HashSet<i64> = std::collections::HashSet::new();
@@ -363,16 +363,6 @@ pub fn audio_similar_ids(conn: &Connection, seed: i64, limit: usize) -> Vec<i64>
     }
     scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     scored.into_iter().take(limit).map(|(id, _)| id).collect()
-}
-
-/// Number of tracks with current-version audio features — gates the home shelf.
-pub fn features_count(conn: &Connection) -> i64 {
-    conn.query_row(
-        "SELECT COUNT(*) FROM track_features WHERE version = ?1",
-        params![FEATURES_VERSION],
-        |r| r.get(0),
-    )
-    .unwrap_or(0)
 }
 
 #[cfg(test)]

@@ -23,7 +23,7 @@
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const API_BASE: &str = "https://api.deezer.com";
 
@@ -127,7 +127,7 @@ pub struct PlaylistTracksInner {
 /// tracks, but it can be absent on some; `/track/{id}` and `/track/isrc:{isrc}`
 /// always carry it. `#[serde(default)]` lets either shape deserialize, and
 /// callers fall back to `get_track` when a search hit's ISRC is missing.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackHit {
     pub id: u64,
     pub title: String,
@@ -158,12 +158,12 @@ pub struct TrackHit {
     pub rank: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtistRef {
     pub name: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlbumRef {
     pub id: u64,
     pub title: String,
@@ -172,12 +172,41 @@ pub struct AlbumRef {
     pub cover_medium: Option<String>,
 }
 
+/// MD5 of the empty string — the hash Deezer serves as its "no artwork" cover.
+/// When an album has no art, Deezer doesn't omit the field or 404: it hands back
+/// a perfectly well-formed cover URL built on this hash (and 302s real-but-
+/// artless hashes to it). Storing one paints a grey placeholder disc on every
+/// tile that album backs, which reads as "our art is broken" rather than
+/// "this album has no cover".
+pub const NO_COVER_MD5: &str = "d41d8cd98f00b204e9800998ecf8427e";
+
+/// True for Deezer's blank/placeholder images. Deezer signals "no art" two ways:
+/// a well-formed URL built on `NO_COVER_MD5`, OR one with an EMPTY hash segment —
+/// e.g. `.../images/artist//1000x1000-...` (note the `//`). Real images always
+/// carry a 32-char hash, so a `//` anywhere in the PATH (past the scheme's own
+/// `://`) means the hash is empty and the image is a placeholder.
+fn is_blank_image(u: &str) -> bool {
+    u.contains(NO_COVER_MD5)
+        || u.split_once("://")
+            .map_or(false, |(_, rest)| rest.contains("//"))
+}
+
+/// Drop a cover/picture URL that is Deezer's known placeholder, so callers fall
+/// through to the next size / source / track instead of persisting a dud.
+///
+/// NOTE: this only catches art Deezer *tells* us is missing. An album whose art
+/// is pulled later keeps a real-looking hash and only reveals itself as a
+/// placeholder by redirecting to a blank at fetch time — that class needs a
+/// network probe, so it can't be caught here.
+fn real_cover(url: Option<String>) -> Option<String> {
+    url.filter(|u| !is_blank_image(u))
+}
+
 impl AlbumRef {
     pub fn best_cover(&self) -> Option<String> {
-        self.cover_xl
-            .clone()
-            .or_else(|| self.cover_big.clone())
-            .or_else(|| self.cover_medium.clone())
+        real_cover(self.cover_xl.clone())
+            .or_else(|| real_cover(self.cover_big.clone()))
+            .or_else(|| real_cover(self.cover_medium.clone()))
     }
 }
 
@@ -207,10 +236,9 @@ pub struct AlbumHit {
 
 impl AlbumHit {
     pub fn best_cover(&self) -> Option<String> {
-        self.cover_xl
-            .clone()
-            .or_else(|| self.cover_big.clone())
-            .or_else(|| self.cover_medium.clone())
+        real_cover(self.cover_xl.clone())
+            .or_else(|| real_cover(self.cover_big.clone()))
+            .or_else(|| real_cover(self.cover_medium.clone()))
     }
 }
 
@@ -258,10 +286,9 @@ impl AlbumDetail {
 
     /// Best available cover URL (largest first).
     pub fn best_cover(&self) -> Option<String> {
-        self.cover_xl
-            .clone()
-            .or_else(|| self.cover_big.clone())
-            .or_else(|| self.cover_medium.clone())
+        real_cover(self.cover_xl.clone())
+            .or_else(|| real_cover(self.cover_big.clone()))
+            .or_else(|| real_cover(self.cover_medium.clone()))
     }
 }
 
@@ -295,11 +322,15 @@ pub struct ArtistHit {
 }
 
 impl ArtistHit {
+    /// Like `best_cover`, drop Deezer's blank placeholder (built on
+    /// `NO_COVER_MD5`) — Deezer hands back a well-formed picture URL on that hash
+    /// for artists with no photo, so callers see `None` instead of persisting a
+    /// grey silhouette. This is also how we tell a real artist from a phantom
+    /// combined-credit ("Marshmello & Omar LinX") entity, which never has a photo.
     pub fn best_picture(&self) -> Option<String> {
-        self.picture_xl
-            .clone()
-            .or_else(|| self.picture_big.clone())
-            .or_else(|| self.picture_medium.clone())
+        real_cover(self.picture_xl.clone())
+            .or_else(|| real_cover(self.picture_big.clone()))
+            .or_else(|| real_cover(self.picture_medium.clone()))
     }
 }
 
@@ -358,7 +389,7 @@ impl DeezerClient {
         Self {
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(15))
-                .user_agent("Beetbot/0.0 (+https://github.com/beetbot-app/beetbot)")
+                .user_agent("Beetbot/0.2 (+https://github.com/beetbot-app/beetbot)")
                 .build()
                 .expect("reqwest client build"),
         }
@@ -877,5 +908,31 @@ mod tests {
             cover_medium: Some("m".into()),
         };
         assert_eq!(all_three.best_cover().as_deref(), Some("xl"));
+    }
+
+    #[test]
+    fn best_picture_drops_deezer_blank_placeholders() {
+        let real = "https://cdn-images.dzcdn.net/images/artist/abc123def456/1000x1000-000000-80-0-0.jpg";
+        // Empty-hash blank (what Deezer returns for a phantom collab credit with
+        // no photo) — note the "//" in the path.
+        let empty_hash = "https://cdn-images.dzcdn.net/images/artist//1000x1000-000000-80-0-0.jpg";
+        // NO_COVER_MD5 blank (md5 of the empty string).
+        let md5_blank = format!(
+            "https://cdn-images.dzcdn.net/images/artist/{NO_COVER_MD5}/1000x1000-000000-80-0-0.jpg"
+        );
+
+        let with = |xl: &str| ArtistHit {
+            id: 1,
+            name: "A".into(),
+            picture_xl: Some(xl.into()),
+            picture_big: None,
+            picture_medium: None,
+            nb_fan: None,
+            nb_album: None,
+        };
+
+        assert_eq!(with(real).best_picture().as_deref(), Some(real));
+        assert_eq!(with(empty_hash).best_picture(), None);
+        assert_eq!(with(&md5_blank).best_picture(), None);
     }
 }

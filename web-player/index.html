@@ -7,10 +7,19 @@
       content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no"
     />
     <meta name="apple-mobile-web-app-capable" content="yes" />
+    <!-- black-translucent puts the artwork wash behind the status bar. It is
+         only safe together with `height: 100vh` in index.css: with a
+         percentage height iOS shrinks the standalone viewport by the status
+         bar height and that space reappears as a dead black bar at the
+         bottom of the screen. Measured before the fix: screen 956, viewport
+         894, safe-area top 62. -->
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="apple-mobile-web-app-title" content="Beetbot" />
     <meta name="mobile-web-app-capable" content="yes" />
-    <meta name="theme-color" content="#141013" />
+    <!-- The app background Home actually paints (neutral-950). The brand ink
+         #141013 is warmer and shows as a seam against it; sheets override
+         this at runtime with the artwork wash. -->
+    <meta name="theme-color" content="#0a0a0a" />
     <title>Beetbot</title>
     <link rel="manifest" href="/manifest.webmanifest" />
     <!--

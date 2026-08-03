@@ -30,9 +30,11 @@ mod mdns;
 mod media;
 mod network;
 mod ngrok;
+mod portable;
 mod profiles;
 mod server;
 mod settings;
+pub mod sharing;
 mod soundcloud;
 mod tags;
 mod textnorm;
@@ -371,6 +373,20 @@ async fn open_exportify_window(app: tauri::AppHandle) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Reveal a file in the system file manager (Finder / Explorer) with it
+/// selected — the "downloaded" badge uses this so it actually leads somewhere.
+/// Errors if the path is empty or no longer on disk.
+#[tauri::command]
+async fn reveal_in_finder(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    if path.is_empty() || !std::path::Path::new(&path).exists() {
+        return Err("file is no longer on disk".into());
+    }
+    app.opener()
+        .reveal_item_in_dir(&path)
+        .map_err(|e| e.to_string())
+}
+
 #[derive(serde::Serialize)]
 struct PlaylistSummary {
     id: i64,
@@ -430,15 +446,13 @@ fn list_playlists(
     profile_id: i64,
 ) -> Result<Vec<PlaylistSummary>, String> {
     let conn = state.0.lock().map_err(|e| e.to_string())?;
-    // Only show playlists with at least one local track row. This naturally
-    // hides:
-    //   - Spotify-owned algorithmic / editorial playlists whose tracks
-    //     endpoint 403s for new (Dev Mode) apps,
-    //   - Empty user-owned playlists like "My playlist #32",
-    //   - Any future sync state where the playlist row exists but tracks
-    //     never landed.
-    // The displayed count is the actual `playlist_tracks` count rather than
-    // the API-reported total so the UI never claims tracks we can't show.
+    // Show a playlist if it has at least one local track row OR it's a
+    // user-created (`local:`) playlist. The track-row test hides an IMPORT
+    // whose track rows never landed (a partial or failed sync) so the UI never
+    // lists an empty ghost; the `local:` exception makes sure a playlist the
+    // user just created appears right away even before they add a song.
+    // The displayed count is the actual `playlist_tracks` count rather than the
+    // import-reported total so the UI never claims tracks we can't show.
     let mut stmt = conn
         .prepare(
             "SELECT p.id, p.name,
@@ -467,8 +481,11 @@ fn list_playlists(
                     p.created_at
              FROM playlists p
              WHERE p.profile_id = ?1
-               AND EXISTS (
-                 SELECT 1 FROM playlist_tracks pt2 WHERE pt2.playlist_id = p.id
+               AND (
+                 EXISTS (
+                   SELECT 1 FROM playlist_tracks pt2 WHERE pt2.playlist_id = p.id
+                 )
+                 OR p.spotify_id LIKE 'local:%'
              )
              ORDER BY p.name COLLATE NOCASE",
         )
@@ -509,8 +526,8 @@ pub(crate) fn playlist_source(spotify_id: &str) -> &'static str {
         // and filter it as an album.
         "album"
     } else if spotify_id.starts_with("local:") {
-        // Playlists minted via POST /api/playlists. Visible to the user,
-        // ignored by sync.
+        // Playlists minted via POST /api/playlists. Visible to the user;
+        // a re-import never touches them (they have no source archive).
         "local"
     } else if spotify_id.starts_with("soundcloud:") {
         // Imported from a SoundCloud playlist link; metadata only.
@@ -531,9 +548,9 @@ pub(crate) fn playlist_source(spotify_id: &str) -> &'static str {
 /// leaving the audio file on disk is the safe default (users can
 /// re-link them by importing again).
 ///
-/// Caller's responsibility to warn the user that Spotify-mirrored
-/// playlists will be restored on the next sync (we don't enforce
-/// that here so the API stays a thin DB wrapper).
+/// Caller's responsibility to warn the user that re-importing the source
+/// archive re-creates an imported playlist (we don't enforce that here so
+/// the API stays a thin DB wrapper).
 pub(crate) fn delete_playlist_row(conn: &rusqlite::Connection, id: i64) -> rusqlite::Result<bool> {
     let removed = conn.execute(
         "DELETE FROM playlists WHERE id = ?1",
@@ -1388,13 +1405,6 @@ struct BackupSummary {
     tracks: i64,
 }
 
-fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 /// Write a profile's playlists + tracks to `path` as a JSON backup file.
 #[tauri::command]
 fn export_library(
@@ -1492,16 +1502,14 @@ fn import_library_backup(
 
     for pl in &backup.playlists {
         let tx = conn.transaction().map_err(|e| e.to_string())?;
-        let snapshot = format!("backup-import:{}", unix_now());
         tx.execute(
             "INSERT INTO playlists
-                 (spotify_id, name, snapshot_id, track_count, last_synced_at, profile_id)
-             VALUES (?1, ?2, ?3, 0, strftime('%s','now'), ?4)
+                 (spotify_id, name, track_count, last_synced_at, profile_id)
+             VALUES (?1, ?2, 0, strftime('%s','now'), ?3)
              ON CONFLICT(spotify_id) DO UPDATE SET
                  name = excluded.name,
-                 snapshot_id = excluded.snapshot_id,
                  last_synced_at = excluded.last_synced_at",
-            rusqlite::params![pl.spotify_id, pl.name, snapshot, profile_id],
+            rusqlite::params![pl.spotify_id, pl.name, profile_id],
         )
         .map_err(|e| e.to_string())?;
         let playlist_id: i64 = tx
@@ -2066,6 +2074,7 @@ fn prune_orphan_tracks(conn: &rusqlite::Connection) -> usize {
         let mut stmt = match conn.prepare(
             "SELECT id, local_path FROM tracks t
              WHERE NOT EXISTS (SELECT 1 FROM playlist_tracks pt WHERE pt.track_id = t.id)
+               AND NOT EXISTS (SELECT 1 FROM profile_downloads pd WHERE pd.track_id = t.id)
                AND t.updated_at < strftime('%s','now') - ?1",
         ) {
             Ok(stmt) => stmt,
@@ -2218,6 +2227,178 @@ fn storage_usage(
         cache_bytes: dir_size_bytes(&live_cache_dir()),
         downloads_bytes: dir_size_bytes(&downloads),
     })
+}
+
+/// Record that `profile_id` saved `track_id` to disk. Idempotent.
+#[tauri::command]
+fn mark_download(
+    state: tauri::State<'_, DbState>,
+    profile_id: i64,
+    track_id: i64,
+) -> Result<(), String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT OR IGNORE INTO profile_downloads (profile_id, track_id) VALUES (?1, ?2)",
+        [profile_id, track_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Attribute every currently-downloaded track in `playlist_id` to `profile_id`
+/// (used after "Download all"). Idempotent.
+#[tauri::command]
+fn mark_playlist_downloads(
+    state: tauri::State<'_, DbState>,
+    profile_id: i64,
+    playlist_id: i64,
+) -> Result<(), String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT OR IGNORE INTO profile_downloads (profile_id, track_id)
+         SELECT ?1, pt.track_id
+         FROM playlist_tracks pt
+         JOIN tracks t ON t.id = pt.track_id
+         WHERE pt.playlist_id = ?2
+           AND ((t.local_path IS NOT NULL AND t.local_path <> '') OR t.status = 'downloaded')",
+        [profile_id, playlist_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Remove `profile_id`'s ownership of `track_id`'s download. The shared file on
+/// disk is deleted only when the LAST owner lets go — another profile that also
+/// downloaded it keeps playing it. Best-effort on the file.
+#[tauri::command]
+fn remove_download(
+    state: tauri::State<'_, DbState>,
+    profile_id: i64,
+    track_id: i64,
+) -> Result<(), String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "DELETE FROM profile_downloads WHERE profile_id = ?1 AND track_id = ?2",
+        [profile_id, track_id],
+    )
+    .map_err(|e| e.to_string())?;
+    let still_owned: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM profile_downloads WHERE track_id = ?1",
+            [track_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if still_owned == 0 {
+        let path: Option<String> = conn
+            .query_row("SELECT local_path FROM tracks WHERE id = ?1", [track_id], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        if let Some(p) = path.as_deref().filter(|s| !s.is_empty()) {
+            let _ = std::fs::remove_file(p);
+        }
+        conn.execute(
+            "UPDATE tracks
+                SET local_path = NULL,
+                    status = CASE WHEN status = 'downloaded' THEN 'matched' ELSE status END,
+                    updated_at = strftime('%s','now')
+              WHERE id = ?1",
+            [track_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Delete download files that no profile owns (never in / removed from every
+/// library) so stray files don't linger invisibly. Runs ONCE, guarded by a
+/// settings flag — after it, every download is explicitly owned, so nothing new
+/// is ever orphaned. Best-effort.
+fn cleanup_orphaned_downloads(conn: &rusqlite::Connection) {
+    let done: Option<String> = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'orphan_downloads_cleaned'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    if done.as_deref() == Some("1") {
+        return;
+    }
+    let orphans: Vec<(i64, Option<String>)> = match conn.prepare(
+        "SELECT id, local_path FROM tracks
+          WHERE ((local_path IS NOT NULL AND local_path <> '') OR status = 'downloaded')
+            AND id NOT IN (SELECT track_id FROM profile_downloads)",
+    ) {
+        Ok(mut stmt) => stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)))
+            .map(|it| it.filter_map(Result::ok).collect())
+            .unwrap_or_default(),
+        Err(_) => return,
+    };
+    for (id, path) in orphans {
+        if let Some(p) = path.as_deref().filter(|s| !s.is_empty()) {
+            let _ = std::fs::remove_file(p);
+        }
+        let _ = conn.execute(
+            "UPDATE tracks
+                SET local_path = NULL,
+                    status = CASE WHEN status = 'downloaded' THEN 'matched' ELSE status END,
+                    updated_at = strftime('%s','now')
+              WHERE id = ?1",
+            [id],
+        );
+    }
+    let _ = conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES ('orphan_downloads_cleaned', '1')",
+        [],
+    );
+}
+
+/// Every track the given profile saved to disk (device-wide files, per-profile
+/// ownership) — powers the Library's Downloaded tab, isolated per profile.
+#[tauri::command]
+fn list_downloaded_songs(
+    state: tauri::State<'_, DbState>,
+    profile_id: i64,
+) -> Result<Vec<PlaylistTrack>, String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT t.id, t.spotify_id, t.title, t.artists, t.album, t.album_art_url,
+                    t.duration_ms, t.isrc, t.status, t.failure_reason, t.local_path,
+                    t.created_at
+             FROM tracks t
+             JOIN profile_downloads pd ON pd.track_id = t.id
+             WHERE pd.profile_id = ?1
+               AND ((t.local_path IS NOT NULL AND t.local_path <> '') OR t.status = 'downloaded')
+               AND TRIM(t.title) <> ''
+             ORDER BY t.title COLLATE NOCASE",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([profile_id], |r| {
+            let artists_json: String = r.get(3)?;
+            let artists: Vec<String> =
+                serde_json::from_str(&artists_json).unwrap_or_default();
+            Ok(PlaylistTrack {
+                id: r.get(0)?,
+                spotify_id: r.get(1)?,
+                title: r.get(2)?,
+                artists,
+                album: r.get(4)?,
+                album_art_url: r.get(5)?,
+                duration_ms: r.get(6)?,
+                isrc: r.get(7)?,
+                status: r.get(8)?,
+                failure_reason: r.get(9)?,
+                local_path: r.get(10)?,
+                position: 0,
+                added_at: r.get(11)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
 }
 
 /// Delete the temporary streaming cache. Returns the number of bytes freed.
@@ -2637,7 +2818,6 @@ fn acme_clear(app: tauri::AppHandle) -> Result<(), String> {
 /// days -- Let's Encrypt certs are valid for 90, so we have 30 days of
 /// retry slack if issuance fails.
 async fn try_renew_cert(app: &tauri::AppHandle) -> Result<bool, String> {
-    use std::time::SystemTime;
     let dir = acme_tls_dir(app)?;
     let cert_file = acme::cert_path(&dir);
     if !cert_file.is_file() {
@@ -3105,6 +3285,9 @@ pub fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>>
             }
 
             let path = db_path(&app.handle())?;
+            // A staged portable import (Settings → full restore) swaps in HERE,
+            // before any connection opens; the old database stays beside it.
+            portable::finish_staged_import(&path);
             tracing::info!(?path, "opening library database");
             let conn = db::open(&path)?;
 
@@ -3374,6 +3557,9 @@ pub fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>>
                         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                         let (pruned, artists_fixed) = {
                             let conn = prune_db.lock().expect("db mutex poisoned");
+                            // One-time: delete download files that no profile owns
+                            // (post per-profile-downloads migration).
+                            cleanup_orphaned_downloads(&conn);
                             // Same launch pass: repair legacy ';'-joined artist
                             // arrays (Exportify imports predating the split fix).
                             (prune_orphan_tracks(&conn), split_semicolon_artists(&conn))
@@ -3484,6 +3670,10 @@ pub fn invoke_handler(
             list_library_artists,
             export_library,
             import_library_backup,
+            portable::portable_export,
+            portable::portable_peek,
+            portable::portable_import,
+            portable::portable_restart,
             import_local_file,
             streaming_status,
             streaming_set_enabled,
@@ -3492,6 +3682,11 @@ pub fn invoke_handler(
             get_download_dir,
             set_download_dir,
             storage_usage,
+            mark_download,
+            mark_playlist_downloads,
+            remove_download,
+            list_downloaded_songs,
+            reveal_in_finder,
             clear_live_cache,
             get_log_dir,
             probe_network,

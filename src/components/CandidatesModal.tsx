@@ -3,7 +3,7 @@ import { open } from '@tauri-apps/plugin-dialog';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { formatDuration } from '@/lib/format';
 import { ipc, type PlaylistTrack } from '@/lib/tauri';
-import { cn, SCRIM, SHEET } from '@shared/ui';
+import { cn, CALLOUT_ERROR, SCRIM, SHEET } from '@shared/ui';
 
 const AUDIO_EXTS = [
   'm4a',
@@ -154,7 +154,7 @@ export function CandidatesModal({ track, onClose, onResolved }: Props) {
                 : 'Drop a file here — or click to choose'}
           </button>
           {error && (
-            <div className="rounded-lg border border-red-900 bg-red-950/40 p-3 text-sm text-red-200">
+            <div className={CALLOUT_ERROR}>
               {error}
             </div>
           )}

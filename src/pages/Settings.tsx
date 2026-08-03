@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ReactElement } from 'react';
-import { open, save } from '@tauri-apps/plugin-dialog';
+import { ask, open, save } from '@tauri-apps/plugin-dialog';
 import { openUrl, revealItemInDir } from '@tauri-apps/plugin-opener';
 import { QRCodeSVG } from 'qrcode.react';
 import { useProfileStore } from '@/lib/profile';
@@ -20,7 +20,8 @@ import {
   type StreamingStatus,
   type UpnpStatus,
 } from '@/lib/tauri';
-import { AvatarSurface } from '@/components/ProfileGate';
+import { AvatarSurface, ProfileForm } from '@/components/ProfileGate';
+import { SharingPeoplePanel } from '@shared/components/SharingPeoplePanel';
 import {
   cn,
   CARD,
@@ -39,6 +40,7 @@ import {
   navPill,
 } from '@shared/ui';
 import { Group, Row, Toggle, Slider, Segmented, Picker } from '@shared/components/SettingsKit';
+import { useCanDownload } from '@/lib/capabilities';
 import {
   useAppearanceStore,
   ZOOM_CHOICES,
@@ -158,23 +160,26 @@ const CATEGORIES: {
 
 // Every section declares its home category + the words search matches against,
 // so one search field can filter rows across every category at once.
-type SectionMeta = { cat: SettingsTab; terms: string[] };
+// `ownerOnly` sections are house-wide or destructive (streaming/pairing, clear
+// cache, factory reset, logs) — only the house owner sees them. See `isOwner`.
+type SectionMeta = { cat: SettingsTab; terms: string[]; ownerOnly?: true };
 const SECTIONS = {
   account: { cat: 'account', terms: ['account', 'profile', 'switch profile', 'user', 'avatar'] },
   appbehaviour: { cat: 'account', terms: ['app behaviour', 'app behavior', 'startup', 'open at login', 'login', 'launch', 'start up'] },
+  personalize: { cat: 'account', terms: ['personalize', 'personalise', 'onboarding', 'setup', 'set up', 'welcome', 'suggestions', 'recommendations', 'taste', 'genres', 'artists', 're-run', 'redo', 'discover'] },
   crossfade: { cat: 'playback', terms: ['crossfade', 'playback', 'fade', 'overlap', 'autoplay', 'radio', 'keep playing', 'continuous'] },
   sound: { cat: 'playback', terms: ['sound', 'equalizer', 'eq', 'normalize', 'loudness', 'mono', 'audio', 'bass', 'treble', 'effects'] },
   zoom: { cat: 'appearance', terms: ['appearance', 'zoom', 'scale', 'text size', 'bigger', 'smaller', 'dense', 'spacious', 'display'] },
   nowplaying: { cat: 'appearance', terms: ['appearance', 'now playing', 'nowplaying', 'full screen', 'open on play', 'player'] },
   imports: { cat: 'library', terms: ['imports', 'import', 'spotify', 'apple music', 'soundcloud', 'playlist', 'csv', 'exportify'] },
-  discover: { cat: 'library', terms: ['discover', 'charts', 'last.fm', 'lastfm', 'genre', 'metadata', 'deezer'] },
   folder: { cat: 'library', terms: ['library folder', 'music folder', 'download', 'folder', 'disk'] },
-  storage: { cat: 'library', terms: ['storage', 'cache', 'clear cache', 'space', 'streaming cache', 'disk', 'downloads'] },
-  backup: { cat: 'library', terms: ['backup', 'restore', 'export', 'library backup', 'snapshot'] },
-  remote: { cat: 'sharing', terms: ['sharing', 'remote', 'listen', 'another device', 'stream', 'streaming', 'pairing', 'ngrok', 'link', 'qr', 'phone'] },
-  logs: { cat: 'advanced', terms: ['logs', 'log', 'security', 'debug', 'diagnostics'] },
+  storage: { cat: 'library', terms: ['storage', 'cache', 'clear cache', 'space', 'streaming cache', 'disk', 'downloads'], ownerOnly: true },
+  backup: { cat: 'library', terms: ['backup', 'restore', 'export', 'library backup', 'snapshot', 'portable', 'move', 'migrate', 'zip', 'new server'] },
+  remote: { cat: 'sharing', terms: ['sharing', 'remote', 'listen', 'another device', 'stream', 'streaming', 'pairing', 'ngrok', 'link', 'qr', 'phone'], ownerOnly: true },
+  people: { cat: 'sharing', terms: ['people', 'invite', 'share with', 'friends', 'family', 'guests', 'access', 'remove access', 'who can'], ownerOnly: true },
+  logs: { cat: 'advanced', terms: ['logs', 'log', 'security', 'debug', 'diagnostics'], ownerOnly: true },
   nativeengine: { cat: 'playback', terms: ['native', 'audio engine', 'beta', 'engine', 'experimental playback'] },
-  reset: { cat: 'advanced', terms: ['reset', 'defaults', 'restore', 'clear settings', 'factory'] },
+  reset: { cat: 'advanced', terms: ['reset', 'defaults', 'restore', 'clear settings', 'factory'], ownerOnly: true },
 } satisfies Record<string, SectionMeta>;
 
 /** Human-readable byte size ("1.2 GB", "340 MB"); em-dash when unknown. */
@@ -221,9 +226,38 @@ export function SettingsPage() {
   // across every category, ignoring the selection while it has text.
   const [tab, setTab] = useState<SettingsTab>('account');
   const [search, setSearch] = useState('');
-  // Account — the active profile + "switch profile" (existing capability).
+  // Account — the active profile + "switch profile" (existing capability), plus
+  // full profile management (edit / add / delete) moved here from the picker.
   const setActiveProfile = useProfileStore((s) => s.setActiveProfile);
   const [profiles, setProfiles] = useState<Profile[]>([]);
+  const [editingProfile, setEditingProfile] = useState<Profile | 'new' | null>(
+    null,
+  );
+  // Switch to another profile (no-PIN → directly; PIN-locked → via the picker,
+  // which owns the PIN entry). A member manages only their own profile, so
+  // getting into another means switching to it first; the owner can manage all.
+  const switchTo = useCallback(
+    (p: Profile) => {
+      if (p.has_pin) setActiveProfile(null);
+      else setActiveProfile(p.id);
+    },
+    [setActiveProfile],
+  );
+  // House "owner" = the oldest profile on this Mac (the seeded account). Only the
+  // owner sees house-wide + destructive settings (Sharing, clear cache, factory
+  // reset, logs) and can add / remove / edit every profile; everyone else manages
+  // just their own. This is a UX guardrail on a shared device — profiles are
+  // picked, not logged into — not a security boundary.
+  const ownerId = profiles.length
+    ? Math.min(...profiles.map((p) => p.id))
+    : 1;
+  const isOwner = activeProfileId === ownerId;
+  // Sharing + Advanced are owner-only categories; if a member ever lands on one
+  // (e.g. after switching out of the owner profile), fall back to Account so the
+  // panel is never blank.
+  useEffect(() => {
+    if (!isOwner && (tab === 'sharing' || tab === 'advanced')) setTab('account');
+  }, [isOwner, tab]);
   // Appearance — the desktop look, persisted per install (not per profile).
   const zoom = useAppearanceStore((s) => s.zoom);
   const setZoom = useAppearanceStore((s) => s.setZoom);
@@ -234,10 +268,6 @@ export function SettingsPage() {
   const nativeEngine = useAppearanceStore((s) => s.nativeEngine);
   const setNativeEngine = useAppearanceStore((s) => s.setNativeEngine);
 
-  // Last.fm (free; genre-accurate Browse charts)
-  const [hasLastfmKey, setHasLastfmKey] = useState(false);
-  const [lastfmKeyInput, setLastfmKeyInput] = useState('');
-  const [editingLastfmKey, setEditingLastfmKey] = useState(false);
 
   // Streaming
   const [streamingStatus, setStreamingStatus] = useState<StreamingStatus | null>(
@@ -249,6 +279,22 @@ export function SettingsPage() {
 
   // Library folder
   const [downloadDir, setDownloadDir] = useState<string | null>(null);
+  // Auto-download (full build only). Load the current value once the capability
+  // resolves; the OSS build never shows the control.
+  const canDownloadCap = useCanDownload();
+  const [autoDownload, setAutoDownloadState] = useState(false);
+  useEffect(() => {
+    if (!canDownloadCap) return;
+    ipc.getAutoDownload().then(setAutoDownloadState).catch(() => {});
+  }, [canDownloadCap]);
+  const handleToggleAutoDownload = useCallback(async (next: boolean) => {
+    setAutoDownloadState(next); // optimistic
+    try {
+      await ipc.setAutoDownload(next);
+    } catch {
+      setAutoDownloadState(!next); // revert on failure
+    }
+  }, []);
 
   // Storage (streaming cache + downloads size)
   const [storage, setStorage] = useState<StorageUsage | null>(null);
@@ -297,6 +343,11 @@ export function SettingsPage() {
   // user still needs to fill it in (the one unavoidable external step).
   const ddnsSubdomainRef = useRef<HTMLInputElement | null>(null);
 
+  // Portable full-server backup (all profiles, one zip)
+  const [portableBusy, setPortableBusy] = useState(false);
+  const [portableAudio, setPortableAudio] = useState(true);
+  const [restartReady, setRestartReady] = useState(false);
+
   // Imports
   const [openingExportify, setOpeningExportify] = useState(false);
   const [bulkImporting, setBulkImporting] = useState(false);
@@ -318,7 +369,6 @@ export function SettingsPage() {
         acmeStatus,
         pairingInfo,
         secLogPath,
-        lastfmKey,
         profileList,
         storageInfo,
       ] = await Promise.all([
@@ -331,11 +381,9 @@ export function SettingsPage() {
         ipc.acmeGetStatus().catch(() => null),
         ipc.pairingGetInfo().catch(() => null),
         ipc.getSecurityLogPath().catch(() => null),
-        ipc.lastfmGetKey().catch(() => null),
         ipc.listProfiles().catch(() => [] as Profile[]),
         ipc.storageUsage().catch(() => null),
       ]);
-      setHasLastfmKey(Boolean(lastfmKey));
       setProfiles(profileList);
       setStorage(storageInfo);
       setStreamingStatus(streamStatus);
@@ -427,31 +475,6 @@ export function SettingsPage() {
     };
   }, [pairing?.remote_streaming_enabled]);
 
-  // -- Last.fm handlers ---------------------------------------------------
-
-  const handleSaveLastfmKey = useCallback(async () => {
-    setBanner(null);
-    try {
-      await ipc.lastfmSetKey(lastfmKeyInput.trim());
-      setHasLastfmKey(true);
-      setEditingLastfmKey(false);
-      setLastfmKeyInput('');
-      setBanner({ kind: 'info', text: 'Last.fm API key saved.' });
-    } catch (e) {
-      setBanner({ kind: 'error', text: String(e) });
-    }
-  }, [lastfmKeyInput]);
-
-  const handleClearLastfmKey = useCallback(async () => {
-    setBanner(null);
-    try {
-      await ipc.lastfmClearKey();
-      setHasLastfmKey(false);
-      setBanner({ kind: 'info', text: 'Last.fm API key cleared.' });
-    } catch (e) {
-      setBanner({ kind: 'error', text: String(e) });
-    }
-  }, []);
 
   // -- Storage handlers ---------------------------------------------------
 
@@ -511,8 +534,8 @@ export function SettingsPage() {
       setBanner({
         kind: 'info',
         text: enabled
-          ? 'Streaming server started.'
-          : 'Streaming server stopped.',
+          ? 'Direct link turned on.'
+          : 'Direct link turned off.',
       });
     } catch (e) {
       setBanner({ kind: 'error', text: String(e) });
@@ -523,6 +546,27 @@ export function SettingsPage() {
     try {
       await ipc.revokeStreamingSession(id);
       setStreamingSessions(await ipc.listStreamingSessions());
+    } catch (e) {
+      setBanner({ kind: 'error', text: String(e) });
+    }
+  }, []);
+
+  // Sign out of every connected device at once. There's no bulk backend command,
+  // so revoke each live session; each device then has to pair again to stream.
+  const handleSignOutAllDevices = useCallback(async () => {
+    if (
+      !confirm(
+        'Sign out of all connected devices? Each one will need to pair again before it can stream from this Mac.',
+      )
+    ) {
+      return;
+    }
+    setBanner(null);
+    try {
+      const sessions = await ipc.listStreamingSessions();
+      await Promise.all(sessions.map((s) => ipc.revokeStreamingSession(s.id)));
+      setStreamingSessions(await ipc.listStreamingSessions());
+      setBanner({ kind: 'info', text: 'Signed out of all devices.' });
     } catch (e) {
       setBanner({ kind: 'error', text: String(e) });
     }
@@ -957,6 +1001,73 @@ export function SettingsPage() {
     }
   }, [activeProfileId]);
 
+  // -- Portable full-server backup handlers -------------------------------
+
+  const handlePortableExport = useCallback(async () => {
+    setBanner(null);
+    setPortableBusy(true);
+    try {
+      const date = new Date().toISOString().slice(0, 10);
+      const path = await save({
+        defaultPath: `beetbot-portable-${date}.zip`,
+        filters: [{ name: 'Beetbot portable backup', extensions: ['zip'] }],
+      });
+      if (!path) return;
+      const s = await ipc.portableExport(path, portableAudio);
+      setBanner({
+        kind: 'info',
+        text: `Exported ${s.profiles} ${s.profiles === 1 ? 'profile' : 'profiles'} · ${s.playlists} playlists · ${s.tracks} songs${
+          s.audioIncluded ? ` · ${s.audioFiles} audio files` : ' (catalog only)'
+        }.`,
+      });
+    } catch (e) {
+      setBanner({ kind: 'error', text: String(e) });
+    } finally {
+      setPortableBusy(false);
+    }
+  }, [portableAudio]);
+
+  const handlePortableImport = useCallback(async () => {
+    setBanner(null);
+    try {
+      const selected = await open({
+        multiple: false,
+        filters: [{ name: 'Beetbot portable backup', extensions: ['zip'] }],
+      });
+      if (typeof selected !== 'string') return;
+      // Show what the backup holds BEFORE anything is replaced.
+      const m = await ipc.portablePeek(selected);
+      const exported = new Date(m.exportedAt * 1000).toLocaleDateString();
+      const ok = await ask(
+        `This replaces everything on this server — every profile, playlist and setting — with the backup from ${exported}: ${m.profiles} ${
+          m.profiles === 1 ? 'profile' : 'profiles'
+        }, ${m.playlists} playlists, ${m.tracks} songs${
+          m.audioIncluded ? `, ${m.audioFiles} audio files` : ' (catalog only)'
+        }. The current library is kept on disk as a rescue copy.`,
+        {
+          title: 'Restore full backup?',
+          kind: 'warning',
+          okLabel: 'Replace & restore',
+          cancelLabel: 'Cancel',
+        },
+      );
+      if (!ok) return;
+      setPortableBusy(true);
+      const s = await ipc.portableImport(selected);
+      setRestartReady(true);
+      setBanner({
+        kind: 'info',
+        text: `Backup staged: ${s.profiles} ${s.profiles === 1 ? 'profile' : 'profiles'} · ${s.playlists} playlists · ${s.tracks} songs${
+          s.audioMissing > 0 ? ` (${s.audioMissing} songs will re-download)` : ''
+        }. Restart Beetbot to finish.`,
+      });
+    } catch (e) {
+      setBanner({ kind: 'error', text: String(e) });
+    } finally {
+      setPortableBusy(false);
+    }
+  }, []);
+
   // -- Imports handlers ---------------------------------------------------
 
   const handleOpenExportify = useCallback(async () => {
@@ -1059,10 +1170,23 @@ export function SettingsPage() {
     // Sound effects (EQ / Mono) only work through the native engine, so only
     // surface the group when that beta is on.
     if (s === SECTIONS.sound && !nativeEngine) return false;
+    // House-wide / destructive controls: owner only (also keeps them out of
+    // search results for members).
+    if (s.ownerOnly && !isOwner) return false;
     return searching ? s.terms.some((t) => t.includes(q)) : tab === s.cat;
   };
   const anyVisible = Object.values(SECTIONS).some(show);
-  const activeProfile = profiles.find((p) => p.id === activeProfileId) ?? null;
+  // A category shows in the rail only if it has at least one section this user is
+  // allowed to see — so members simply don't get a Sharing or Advanced tab.
+  const allSections = Object.values(SECTIONS) as SectionMeta[];
+  const visibleCats = CATEGORIES.filter((c) =>
+    allSections.some(
+      (s) =>
+        s.cat === c.id &&
+        (!s.ownerOnly || isOwner) &&
+        (s !== SECTIONS.sound || nativeEngine),
+    ),
+  );
 
   return (
     <div className="h-full flex">
@@ -1081,7 +1205,7 @@ export function SettingsPage() {
           />
         </div>
         <div className="space-y-0.5">
-          {CATEGORIES.map((c) => {
+          {visibleCats.map((c) => {
             const active = !searching && tab === c.id;
             return (
               <button
@@ -1124,41 +1248,138 @@ export function SettingsPage() {
       {show(SECTIONS.account) && (
       <Group
         title="Account"
-        description="The profile you’re listening as on this Mac."
+        description={
+          isOwner
+            ? 'Switch between profiles, edit or remove them, or add a new one.'
+            : 'Switch profiles, or edit the one you’re signed into.'
+        }
       >
-        <div className="flex items-center justify-between gap-3">
-          <div className="flex min-w-0 items-center gap-3">
-            <span className="grid h-10 w-10 shrink-0 overflow-hidden rounded-lg text-base">
-              {activeProfile ? (
-                <AvatarSurface
-                  name={activeProfile.name}
-                  color={activeProfile.avatar_color}
-                  avatarPath={activeProfile.avatar_path}
-                />
-              ) : (
-                <span className="grid h-full w-full place-items-center bg-neutral-800 text-neutral-500">
-                  ?
-                </span>
-              )}
-            </span>
-            <div className="min-w-0">
-              <div className="truncate text-sm font-medium">
-                {activeProfile?.name ?? 'Current profile'}
+        <div className="flex flex-col">
+          {profiles.map((p, i) => {
+            const current = p.id === activeProfileId;
+            return (
+              <div
+                key={p.id}
+                className={cn(
+                  'flex items-center justify-between gap-3 py-2.5',
+                  i > 0 && 'border-t border-white/10',
+                )}
+              >
+                <div className="flex min-w-0 items-center gap-3">
+                  <span className="grid h-10 w-10 shrink-0 overflow-hidden rounded-lg text-base">
+                    <AvatarSurface
+                      name={p.name}
+                      color={p.avatar_color}
+                      avatarPath={p.avatar_path}
+                    />
+                  </span>
+                  <div className="min-w-0">
+                    <div className="truncate text-sm font-medium">
+                      {p.name}
+                      {current && (
+                        <span className="ml-2 text-xs font-normal text-neutral-500">
+                          This profile
+                        </span>
+                      )}
+                    </div>
+                    {p.has_pin && (
+                      <div className="text-xs text-neutral-500">
+                        Protected with a PIN
+                      </div>
+                    )}
+                  </div>
+                </div>
+                <div className="flex shrink-0 items-center gap-2">
+                  {current ? (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => setActiveProfile(null)}
+                        className={BTN_GHOST}
+                      >
+                        Switch profile
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setEditingProfile(p)}
+                        className={BTN_SECONDARY}
+                      >
+                        Edit
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => switchTo(p)}
+                        className={BTN_SECONDARY}
+                      >
+                        Switch
+                      </button>
+                      {/* Only the owner can manage other profiles; members see
+                          a Switch and nothing else. */}
+                      {isOwner && (
+                        <button
+                          type="button"
+                          onClick={() => setEditingProfile(p)}
+                          className={BTN_GHOST}
+                        >
+                          Edit
+                        </button>
+                      )}
+                    </>
+                  )}
+                </div>
               </div>
-              {activeProfile?.has_pin && (
-                <div className="text-xs text-neutral-500">Protected with a PIN</div>
-              )}
-            </div>
-          </div>
-          <button
-            type="button"
-            onClick={() => setActiveProfile(null)}
-            className={cn(BTN_SECONDARY, 'shrink-0')}
-          >
-            Switch profile
-          </button>
+            );
+          })}
+          {isOwner && (
+            <button
+              type="button"
+              onClick={() => setEditingProfile('new')}
+              className="flex items-center gap-3 border-t border-white/10 py-2.5 text-sm text-neutral-300 transition hover:text-neutral-100"
+            >
+              <span className="grid h-10 w-10 shrink-0 place-items-center rounded-lg border border-dashed border-neutral-700 text-neutral-500">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden>
+                  <path d="M12 5v14M5 12h14" />
+                </svg>
+              </span>
+              Add profile
+            </button>
+          )}
         </div>
       </Group>
+      )}
+      {editingProfile && (
+        <ProfileForm
+          profile={editingProfile === 'new' ? null : editingProfile}
+          // Anyone may delete THEIR OWN profile; the owner may delete any.
+          // Never the last one — the "who's listening?" gate needs an answer.
+          canDelete={
+            (isOwner ||
+              (editingProfile !== 'new' &&
+                editingProfile.id === activeProfileId)) &&
+            profiles.length > 1
+          }
+          onClose={() => setEditingProfile(null)}
+          onSaved={() => {
+            setEditingProfile(null);
+            void ipc
+              .listProfiles()
+              .then((fresh) => {
+                setProfiles(fresh);
+                // The active profile no longer exists (someone deleted the
+                // profile they were using) → back to "Who's listening?".
+                if (
+                  activeProfileId != null &&
+                  !fresh.some((p) => p.id === activeProfileId)
+                ) {
+                  setActiveProfile(null);
+                }
+              })
+              .catch(() => {});
+          }}
+        />
       )}
 
       {/* -- App behaviour ------------------------------------------- */}
@@ -1177,6 +1398,30 @@ export function SettingsPage() {
                 ariaLabel="Open at login"
               />
             )
+          }
+        />
+      </Group>
+      )}
+
+      {/* -- Personalize --------------------------------------------- */}
+      {show(SECTIONS.personalize) && (
+      <Group
+        title="Personalize"
+        footer="Your playlists, library, and downloads are left untouched — this only refreshes what Home suggests for this profile."
+      >
+        <Row
+          label="Personalize home"
+          secondary="Run the welcome setup again to refresh your music and what Home suggests."
+          control={
+            <button
+              type="button"
+              onClick={() =>
+                window.dispatchEvent(new Event('beetbot:rerun-onboarding'))
+              }
+              className={BTN_SECONDARY}
+            >
+              Start setup
+            </button>
           }
         />
       </Group>
@@ -1499,80 +1744,6 @@ export function SettingsPage() {
       </Group>
       )}
 
-      {/* -- Discover charts (Last.fm) ------------------------------- */}
-      {show(SECTIONS.discover) && (
-      <Group
-        title="Discover charts"
-        description="Optional: a free Last.fm API key makes the Discover genre pages reflect how listeners tag tracks (cleaner per-genre charts). Without it, genres use Deezer's charts."
-      >
-        {hasLastfmKey && !editingLastfmKey ? (
-          <div className="flex items-center justify-between rounded-lg border border-white/10 p-3">
-            <div className="min-w-0">
-              <div className="text-sm font-medium">Last.fm key saved</div>
-              <div className="text-xs text-neutral-500">
-                Genre pages now use Last.fm tag charts.
-              </div>
-            </div>
-            <div className="flex gap-2 shrink-0">
-              <button
-                type="button"
-                onClick={() => {
-                  setEditingLastfmKey(true);
-                  setLastfmKeyInput('');
-                }}
-                className={BTN_GHOST}
-              >
-                Replace
-              </button>
-              <button
-                type="button"
-                onClick={handleClearLastfmKey}
-                className={BTN_GHOST_DANGER}
-              >
-                Clear
-              </button>
-            </div>
-          </div>
-        ) : (
-          <div className="space-y-3 rounded-lg border border-white/10 p-4">
-            <div className="text-sm text-neutral-300">
-              Get a free API key at{' '}
-              <span className="text-neutral-100">last.fm/api/account/create</span>{' '}
-              (any app name works) and paste it here.
-            </div>
-            <div className="flex gap-2">
-              <input
-                type="password"
-                value={lastfmKeyInput}
-                onChange={(e) => setLastfmKeyInput(e.target.value)}
-                placeholder="Last.fm API key"
-                className={cn(INPUT, 'flex-1')}
-              />
-              <button
-                type="button"
-                onClick={handleSaveLastfmKey}
-                disabled={!lastfmKeyInput.trim()}
-                className={BTN_PRIMARY}
-              >
-                Save
-              </button>
-              {editingLastfmKey && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    setEditingLastfmKey(false);
-                    setLastfmKeyInput('');
-                  }}
-                  className={BTN_GHOST}
-                >
-                  Cancel
-                </button>
-              )}
-            </div>
-          </div>
-        )}
-      </Group>
-      )}
 
       {/* -- Library folder ------------------------------------------ */}
       {show(SECTIONS.folder) && (
@@ -1581,6 +1752,7 @@ export function SettingsPage() {
         description="Where imported music is stored on disk."
       >
         <Row
+          divider={canDownloadCap}
           label={
             downloadDir ?? (
               <span className="inline-block h-3.5 w-48 max-w-full rounded bg-neutral-800 animate-pulse align-middle" aria-label="Loading" />
@@ -1594,6 +1766,19 @@ export function SettingsPage() {
             </button>
           }
         />
+        {canDownloadCap && (
+          <Row
+            label="Auto-download songs in my playlists"
+            secondary="Save songs to this folder as you add them, so they play without streaming."
+            control={
+              <Toggle
+                checked={autoDownload}
+                onChange={handleToggleAutoDownload}
+                ariaLabel="Auto-download songs in my playlists"
+              />
+            }
+          />
+        )}
       </Group>
       )}
 
@@ -1639,7 +1824,7 @@ export function SettingsPage() {
       {show(SECTIONS.backup) && (
       <Group
         title="Backup & restore"
-        description="Save your playlists and tracks to a file, or restore them from one. Your audio files stay where they are — this is the catalog."
+        description="Save your playlists to a file, restore them from one — or move the whole server, every profile and setting included, to a new machine."
       >
         <Row
           label="Library backup"
@@ -1668,6 +1853,57 @@ export function SettingsPage() {
             </>
           }
         />
+        <Row
+          divider
+          label="Move to a new server"
+          secondary={
+            <>
+              The whole server — every profile, playlist, setting and listening
+              history, optionally the audio — as one{' '}
+              <code className={CODE_CHIP}>.zip</code>. Restoring replaces this
+              server's library; the previous one is kept on disk as a rescue
+              copy.
+            </>
+          }
+          control={
+            restartReady ? (
+              <button
+                type="button"
+                onClick={() => void ipc.portableRestart()}
+                className={BTN_PRIMARY}
+              >
+                Restart to finish
+              </button>
+            ) : (
+              <>
+                <label className="flex items-center gap-1.5 text-xs text-neutral-500 select-none whitespace-nowrap">
+                  <input
+                    type="checkbox"
+                    checked={portableAudio}
+                    onChange={(e) => setPortableAudio(e.target.checked)}
+                  />
+                  Include audio
+                </label>
+                <button
+                  type="button"
+                  disabled={portableBusy}
+                  onClick={handlePortableImport}
+                  className={BTN_GHOST}
+                >
+                  Restore…
+                </button>
+                <button
+                  type="button"
+                  disabled={portableBusy}
+                  onClick={handlePortableExport}
+                  className={BTN_PRIMARY}
+                >
+                  {portableBusy ? 'Working…' : 'Export…'}
+                </button>
+              </>
+            )
+          }
+        />
       </Group>
       )}
 
@@ -1677,7 +1913,19 @@ export function SettingsPage() {
         title="Listen on another device"
         description="Open your library on your phone or laptop — at home or anywhere."
       >
-        <div className="space-y-3">
+        {/* The pluggable sharing provider is the recommended way to reach your
+            library — it signs visitors in for you, so no code is needed. Its
+            name and URL come from the host build at runtime; this core never
+            names one. Rendered FIRST as the primary option. */}
+        <ExternalSharingCard />
+        {/* Beetbot's own direct link (an ngrok tunnel with a 6-digit code) is the
+            fallback for people not using the provider above. Tucked into a
+            disclosure so it isn't mistaken for a step the provider needs. */}
+        <details className="mt-4">
+          <summary className="cursor-pointer select-none text-xs text-neutral-500 hover:text-neutral-300">
+            Other ways to connect — a direct link (needs a 6-digit code) →
+          </summary>
+        <div className="space-y-3 mt-3">
           <div className="flex items-center justify-between gap-3">
             <div>
               <div className="text-sm font-medium">
@@ -1772,6 +2020,20 @@ export function SettingsPage() {
                   </button>
                 </div>
               ))}
+              {streamingSessions.length > 1 && (
+                <button
+                  type="button"
+                  onClick={handleSignOutAllDevices}
+                  className="flex w-full items-center gap-2 pt-2 mt-1 border-t border-white/10 text-sm text-neutral-400 transition hover:text-red-400"
+                >
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                    <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+                    <polyline points="16 17 21 12 16 7" />
+                    <line x1="21" y1="12" x2="9" y2="12" />
+                  </svg>
+                  Sign out of all devices
+                </button>
+              )}
             </div>
           )}
           {/* Setup and advanced — phase-aware: the ngrok wizard is the hero
@@ -1893,13 +2155,14 @@ export function SettingsPage() {
               </button>
             ))}
         </div>
-        {/* Optional pluggable sharing provider. Renders nothing unless the host
-            build supplies the `external_sharing_status` command, and stays
-            brand-neutral — every provider-specific string comes from the host
-            at runtime. */}
-        <ExternalSharingCard />
+        </details>
       </Group>
       )}
+
+      {/* Who else can open this server. Renders nothing unless the host build
+          supplies a sharing provider AND it is connected, so the plain build is
+          unchanged. Same panel the phone shows — see SharingPeoplePanel. */}
+      {show(SECTIONS.people) && <SharingPeoplePanel />}
 
       {/* -- Logs ---------------------------------------------------- */}
       {show(SECTIONS.logs) && (
@@ -2769,32 +3032,53 @@ function ExternalSharingCard() {
 
   const { available, state, providerName, url } = status;
   const isOn = state !== 'off';
+  // In a conflict, name the contested address when we have it — a household can
+  // have several devices sharing and the host says which one this fight is over.
+  const conflictHost = (() => {
+    if (!url) return 'your address';
+    try {
+      return new URL(url).host;
+    } catch {
+      return 'your address';
+    }
+  })();
   const statusLine =
     state === 'live'
       ? `Live through ${providerName}.`
       : state === 'pending'
         ? `Waiting for you to approve this in ${providerName}.`
-        : available
-          ? `Reach your library through ${providerName} — works anywhere, no setup.`
-          : `${providerName} isn't running right now.`;
+        : state === 'conflict'
+          ? `Another device on your account is serving ${conflictHost} — visitors reach that device's library, not this one. Turn off sharing there to move it here.`
+          : available
+            ? `Reach your library anywhere through ${providerName} — it signs visitors in for you, so there's no code to enter.`
+            : `${providerName} isn't running right now.`;
 
   return (
     <div className="mt-3 rounded-lg border border-neutral-800 p-4 space-y-3">
       <div className="flex items-center justify-between gap-3">
         <div>
           <div className="text-sm font-medium">
-            Also available through {providerName}
+            Share through {providerName}
           </div>
-          <div className="text-xs text-neutral-500 mt-0.5">{statusLine}</div>
+          <div
+            className={
+              state === 'conflict'
+                ? 'text-xs text-amber-400 mt-0.5'
+                : 'text-xs text-neutral-500 mt-0.5'
+            }
+          >
+            {statusLine}
+          </div>
         </div>
         <button
           type="button"
           disabled={busy || (!isOn && !available)}
           onClick={() => handleToggle(!isOn)}
           className={
-            isOn
+            'shrink-0 whitespace-nowrap ' +
+            (isOn
               ? 'rounded-lg px-3 py-2 text-sm text-neutral-300 hover:text-red-400 border border-neutral-800 disabled:opacity-50'
-              : 'rounded-lg px-4 py-2 bg-neutral-100 hover:bg-white text-neutral-950 font-medium transition disabled:opacity-50'
+              : 'rounded-lg px-4 py-2 bg-neutral-100 hover:bg-white text-neutral-950 font-medium transition disabled:opacity-50')
           }
         >
           {busy ? 'Working…' : isOn ? 'Turn off' : 'Turn on'}

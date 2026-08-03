@@ -1,12 +1,15 @@
 //
 // Beetbot web-player service worker.
 //
-// Two cache namespaces:
-//   beetbot-shell-v1  — HTML / JS / CSS / icons. Network-first nav,
-//                       stale-while-revalidate for hashed assets.
-//   beetbot-audio-v1  — Audio responses cached on explicit user opt-in.
-//                       Cache key strips the session token so a token
-//                       rotation doesn't invalidate offline tracks.
+// Three cache namespaces (prefix-versioned; bump the suffix to invalidate):
+//   beetbot-shell-*  — HTML / JS / CSS / icons. Network-first nav,
+//                      stale-while-revalidate for hashed assets.
+//   beetbot-audio-*  — Audio responses cached on explicit user opt-in.
+//                      Cache key strips the session token so a token
+//                      rotation doesn't invalidate offline tracks.
+//   beetbot-api-*    — Stale-while-revalidate cache of read-only API GETs
+//                      (library, playlist tracks, metadata, art) so the
+//                      PWA boots fully offline.
 //
 // On /stream/<id> requests we look up the stripped URL in the audio cache.
 // On hit we serve from cache (and synthesize a Range 206 if the request had
@@ -14,307 +17,65 @@
 // fall through to network -- we NEVER auto-cache, every cached track is
 // the result of an explicit user "Available offline" action.
 
-// v28: album view — hide the "Add album to library" button once every
-// track is already in the library (show "✓ In your library" instead).
-// New JS hash, bump to pull.
-//
-// v27: album view restyle — Spotify album-header layout (full square
-// cover + title + "Artist · Year · N songs · duration"), keeping the
-// "Add album to library" button. New JS hash, bump to pull.
-//
-// v26: artist hero restyle — Spotify playlist-header layout (full square
-// photo on the left, name + listener count beside it, blurred colour
-// wash behind) instead of the cropped banner. Also folds in the recent
-// desktop-only shared changes. New JS hash, bump to pull.
-//
-// v25: "Fans also like" now shows a preview (8) with a "Show all"
-// toggle, matching Discography. New JS hash, bump to pull.
-//
-// v24: About card — switch the backdrop to a blurred/darkened ambient
-// photo so the bio text is the focus (the sharp full portrait duplicated
-// the top banner). New JS hash, bump to pull.
-//
-// v23: About section restyle — Spotify-style image card (artist photo
-// backdrop + gradient with the listener count + bio overlaid) instead of
-// plain text. New JS hash, bump to pull.
-//
-// v22: artist "About" section — a Wikipedia bio blurb (free, no key,
-// attributed) on the artist page. New JS hash, bump to pull.
-//
-// v21: artist-page polish — fan count on the hero (Deezer nb_fan) and
-// explicit "E" badges on tracks (Deezer explicit_lyrics). New JS hash,
-// bump to pull.
-//
-// v20: "Popular releases" now ranks the discography by the artist's
-// top-track albums (real popularity signal) instead of pure newest-
-// first, so it stops mirroring the Singles tab. New JS hash, bump.
-//
-// v19: discography polish — "Popular releases" chip label + a
-// collapsed preview with a "Show all" toggle. New JS hash, bump.
-//
-// v18: artist discography restyle — "Year • Type" album cards +
-// All / Albums / Singles & EPs filter chips, newest-first. New JS
-// hash, bump to pull.
-//
-// v17: artist page restyle — full-bleed banner hero with the artist
-// name set large (Spotify-style), wider modal. New JS hash, bump to pull.
-//
-// v16: Browse tab — Deezer charts (top songs/albums/artists) + new
-// releases, as a new bottom-nav tab. New JS hash, so bump to pull it.
-//
-// v15: phone library redesign — list/grid toggle, sortable "Recents"
-// header (recently played / A–Z / recently added), and 2×2 mosaic
-// cover tiles. New JS hash, so bump the shell cache to pull it.
-//
-// v14: richer artist page — the artist drill-in now shows "Popular"
-// (top tracks, with preview + add) and "Fans also like" (related
-// artists) alongside the discography. New JS hash, so bump the shell
-// cache to pull the new bundle.
-//
-// v13: recent-searches polish — drop the ↩ emoji glyph for a
-// monochrome clock icon, and collapse search-as-you-type prefix
-// fragments ("sw"/"swit"/"switch") down to the final term. New JS
-// hash, so bump the shell cache to pull the new bundle.
-//
-// v12: reworks the search preview into a Shazam-style interaction —
-// tap the song row and the album art shows a pause glyph with a
-// depleting countdown ring (replacing the standalone ▶ button). New
-// JS hash, so bump the shell cache to force phones onto the new bundle.
-//
-// v11: ships the 30-second Deezer preview (▶) button on search
-// results. Bumping the shell cache forces phones still running the
-// pre-preview bundle to drop it and pull the new JS — without the
-// bump, the cache-first navigation handler would keep serving the
-// old HTML/JS and the new control would never appear.
-//
-// v10: ships inline data: URL artwork in MediaSession metadata so
-// iOS doesn't make a network fetch for the lock-screen art on
-// track auto-advance. That fetch is the suspected reason audio
-// stays silent in background when the Beetbot host (desktop) is
-// asleep, even for offline-cached tracks.
-// v124: full build plays non-downloaded tracks via on-demand /live (instant
-// stream / match-on-play); rows are no longer greyed and the cover plays
-// instead of previewing; recent-search artist navigation fix.
-// v125: unified album page — browse/library albums share the same layout with
-// a Spotify-style +/✓ library toggle (Play · Shuffle · +/✓); downloaded badge
-// + discoverable pinning (artist/album/playlist) + album-rename gating.
-// v126: tapping a searched song streams in full (not the 30s preview); album
-// FILE column merges the +/✓ into one aligned spot. (Sticky headers, per-song
-// ⋯ menus, edit-details + play/pause state are desktop-only.)
-// v127: Discover/catalog playlists render through the shared album/playlist
-// page (read-only "Add all to library") AND are searchable from the search bar
-// (Playlists tab + grid); "tracks" → "songs" everywhere.
-// v128: clickable artist/album names in track rows (→ their pages); catalog
-// playlists show per-track cover + Album column; the Deezer-wordmark cover badge
-// is a rounded inset chip (on the hero too, not just cards); search dropdown
-// surfaces matching playlists inline.
-// v129: album/playlist track rows move the add-to-playlist +/✓ next to the
-// title (it no longer covers the FILE download badge on hover).
-// v130: the add-to-playlist +/✓ gets its OWN column between File and Time
-// (consistent Spotify-style spot); the "downloaded" badge becomes a green
-// DOWN-ARROW (not a check) so it reads distinctly from the in-playlist ✓.
-// v131: a saved album is no longer treated as a playlist — its tracks show no
-// per-song ✓ (the album-level save indicator covers it), and albums are dropped
-// from the "add to playlist" picker (you can't add songs to an album). The
-// download arrow stays in the File column (consistent with the other pages).
-// v132: the album-page hero's artist name is clickable → that artist's page.
-// v133: Home shows Spotify-style skeleton placeholders (pulsing gray boxes) on
-// cold start while the feed loads, instead of a blank page; a small per-profile
-// cache keeps return visits from re-flashing the skeleton.
-// v134: skeleton shelf title bar is inset (ml-4) like the real title instead of
-// flush to the edge.
-// v136: phone Settings gets an Account section — current profile, Switch
-// profile, and Disconnect this device (re-pair).
-// v137: phone Settings is just Account now — dropped the desktop-only
-// Crossfade/Library explainer cards.
-// v138: switching profiles resets now-playing so one user's song doesn't carry
-// into the next profile (it would otherwise log under the new profile).
-// v139: cross-device presence ("playing on phone/computer") is scoped per
-// profile — one account no longer sees another account's devices.
-// v140: per-profile isolation — search recents / recently-played / offline
-// flags / pinned playlists / Discover cache are now keyed by profile, and the
-// Library shows each profile's own saved music (downloads stay shared).
-// v141: auth hardening — the phone binds its session to a profile (PIN-checked
-// server-side) so the server enforces playlist ownership per profile.
-// v142: the player auto-recovers from a dropped stream (desktop restart / stale
-// URL after backgrounding) — retries with backoff + resumes, instead of the
-// "Audio format not supported" banner.
-// v143: drop the doubled home-indicator inset — the player bar only reserves it
-// when it's bottom-most, killing the black gap above the nav. Plus a sticky,
-// frosted Home header + a status-bar scrim so content stops bleeding past the
-// clock/battery in the standalone PWA.
-// v144: prefetch the next track's /live stream (not just downloaded ones) so a
-// non-downloaded next song is de-fragmented on the desktop before the queue
-// advances — cuts the "couldn't reach the stream" failures when the phone
-// advances a song while the screen is locked.
-// v145: lyrics load from a persistent DB cache (survives restarts) and the next
-// queued track's lyrics are prefetched, so they appear instantly on song change;
-// transient LRCLIB failures now retry instead of sticking as a permanent miss.
-// v146: unsynced (plain) lyrics render line-by-line with the same spacing + size
-// as the synced/karaoke view, instead of one cramped pre-wrap block.
-// v167: Apple-style restyle — SF system font app-wide, emerald retired (white
-// controls + artwork-derived --color-accent for now-playing indicators), and a
-// per-track "⋯" action sheet on playlist rows (Favorite/Add/Go to Artist/Album).
-// v169: style consolidation — rounded-lg/xl radii sweep (playlist hero art),
-// one frosted recipe for all popups/sheets, unified sticky frosted headers
-// (Library gets one), skeleton loaders replace "Loading…" text, "Browse all"
-// page lead + in-search Browse button, "What do you want to play?" placeholder.
-// v170: Home shelves get Show all (row ⇄ wrapping grid) + uppercase eyebrow
-// kickers; New-playlist creation on the phone (Library "+" → name sheet) and
-// desktop sidebar "+"; sidebar library sorts by recently played; sheets frosted.
-// v196: design cohesion — Spotify-style hover Play button on every album/artist/
-// playlist card (search results, "fans also like", artist/album pages), Library
-// cards unified to the borderless halo language; keyboard-safe (the nested play
-// button no longer double-fires the card's open action).
-// v197: Tier 2 cohesion — shared token sheet (shared/ui.ts) now drives the modal
-// sheets, scrims, and popover menus (CastPicker, ContextMenu, sleep-timer, search
-// sheets/dropdowns) so they converge on one frosted recipe.
-// v198: Tier 3 signature swings — artwork tint on progress fills / active queue
-// rows / mini-bar glow while playing; one shared ambient hero wash on every
-// detail page; one house easing curve (+ desktop reduce-motion); reserved beet
-// ignition pulse on "My station".
-// v199: phone cohesion — persistent frosted bottom nav on every screen (search /
-// browse drill-ins now render as pages under the chrome, not cover-everything
-// sheets); ~50 recipe swaps routing every phone sheet/button/input/callout/eyebrow
-// through the token sheet; collage-playlist hero tint; unified genre tiles;
-// condensed sticky header on playlist scroll; 16px inputs (no iOS focus-zoom).
-// v200: detail-page consistency — catalog album/playlist drill-ins from Home now
-// cover the greeting + show the back chevron (z-fix) and the Home tab pops them;
-// library + catalog detail pages share ONE treatment: floating back over a
-// full-bleed hero that frosts+condenses on scroll, and one white play circle.
-// v201: connection banner — a floating frosted pill above the mini-bar tells
-// "you're offline" (no internet) apart from "can't reach your library" (home
-// server asleep/off) and pulses "back online" once the server returns; the
-// Player's 2s heartbeat now doubles as the liveness probe.
-// v202: banner docks onto the mini-player as a state-tinted header (fused into
-// one card) when a track is playing; standalone tinted card above the nav when
-// nothing plays. Fewer floating islands; reads as an alert, not a nav pill.
-// v203: friendly errors — every action that used to dump a raw exception string
-// ("TypeError: Failed to fetch", "import album failed (500)") now shows a clean
-// message; write mutations get an abort timeout so a dead host fails fast.
-// v204: play-gating — non-downloaded tracks can't stream without the hub, so
-// their Play controls now DIM + go inert while the desktop is unreachable
-// (the connection banner explains why) instead of failing on tap. Downloaded
-// tracks and the queue are unaffected.
-// v205: write-gating — hub-write buttons (rename / delete / make-offline / new
-// playlist / add album to library) disable + dim when the desktop is
-// unreachable, so they can't be tapped into a failure. Local actions (queue,
-// evict, sort/pin) stay enabled offline.
-// v206: playlist header — match desktop. Rename moves onto the title tap and
-// Delete moves into the action row, so the sticky/condensed bar is just back +
-// title + play (no persistent edit/delete icons crowding the top bar).
-// v207: playlist hero redesign (Apple-Music/Spotify-inspired) — large centered
-// cover floating on the artwork wash, centered title/meta, actions as a
-// centered row of frosted circles (shuffle · play · offline · delete); rows
-// drop the number gutter + duration column and bold their titles; the offline
-// toggle compacts to an icon circle (progress detail stays in the banner).
-// v208: same hero on the CATALOG album + playlist drill-in pages (phone only —
-// the shared AlbumDetailModal now renders the centered hero when !inline, and
-// leaves the desktop side-by-side header byte-identical).
-// v209: catalog track rows match the library playlist on phone — flex row (art
-// · title · download) with the #/Album/Time columns + column header hidden
-// (sm:grid restores the full desktop table). Desktop unchanged.
-// v220: profile-switch fix — the API cache key kept only origin+pathname, so
-// every profile's /api/playlists collapsed onto one entry and switching users
-// flashed the previous profile's playlists before revalidating. The key now
-// preserves profile_id (token still stripped), so each profile caches its own.
-// v221: catalog album + Deezer playlist track rows get the library page's
-// swipe gestures (→ Queue, ← Save) with a confirmation toast, across Search,
-// Home, and Browse; the per-song ⋯ sheet now also appears on Home/Browse-opened
-// catalog pages (was Search-only). Desktop unchanged.
-// v222: "Liked Songs" is now "Favorites" everywhere — the star toggle, the
-// playlist name, and all copy (menus / toasts / labels) standardize on the
-// Apple-style Favorites metaphor; the ♥ placeholder glyph becomes ★.
-// v223: Home freshness N0+N1 — the client mints a per-visit nonce that the
-// server folds into its shelf-selection seed, so each visit deals a different
-// slice of the day's cached discovery pools; served discovery items are now
-// impression-logged server-side.
-// v224: N0+N1 review fixes — the visit nonce is now held in sessionStorage
-// (stable per session; only pull-to-refresh re-mints) so returning to Home no
-// longer reshuffles the feed under the user; server keeps impression last_shown
-// monotonic across clock rollbacks.
-// v225: Home freshness N6+N7 — honest "Updated …" caption from the real
-// discovery-pool age, "New" ribbon tightened to 30 days, and the phone refreshes
-// Home on foreground-return / day rollover (30-min staleness guard). (N2-N5 were
-// server-only: recency-weighted + widened + rotated seed pools, impression
-// discounting, exploration slots, and per-visit shelf-lineup selection.)
-// v226: "Made for you" rail (P2) — the Play-My-Beetbot button + Deep/Fresh
-// chips are replaced by a portrait tile rail carrying two station tiles
-// (My station = for-you, Discovery station = fresh); the beet-ignite glow
-// moves onto the My-station tile.
-// v227: rail mix tiles + mix page (P3) — the daily mixes (artist / genre /
-// decade) now render as collage tiles in the rail (not rows), and tapping one
-// opens a mix detail page (Play/Shuffle, tracklist) via the shared album page.
-// v228: spotlight band (P4) — the server marks one discovery shelf per visit as
-// `display:'spotlight'`; the client renders it mid-feed as a full-width band
-// (artwork + title + description + Play) instead of a row.
-// v229: desktop mix page (P5) — desktop gains the rail mix tiles + a
-// history-compliant inline mix page (Back/Forward replay). Phone behavior is
-// unchanged; this bump is only because the shared HomeScreen bundle changed.
-// v230: rail polish — drop scroll-snap (it ate the left padding, so tiles sat
-// flush to the edge); tile play buttons now match the album-card button (white
-// circle, bottom-right, shadow, hover-reveal on desktop); station tiles gain
-// collage cover art + a play button under a branded wash.
-// v231: album-card plays backfill Now-Playing art; desktop Home drill-ins (mix
-// page + catalog playlist) are history-compliant + scroll to top on open.
-// v232: desktop shell restyle — transparent header (no hard line), sidebar +
-// main as rounded cards below the header. Shared-component changes are all
-// desktop-gated (inline/pageMode/overlayMode), so phone behavior is unchanged.
-// v233: carry the Home-card batch to the phone — "Favorites" rename (star),
-// swipe-to-queue/save on catalog rows, Deezer playlist title/hover parity +
-// hover play, and the Spotify-style persistent now-playing play/pause across
-// album/playlist/song/artist cards + the hero banners (blurred-bg, no crop).
-// v234: Home rows + the "Made for you" rail get the same desktop hover ‹ ›
-// scroll arrows as the artist page (shared ShelfRow). Desktop-only (sm:flex) —
-// the phone still swipes, so phone behavior is unchanged.
-// v235: album page reaches now-playing parity with the playlist page — the
-// current track highlights + shows equalizer bars, the hero + sticky Play
-// button reflect ⏸/▶ and toggle, rows highlight/reveal ▶ on hover, the
-// redundant hover "+" is dropped, and the row metrics match the playlist. The
-// now-playing wiring is desktop-gated (pageMode/inline), so phone rows are
-// unchanged; the shared roomier metrics only apply on the desktop full page.
-// v236: artist page reaches parity with the album/playlist pages — icon-only
-// pin (no "Pin" text), a condensed sticky header with a ⏸/▶ play button on
-// scroll, dynamic hero/Top-Songs/album-card play buttons (highlight + equalizer
-// on the current row, persistent pause on the playing album card), and the
-// album-card hover halo now matches the Home shelves. Desktop-gated (pageMode).
-// v237: fix the artist-page album carousels clipping that hover halo — the
-// scroller now uses py-4 + overflow-y-clip inside a -my-4 wrapper (mirroring the
-// Home shelves), so each card's -inset-3 highlight has vertical room instead of
-// being cut off top/bottom.
-// v238: Discover genre pages reach parity with the album/playlist pages — a
-// full-bleed hero with Play/Shuffle + a condensed sticky play bar (dynamic
-// ⏸/▶), the Top-songs/All-time track lists get now-playing highlight +
-// equalizer + a File badge, and every genre shelf uses the app-wide ShelfRow
-// (pill arrows + Home-style hover) instead of the old bespoke carousel.
-// v239: the "Add to playlist" picker no longer stretches to nearly the full
-// window (height capped) and its "Done" button is pinned as a footer so it
-// can't be scrolled off / clipped — the playlist list scrolls inside the body.
-// v240: catalog track rows drop the bare hover "+" for a ⋯ overflow menu (genre
-// pages) and show a small white ✓ next to Time only for songs already in a
-// playlist (album / artist / genre) — click it to manage (opens the add-to-
-// playlist picker, pre-checked). Adding now lives in the ⋯ menu.
-// v241: genre track lists match the playlist page more closely — the Time
-// column header reads "Time" (was a clock icon), and the now-playing / hover
-// play indicator lives in the # gutter (equalizer while playing, ▶ on hover)
-// instead of over the cover, so the cover stays plain art like the playlist.
-// v242: playlist "#" column header is centered to line up with the row numbers;
-// genre track rows adopt the playlist's larger type (text-base title, text-sm
-// artist/album/time on desktop) so they read the same weight/size.
-// v243: Browse declutter — drop the "BEETBOT" wordmark stamped on covers, drop
-// "Playlist · N songs" card subtitles (creator-only), drop the genre hero's
-// "Top songs, albums & artists" filler, tighten section titles ("Top songs",
-// "Popular playlists"), and make the global Browse page tiles-only (charts move
-// to Home + genre pages) — Spotify Search-landing style.
-// v244: Home loads faster — the feed is persisted per profile (localStorage)
-// so an app relaunch paints the last feed instantly (stale-while-revalidate,
-// no skeleton), and the server serves Home card art at 500×500 instead of
-// 1000×1000 (~4× fewer image bytes per feed; full-res stays everywhere else).
-// v249: catalog (Deezer) playlist pages now get now-playing awareness — the
-// playing row shows the equalizer bars in its # gutter and the hero Play button
-// toggles ⏸/▶ (was missing; wired isTrackCurrent/isPlaying/onTogglePlay through
-// PlaylistDetailModal to match the album + library playlist pages).
-const SHELL_CACHE = 'beetbot-shell-v252';
+// v320: home-screen / PWA icons regenerated full-bleed and opaque. The old
+// apple-touch-icon.png / icon-192 / icon-512 rasterized the crimson beet to
+// black (the gradient was lost) and kept transparent, pre-rounded corners, so
+// iOS drew a tiny dark beet inside a white frame. Bumping the shell cache
+// forces phones to re-fetch the corrected icons.
+// v321: Mix/catalog-playlist rows — now-playing cover overlay is phone-only
+// (sm:hidden); desktop keeps the indicator in the number gutter alone.
+// v322: real shuffle — one-pass permutation plan (no early repeats, honors
+// repeat all/off at pass end), history-aware prev, shuffle-aware crossfade
+// + prefetch via peekNextIndex.
+// v323: consistency fixes — search Songs tab now-playing indicator, library
+// search rows gate on canPlayNow (live-streamable songs no longer dimmed).
+// v324: Up next tells the truth under shuffle — queue UIs display the plan
+// order and drag-reorder edits the plan.
+// v325: hero secondary-button hovers unified to circles; Fisher-Yates for the
+// artist-page + taste-picks shuffles.
+// v326: cast streamed (non-downloaded) tracks — warm the /live temp file,
+// then hand the Chromecast the seekable URL (Preparing… state while cold).
+// v327: Connect polish — device-agnostic icon, sheet reflects remote-playing
+// device, remote 'playing on…' banner docked to the bottom (no longer over Home).
+// v350: Now Playing rework — Connect + Queue moved to the header corners,
+// lyrics became a peeking preview card with its own full-screen reading view.
+// Nav is cache-first, so without this bump a phone would render the previous
+// HTML (and its old bundle hash) for one more launch before picking any of it
+// up. Bumping reaps the stale shell cache and lands the new build on the next
+// open. Audio + API caches are untouched — offline tracks survive.
+// v351: safe-area fixes for the same sheet (dead strip under the lyrics card,
+// peek collapsing on inset screens). Re-bumped rather than riding v350: a
+// phone that already installed v350 precached the build before these fixes,
+// and would otherwise need a second launch to see them.
+// v352: the remote device's Now Playing screen gets the lyrics card too.
+// v353: remote device screen gains a Queue button + that device's Up next.
+// v354: cover stays square when its box is shorter than it is wide.
+// v355: swipe-down-to-dismiss on the remote device Now Playing screen.
+// v356: devices sheet locks background scroll while it's up.
+// v357: flat 48px lyrics peek; devices screen artwork matches the local sheet.
+// v358: TEMPORARY viewport probe for the standalone bottom-bar question.
+// v359: drop the deprecated black-translucent status bar. On a home-screen
+// app it cost 62pt of dead black space at the bottom of the screen.
+// v360: status-bar strip follows the screen's own colour (theme-color).
+// v362: wash starts at black so it meets the OS status-bar strip cleanly.
+// v363: 100vh root + black-translucent restored — wash behind the status bar
+// without the bottom bar. Probe re-added for one verification pass.
+// v364: viewport confirmed full-screen on device; diagnostic probe removed.
+// v365: phone Queue button draws the desktop's queue mark.
+// v366: favourite the track playing on another device from its screen.
+// v367: remote device screen gets the ⋯ menu; heartbeat carries the album.
+// v368: a library write now evicts the cached playlist reads it invalidates.
+// v369: remote clock no longer jumps forward the moment playback starts.
+// v370: re-probe the hub on pageshow/focus so a resumed PWA clears a stale
+// 'can't reach your library' instead of needing a full relaunch.
+// v371: MUST BE BUMPED — a phone that reached Beetbot from outside while the
+// host was asleep may have the remote-access service's "computer is asleep"
+// placeholder cached as the app shell. It used to arrive as a 200, and this
+// worker cached any 200 navigation as the shell (see isRealShell), so
+// cache-first navigation then served the placeholder on every launch no matter
+// what the computer was doing. Bumping reaps the poisoned entry, which is the
+// only way an already-affected phone recovers.
+const SHELL_CACHE = 'beetbot-shell-v371';
 // Bump the cache name to invalidate everything ever cached at v1. The
 // v1 cache held m4a files downloaded before we started embedding album
 // art via ffmpeg post-process — those old bytes have no `covr` atom,
@@ -367,7 +128,7 @@ const OFFLINE_FALLBACK_HTML = `<!doctype html>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
-  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black" />
   <meta name="theme-color" content="#0a0a0a" />
   <title>Beetbot — offline</title>
   <style>
@@ -397,6 +158,31 @@ const OFFLINE_FALLBACK_HTML = `<!doctype html>
  * after a SHELL_CACHE bump would have HTML in cache but no
  * JS/CSS, and the page would render white.
  */
+/**
+ * Is this response actually Beetbot, or something standing in for it?
+ *
+ * THE BUG THIS FIXES. When Beetbot is reached from outside over a remote-access
+ * service and the host computer is asleep, it is not Beetbot that answers — the
+ * service in front returns its own "this computer is asleep" placeholder. Those
+ * used to arrive as a 200, and this worker cached any 200 navigation as the app
+ * shell, so the placeholder was stored AS Beetbot. Navigation is cache-first
+ * (deliberately, for the reason given at that handler), so every later launch
+ * rendered the placeholder instantly from cache regardless of what the computer
+ * was doing. On an iPhone home-screen app that meant reloading and reopening
+ * several times before the real app came back.
+ *
+ * `res.ok` is the whole rule: a placeholder for an unreachable origin is a
+ * non-2xx (503), and so is any other sensible error page. Nothing about which
+ * service is in front is assumed, because Beetbot does not know or care — it
+ * only knows what Beetbot itself sounds like.
+ *
+ * `type === 'basic'` stays: an opaque cross-origin response has no readable body
+ * or status, so caching one as the shell would store a black box.
+ */
+function isRealShell(res) {
+  return Boolean(res && res.ok && res.type === 'basic');
+}
+
 function extractAssetUrls(html) {
   const urls = [];
   // <script src="..."> — including type="module" Vite emits.
@@ -519,7 +305,7 @@ self.addEventListener('fetch', (event) => {
         const cached = await cache.match('/');
         const revalidate = fetch(req)
           .then((fresh) => {
-            if (fresh && fresh.status === 200 && fresh.type === 'basic') {
+            if (isRealShell(fresh)) {
               cache.put('/', fresh.clone()).catch(() => {});
             }
             return fresh;
@@ -556,7 +342,7 @@ self.addEventListener('fetch', (event) => {
       const cached = await cache.match(req);
       const fetched = fetch(req)
         .then((res) => {
-          if (res && res.status === 200 && res.type === 'basic') {
+          if (isRealShell(res)) {
             cache.put(req, res.clone()).catch(() => {});
           }
           return res;
@@ -591,7 +377,7 @@ async function handleApiFetch(req, url) {
   // fresh on every successful online visit.
   const networkPromise = fetch(req)
     .then((res) => {
-      if (res && res.status === 200 && res.type === 'basic') {
+      if (isRealShell(res)) {
         apiCache.put(strippedUrl, res.clone()).catch(() => {});
       }
       return res;
@@ -660,66 +446,3 @@ async function sliceRangeResponse(cachedResponse, rangeHeader) {
     headers,
   });
 }
-
-// -- message channel -----------------------------------------------------
-//
-// The page side talks to the SW via postMessage so the SW can manage cache
-// entries by canonical (stripped) URL.
-
-self.addEventListener('message', (event) => {
-  const msg = event.data;
-  if (!msg || typeof msg !== 'object') return;
-  const reply = (data) => {
-    if (event.ports && event.ports[0]) event.ports[0].postMessage(data);
-  };
-  switch (msg.type) {
-    case 'cache-track': {
-      // Caller pre-fetched the response and provides token-stripped URL.
-      // Most callers should use the page-side helper which does this for
-      // them; this message is mostly for symmetry.
-      event.waitUntil(
-        (async () => {
-          try {
-            const res = await fetch(msg.tokenedUrl);
-            if (!res.ok) throw new Error(`fetch ${res.status}`);
-            const audioCache = await caches.open(AUDIO_CACHE);
-            await audioCache.put(msg.strippedUrl, res);
-            reply({ ok: true });
-          } catch (e) {
-            reply({ ok: false, error: String(e) });
-          }
-        })(),
-      );
-      return;
-    }
-    case 'evict-track': {
-      event.waitUntil(
-        (async () => {
-          const audioCache = await caches.open(AUDIO_CACHE);
-          const removed = await audioCache.delete(msg.strippedUrl);
-          reply({ ok: true, removed });
-        })(),
-      );
-      return;
-    }
-    case 'evict-all-audio': {
-      event.waitUntil(
-        (async () => {
-          await caches.delete(AUDIO_CACHE);
-          reply({ ok: true });
-        })(),
-      );
-      return;
-    }
-    case 'list-cached-audio': {
-      event.waitUntil(
-        (async () => {
-          const audioCache = await caches.open(AUDIO_CACHE);
-          const keys = await audioCache.keys();
-          reply({ ok: true, urls: keys.map((r) => r.url) });
-        })(),
-      );
-      return;
-    }
-  }
-});

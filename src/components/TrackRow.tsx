@@ -2,7 +2,8 @@ import { PreviewRing } from '@shared/components/SearchScreen';
 import { EqualizerBars } from '@shared/components/EqualizerBars';
 import { formatDuration } from '@/lib/format';
 import { canStream, usePlayerStore } from '@/lib/store';
-import type { PlaylistTrack } from '@/lib/tauri';
+import { useTrackDownload } from '@/lib/downloads';
+import { ipc, type PlaylistTrack } from '@/lib/tauri';
 
 interface Props {
   track: PlaylistTrack;
@@ -98,6 +99,9 @@ export function TrackRow({
   // the number returns (the row + number keep their highlight), instead of a
   // static play glyph.
   const audible = usePlayerStore((s) => s.isPlaying);
+  // Live download state for this row (undefined unless a download is running).
+  // Always false on the open-core/OSS build — nothing ever starts a download.
+  const dl = useTrackDownload(track.id);
   // Artist name(s) → clickable links (navigate to that artist), stopping
   // propagation so they don't also trigger the row's play. Plain text otherwise.
   const renderArtists = () => {
@@ -267,7 +271,12 @@ export function TrackRow({
           </div>
         ))}
       <div className="min-w-0">
-        <div className="truncate font-medium" title={track.title}>
+        <div
+          // Accent tint on the current track's title — the app-wide now-playing
+          // convention (every catalog list + both queues); this row predated it.
+          className={`truncate font-medium ${isPlaying ? 'text-accent' : ''}`}
+          title={track.title}
+        >
           {track.title}
         </div>
         <div className="truncate text-sm text-neutral-500" title={track.artists.join(', ')}>
@@ -305,8 +314,41 @@ export function TrackRow({
           the "File" header (not an orphaned column to the right). */}
       <div className="grid place-items-start">
         <span className="grid h-7 w-7 place-items-center">
-          {hasFile ? (
-            <DownloadedBadge />
+          {dl && dl.phase !== 'failed' ? (
+            // A download is in flight (full build only) — spinner + % if known.
+            <span
+              className="grid h-full w-full place-items-center text-neutral-300"
+              title={
+                dl.percent != null
+                  ? `Downloading ${Math.round(dl.percent)}%`
+                  : 'Downloading…'
+              }
+              aria-label="Downloading"
+            >
+              <svg className="h-4 w-4 animate-spin" viewBox="0 0 24 24" fill="none" aria-hidden>
+                <circle cx="12" cy="12" r="9" stroke="currentColor" strokeOpacity="0.25" strokeWidth="3" />
+                <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
+              </svg>
+            </span>
+          ) : hasFile ? (
+            track.local_path ? (
+              // Downloaded with a real file on THIS device — click reveals it.
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  void ipc.revealInFinder(track.local_path!).catch(() => {});
+                }}
+                className="grid h-full w-full place-items-center rounded text-neutral-500 transition hover:bg-neutral-800 hover:text-neutral-200"
+                title="Show in Finder"
+                aria-label="Show downloaded file in Finder"
+              >
+                <DownloadedBadge />
+              </button>
+            ) : (
+              // 'downloaded' status but no local file on this device — indicator only.
+              <DownloadedBadge />
+            )
           ) : (
             <button
               type="button"

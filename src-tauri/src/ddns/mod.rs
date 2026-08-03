@@ -29,8 +29,6 @@ use rusqlite::{Connection, params};
 // threat model is acceptable: anyone with read access to library.db
 // already has the user's full music library, so adding one more secret to
 // the same trust boundary doesn't weaken anything.
-pub const KEYCHAIN_SERVICE: &str = "Beetbot";
-pub const KEYCHAIN_USER: &str = "ddns_token";
 const SETTING_TOKEN: &str = "ddns_token";
 
 #[derive(Debug, thiserror::Error)]
@@ -49,6 +47,9 @@ pub enum DdnsError {
 
 #[async_trait]
 pub trait DdnsProvider: Send + Sync {
+    /// Provider identifier. Part of the trait surface + exercised by tests, even
+    /// though no production path prints it yet.
+    #[allow(dead_code)]
     fn name(&self) -> &'static str;
     /// Push `ip` to the provider. On success the returned String is the
     /// public hostname now pointing at it (e.g. `example.duckdns.org`).

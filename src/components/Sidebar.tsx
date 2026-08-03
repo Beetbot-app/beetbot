@@ -1,14 +1,40 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Wordmark } from '@shared/components/Wordmark';
 import { ipc, type PlaylistSummary } from '@/lib/tauri';
 import { isPinned, pinId, usePinStore, type Pin } from '@/lib/pins';
+import { useSavedStore, savedArtistId, type SavedArtist } from '@/lib/saved';
+import { hasRealPortrait, isReplaceableArt, pickArtistForName } from '@shared/artistName';
 import { ContextMenu, MenuGlyphs, type MenuState } from '@shared/components/ContextMenu';
 import { useNavStore } from '@/lib/nav';
 import { usePlayerStore } from '@/lib/store';
 import { useSession } from '@/lib/session';
-import { createPlaylist, sortPlaylistsByRecent } from '@shared/api';
+import {
+  createPlaylist,
+  getRecentlyPlayedPlaylists,
+  searchCatalog,
+} from '@shared/api';
 import logoUrl from '../assets/logo.svg';
+import { useRecentlyPlayedVersion } from '@shared/useRecentPlaylists';
 
 const COLLAPSE_KEY = 'beetbot.sidebar_collapsed';
+
+/** One row in the sidebar library list — a playlist/album or a saved artist.
+ *  `recency`/`liked` are sort keys; the payload drives rendering + the menu. */
+type SidebarRow =
+  | {
+      kind: 'playlist';
+      key: string;
+      recency: number;
+      liked: boolean;
+      playlist: PlaylistSummary;
+    }
+  | {
+      kind: 'artist';
+      key: string;
+      recency: number;
+      liked: false;
+      artist: SavedArtist;
+    };
 
 function readCollapsed(): boolean {
   try {
@@ -33,7 +59,6 @@ export function Sidebar({
   currentPlaylistId,
   refreshSignal,
   profileId,
-  floating = false,
 }: {
   /** Current top-level view name (so the matching item highlights). */
   active: string;
@@ -45,19 +70,22 @@ export function Sidebar({
   refreshSignal: unknown;
   /** Active profile — scopes the library to this user. */
   profileId: number;
-  /** Floating-shell layout: render as a rounded, gap-separated panel instead
-   *  of a flush bar with a hard right divider. */
-  floating?: boolean;
 }) {
   const [playlists, setPlaylists] = useState<PlaylistSummary[] | null>(null);
   const [collapsed, setCollapsed] = useState<boolean>(readCollapsed);
   const [filter, setFilter] = useState('');
   const [filterOpen, setFilterOpen] = useState(false);
-  // Spotify-style library type filter: All / Playlists / Albums. Albums are
-  // whole-album imports (source==='album'); everything else is a playlist.
-  const [typeFilter, setTypeFilter] = useState<'all' | 'playlist' | 'album'>(
-    'all',
-  );
+  // Spotify-style library type filter: All / Playlists / Albums / Artists.
+  // Albums are whole-album imports (source==='album'); Artists are saved
+  // artists (Library › Artists); everything else is a playlist.
+  const [typeFilter, setTypeFilter] = useState<
+    'all' | 'playlist' | 'album' | 'artist'
+  >('all');
+  // Saved artists live in the library too, so they show in this list (and get
+  // their own filter chip). Same per-profile KV store the Library tab uses.
+  const savedArtists = useSavedStore((s) => s.artists);
+  const removeSavedArtist = useSavedStore((s) => s.removeArtist);
+  const setArtwork = useSavedStore((s) => s.setArtwork);
 
   useEffect(() => {
     try {
@@ -88,27 +116,149 @@ export function Sidebar({
     () => !!playlists && playlists.some((p) => p.source === 'album'),
     [playlists],
   );
+  const hasArtists = savedArtists.length > 0;
 
-  const visible = useMemo(() => {
+  // Unified library list: playlists + saved artists, filtered by the type chip
+  // and search, then ordered recently-touched-first (playlist play-recency /
+  // artist save-time) with Liked Songs pinned to the very top. Ordering matches
+  // the old playlist-only sort for playlists, with artists interleaved by when
+  // they were saved.
+  const recentsVersion = useRecentlyPlayedVersion();
+  const visible = useMemo<SidebarRow[] | null>(() => {
     if (!playlists) return null;
     const f = filter.trim().toLowerCase();
-    const filtered = playlists.filter((p) => {
-      if (typeFilter === 'album' && p.source !== 'album') return false;
-      if (typeFilter === 'playlist' && p.source === 'album') return false;
-      if (f && !p.name.toLowerCase().includes(f)) return false;
-      return true;
+    const recents = getRecentlyPlayedPlaylists();
+    const rows: SidebarRow[] = [];
+    if (typeFilter !== 'artist') {
+      for (const p of playlists) {
+        if (typeFilter === 'album' && p.source !== 'album') continue;
+        if (typeFilter === 'playlist' && p.source === 'album') continue;
+        if (f && !p.name.toLowerCase().includes(f)) continue;
+        rows.push({
+          kind: 'playlist',
+          key: `p:${p.id}`,
+          recency: recents.get(p.id) ?? 0,
+          liked: p.source === 'liked',
+          playlist: p,
+        });
+      }
+    }
+    if (typeFilter === 'all' || typeFilter === 'artist') {
+      for (const a of savedArtists) {
+        if (f && !a.name.toLowerCase().includes(f)) continue;
+        rows.push({
+          kind: 'artist',
+          key: `a:${a.key}`,
+          recency: a.savedAt ?? 0,
+          liked: false,
+          artist: a,
+        });
+      }
+    }
+    rows.sort((x, y) => {
+      if (x.liked !== y.liked) return x.liked ? -1 : 1;
+      return y.recency - x.recency;
     });
-    // Recently-played first (same recency signal as Home/mobile Library),
-    // with Liked Songs pinned to the very top, Spotify-style.
-    return sortPlaylistsByRecent(filtered).sort(
-      (a, b) =>
-        (a.source === 'liked' ? 0 : 1) - (b.source === 'liked' ? 0 : 1),
-    );
-  }, [playlists, filter, typeFilter]);
+    return rows;
+  // `recentsVersion` isn't read in the body on purpose: it's the signal that the
+  // hub's shared recency merged in. Dropping it would silently stop the other
+  // device's plays from ever reordering this list.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [playlists, savedArtists, filter, typeFilter, recentsVersion]);
 
   // "+" new playlist — inline name row (Apple/Spotify-style), then jump into
   // the fresh playlist. Uses the same create path as the add-to-playlist modal.
   const { token: sessionToken } = useSession();
+
+  // Portrait backfill: artists saved via the bulk "Add from your songs" seed (or
+  // onboarding) carry an ALBUM cover, not the artist's photo — so they'd mismatch
+  // their own page. Resolve the real Deezer portrait and cache it back into the
+  // store, so the sidebar + Library tab match the artist page.
+  //
+  // Three subtleties, all learned the hard way:
+  //   • Match by NAME + FANS, don't just take result [0]. Deezer's artist search
+  //     ranks by relevance, not popularity, and floods same-name impostors and
+  //     portrait-less phantom credits ahead of the real act (a 50-fan "Drake"
+  //     and "Marshmello & Omar LinX" outrank the real ones) — so [0] caches the
+  //     wrong, often portrait-less, entity. `pickArtistForName` fixes this.
+  //   • Re-run for records stuck on a stand-in image — a blank or album cover.
+  //   • ONE-TIME re-resolve of EVERY saved artist per profile (the `v2` flag),
+  //     because an earlier result-[0] pass may have cached an impostor's own
+  //     portrait — which looks like a valid portrait by URL, so the stand-in
+  //     check alone can't catch it. Storing only a real portrait or null means
+  //     this converges and never loops.
+  const backfillTried = useRef<Set<string>>(new Set());
+  const backfillProfile = useRef<number | null>(null);
+  useEffect(() => {
+    if (!sessionToken) return;
+    const profileId = useSavedStore.getState().profileId;
+    // Fresh "tried" set per profile — the effect re-fires as it writes art (and
+    // on profile switch), and this both prevents re-query loops within a profile
+    // and stops one profile's attempts from suppressing another's.
+    if (backfillProfile.current !== profileId) {
+      backfillProfile.current = profileId;
+      backfillTried.current = new Set();
+    }
+    const v2Key = profileId != null ? `beetbot.portraits.v2.${profileId}` : null;
+    let v2Done = true;
+    try {
+      v2Done = !v2Key || localStorage.getItem(v2Key) === '1';
+    } catch {
+      /* storage blocked — behave as if the one-time pass already ran */
+    }
+    const markV2Done = () => {
+      if (v2Key && !v2Done) {
+        try {
+          localStorage.setItem(v2Key, '1');
+        } catch {
+          /* ignore */
+        }
+      }
+    };
+    const pending = useSavedStore
+      .getState()
+      .artists.filter(
+        (a) =>
+          // v2 pass: everyone once. Afterwards: only stand-in (blank/cover) art.
+          (!v2Done || !a.portrait || isReplaceableArt(a.art)) &&
+          !backfillTried.current.has(savedArtistId(a.name)),
+      );
+    if (pending.length === 0) {
+      markV2Done();
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      for (const a of pending) {
+        if (cancelled) break;
+        backfillTried.current.add(savedArtistId(a.name));
+        try {
+          const res = await searchCatalog(a.name, sessionToken, 'artist', 8);
+          // Same relevance-not-popularity trap as onboarding: pick the real
+          // artist by name + fans, not Deezer's result [0].
+          const best = pickArtistForName(res.artists ?? [], a.name);
+          // Store a real portrait if we found one; else keep any real art we
+          // already had, else null — NEVER re-persist a blank/cover, so this
+          // can't loop.
+          const next = hasRealPortrait(best?.picture_url)
+            ? best!.picture_url
+            : hasRealPortrait(a.art)
+              ? a.art
+              : null;
+          if (!cancelled) setArtwork(a.name, next);
+        } catch {
+          /* leave unresolved → retried next session */
+        }
+      }
+      if (!cancelled) markV2Done();
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // `savedArtists` in deps so the pass runs once the list (and its profile)
+    // has loaded, and after a profile switch — not just on first mount. The
+    // `backfillTried` guard + v2 flag keep this from re-querying resolved names.
+  }, [sessionToken, setArtwork, savedArtists]);
   const [createOpen, setCreateOpen] = useState(false);
   const [createName, setCreateName] = useState('');
   const [creating, setCreating] = useState(false);
@@ -161,14 +311,9 @@ export function Sidebar({
 
   return (
     <aside
-      className={`${collapsed ? 'w-[72px]' : 'w-60'} ${
-        // Floating card sits BELOW the header now; the brand row's own pt-4 is
-        // the inner inset (no extra card padding). Legacy non-floating overlaps
-        // the absolute header → clear it (pt-14).
-        floating
-          ? 'rounded-2xl border border-white/10 overflow-hidden'
-          : 'border-r border-white/5 pt-14'
-      } shrink-0 h-full flex flex-col bg-neutral-950/40 backdrop-blur-2xl backdrop-saturate-150 transition-[width] duration-200`}
+      className={`group/side ${
+        collapsed ? 'w-[72px]' : 'w-60'
+      } rounded-2xl border border-white/10 overflow-hidden shrink-0 h-full flex flex-col bg-neutral-950/40 backdrop-blur-2xl backdrop-saturate-150 transition-[width] duration-200`}
     >
       {/* Anchor all content to a fixed-width column — the collapsed rail width
           when collapsed, the full width when expanded — pinned to the LEFT. As
@@ -206,7 +351,14 @@ export function Sidebar({
           </button>
         </div>
       ) : (
-        <div className="flex items-center justify-between px-3 pt-4 pb-1">
+        <div className="flex items-center px-3 pt-4 pb-1">
+          {/* Collapse toggle sits to the LEFT of the brand and stays hidden
+              until the sidebar is hovered — then it slides in from the left and
+              nudges the brand right (Spotify-style). Zero width when hidden, so
+              the logo starts flush-left with no reserved gap. */}
+          <div className="shrink-0 overflow-hidden transition-all duration-200 ease-out w-0 -translate-x-2 opacity-0 group-hover/side:w-8 group-hover/side:translate-x-0 group-hover/side:opacity-100">
+            <CollapseToggle collapsed={false} onClick={() => setCollapsed(true)} />
+          </div>
           {/* Expanded: the full brand lockup — the beet mark + the two-tone
               wordmark (cream "beet", crimson "bot") in the display serif.
               Collapsed drops back to the mark alone (above). */}
@@ -219,7 +371,6 @@ export function Sidebar({
             <Logo size={30} className="-translate-y-[3px]" />
             <Wordmark className="-ml-[2px]" />
           </div>
-          <CollapseToggle collapsed={false} onClick={() => setCollapsed(true)} />
         </div>
       )}
 
@@ -229,7 +380,7 @@ export function Sidebar({
       {/* Pinned (Daft-style) — shortcuts the user pinned from the library's
           right-click menus. Hidden until something is pinned. */}
       {pins.length > 0 ? (
-        <div className={collapsed ? 'mt-2 px-1' : 'mt-5 px-2'}>
+        <div className={collapsed ? 'mt-2 px-1' : 'mt-2 px-2'}>
           {!collapsed ? (
             // Same uppercase tracked eyebrow the content surfaces use for
             // section labels (Home's "BASED ON…"), so the sidebar sections
@@ -256,7 +407,7 @@ export function Sidebar({
       {/* Your Library — same quiet eyebrow style + indent as "Pinned", so the
           sidebar reads as one uniform list (Apple-style). Still clickable. */}
       {!collapsed ? (
-        <div className="mt-5 px-2">
+        <div className="mt-2 px-2">
           <div className="flex items-center justify-between gap-2 mb-1.5">
             <button
               type="button"
@@ -342,8 +493,8 @@ export function Sidebar({
               className="w-[calc(100%-1rem)] mx-2 mb-1 rounded-lg bg-neutral-900 border border-neutral-800 px-2.5 py-1.5 text-xs text-neutral-100 placeholder-neutral-600 focus:outline-none focus:border-neutral-400"
             />
           ) : null}
-          {hasAlbums ? (
-            <div className="flex items-center gap-1.5 px-2 mt-1 mb-3">
+          {hasAlbums || hasArtists ? (
+            <div className="flex items-center gap-1.5 px-2 mt-1 mb-3 flex-wrap">
               <TypeChip
                 label="Playlists"
                 active={typeFilter === 'playlist'}
@@ -351,13 +502,24 @@ export function Sidebar({
                   setTypeFilter((v) => (v === 'playlist' ? 'all' : 'playlist'))
                 }
               />
-              <TypeChip
-                label="Albums"
-                active={typeFilter === 'album'}
-                onClick={() =>
-                  setTypeFilter((v) => (v === 'album' ? 'all' : 'album'))
-                }
-              />
+              {hasAlbums ? (
+                <TypeChip
+                  label="Albums"
+                  active={typeFilter === 'album'}
+                  onClick={() =>
+                    setTypeFilter((v) => (v === 'album' ? 'all' : 'album'))
+                  }
+                />
+              ) : null}
+              {hasArtists ? (
+                <TypeChip
+                  label="Artists"
+                  active={typeFilter === 'artist'}
+                  onClick={() =>
+                    setTypeFilter((v) => (v === 'artist' ? 'all' : 'artist'))
+                  }
+                />
+              ) : null}
             </div>
           ) : null}
         </div>
@@ -383,88 +545,163 @@ export function Sidebar({
         ) : visible.length === 0 ? (
           !collapsed ? (
             <div className="px-2 py-1 text-xs text-neutral-600">
-              {filter.trim() ? 'No matches.' : 'No playlists yet.'}
+              {filter.trim()
+                ? 'No matches.'
+                : typeFilter === 'artist'
+                  ? 'No saved artists yet.'
+                  : 'No playlists yet.'}
             </div>
           ) : null
         ) : (
           <ul className="flex flex-col gap-0.5">
-            {visible.map((p) => (
-              <li key={p.id}>
-                <button
-                  type="button"
-                  onClick={() => onOpenPlaylist(p.id)}
-                  onContextMenu={(e) => {
-                    e.preventDefault();
-                    const pin: Pin = {
-                      kind: 'playlist',
-                      id: p.id,
-                      name: p.name,
-                      art: p.cover_url,
-                      source: p.source,
-                    };
-                    setMenu({
-                      x: e.clientX,
-                      y: e.clientY,
-                      items: [
-                        {
-                          label: isPinned(pins, pin)
-                            ? 'Unpin from sidebar'
-                            : 'Pin to sidebar',
-                          icon: MenuGlyphs.pin,
-                          onClick: () => togglePin(pin),
-                        },
-                      ],
-                    });
-                  }}
-                  className={`w-full flex items-center px-2 py-1.5 rounded-lg text-left transition ${
-                    collapsed ? 'justify-center' : 'gap-3'
-                  } ${
-                    currentPlaylistId === p.id
-                      ? 'bg-neutral-900'
-                      : 'hover:bg-neutral-900'
-                  }`}
-                  title={p.name}
-                >
-                  <div
-                    className={`h-10 w-10 shrink-0 rounded overflow-hidden grid place-items-center ${
-                      currentPlaylistId === p.id && collapsed
-                        ? 'ring-2 ring-white/60'
-                        : 'bg-neutral-800'
+            {visible.map((row) => {
+              // Saved artist row: round avatar, opens the artist page; the
+              // right-click menu removes it from the library or pins it.
+              if (row.kind === 'artist') {
+                const a = row.artist;
+                return (
+                  <li key={row.key}>
+                    <button
+                      type="button"
+                      onClick={() => openArtist(a.name)}
+                      onContextMenu={(e) => {
+                        e.preventDefault();
+                        const pin: Pin = {
+                          kind: 'artist',
+                          key: a.key,
+                          name: a.name,
+                          art: a.art,
+                        };
+                        setMenu({
+                          x: e.clientX,
+                          y: e.clientY,
+                          items: [
+                            {
+                              label: 'Remove from your library',
+                              icon: MenuGlyphs.check,
+                              onClick: () => removeSavedArtist(a.name),
+                            },
+                            {
+                              label: isPinned(pins, pin)
+                                ? 'Unpin from sidebar'
+                                : 'Pin to sidebar',
+                              icon: MenuGlyphs.pin,
+                              onClick: () => togglePin(pin),
+                            },
+                          ],
+                        });
+                      }}
+                      className={`w-full flex items-center px-2 py-1.5 rounded-lg text-left transition hover:bg-neutral-900 ${
+                        collapsed ? 'justify-center' : 'gap-3'
+                      }`}
+                      title={a.name}
+                    >
+                      <div className="h-10 w-10 shrink-0 rounded-full overflow-hidden grid place-items-center bg-neutral-800">
+                        {a.art ? (
+                          <img
+                            src={a.art}
+                            alt=""
+                            className="h-full w-full object-cover"
+                            draggable={false}
+                            loading="lazy"
+                          />
+                        ) : (
+                          <span className="text-neutral-600 text-xs">☺</span>
+                        )}
+                      </div>
+                      {!collapsed ? (
+                        <div className="min-w-0 flex-1">
+                          <div className="text-sm truncate text-neutral-200">
+                            {a.name}
+                          </div>
+                          <div className="text-[11px] text-neutral-500 truncate">
+                            Artist
+                          </div>
+                        </div>
+                      ) : null}
+                    </button>
+                  </li>
+                );
+              }
+              const p = row.playlist;
+              return (
+                <li key={row.key}>
+                  <button
+                    type="button"
+                    onClick={() => onOpenPlaylist(p.id)}
+                    onContextMenu={(e) => {
+                      e.preventDefault();
+                      const pin: Pin = {
+                        kind: 'playlist',
+                        id: p.id,
+                        name: p.name,
+                        art: p.cover_url,
+                        source: p.source,
+                      };
+                      setMenu({
+                        x: e.clientX,
+                        y: e.clientY,
+                        items: [
+                          {
+                            label: isPinned(pins, pin)
+                              ? 'Unpin from sidebar'
+                              : 'Pin to sidebar',
+                            icon: MenuGlyphs.pin,
+                            onClick: () => togglePin(pin),
+                          },
+                        ],
+                      });
+                    }}
+                    className={`w-full flex items-center px-2 py-1.5 rounded-lg text-left transition ${
+                      collapsed ? 'justify-center' : 'gap-3'
+                    } ${
+                      currentPlaylistId === p.id
+                        ? 'bg-neutral-900'
+                        : 'hover:bg-neutral-900'
                     }`}
+                    title={p.name}
                   >
-                    {p.cover_url ? (
-                      <img
-                        src={p.cover_url}
-                        alt=""
-                        className="h-full w-full object-cover"
-                        draggable={false}
-                        loading="lazy"
-                      />
-                    ) : (
-                      <span className="text-neutral-600 text-xs">
-                        {p.source === 'liked' ? '★' : '♪'}
-                      </span>
-                    )}
-                  </div>
-                  {!collapsed ? (
-                    <div className="min-w-0 flex-1">
-                      <div
-                        className={`text-sm truncate ${
-                          currentPlaylistId === p.id
-                            ? 'text-neutral-100'
-                            : 'text-neutral-200'
-                        }`}
-                      >
-                        {p.name}
-                      </div>
-                      <div className="text-[11px] text-neutral-500 truncate">
-                        {subtitleFor(p)}
-                      </div>
+                    <div
+                      className={`h-10 w-10 shrink-0 rounded overflow-hidden grid place-items-center ${
+                        currentPlaylistId === p.id && collapsed
+                          ? 'ring-2 ring-white/60'
+                          : 'bg-neutral-800'
+                      }`}
+                    >
+                      {p.cover_url ? (
+                        <img
+                          src={p.cover_url}
+                          alt=""
+                          className="h-full w-full object-cover"
+                          draggable={false}
+                          loading="lazy"
+                        />
+                      ) : (
+                        <span className="text-neutral-600 text-xs">
+                          {p.source === 'liked' ? '★' : '♪'}
+                        </span>
+                      )}
                     </div>
-                  ) : null}
-                </button>
-              </li>
-            ))}
+                    {!collapsed ? (
+                      <div className="min-w-0 flex-1">
+                        <div
+                          className={`text-sm truncate ${
+                            currentPlaylistId === p.id
+                              ? 'text-neutral-100'
+                              : 'text-neutral-200'
+                          }`}
+                        >
+                          {p.name}
+                        </div>
+                        <div className="text-[11px] text-neutral-500 truncate">
+                          {subtitleFor(p)}
+                        </div>
+                      </div>
+                    ) : null}
+                  </button>
+                </li>
+              );
+            })}
           </ul>
         )}
       </div>
@@ -582,24 +819,6 @@ function PinRow({
         </button>
       ) : null}
     </div>
-  );
-}
-
-/** The Beetbot wordmark — "beet" in cream + "bot" in beet-pop crimson, set in
- *  the brand display serif (Fraunces / Playfair Display, Georgia fallback),
- *  bold italic. Matches logo/beetbot-wordmark.svg. Shown only when the sidebar
- *  is expanded; decorative, so hidden from assistive tech (the app is labelled
- *  elsewhere). */
-function Wordmark({ className }: { className?: string }) {
-  return (
-    <span
-      aria-hidden
-      className={`select-none text-[24px] font-extrabold italic leading-none tracking-[-0.03em] ${className ?? ''}`}
-      style={{ fontFamily: '"Fraunces", "Playfair Display", Georgia, serif' }}
-    >
-      <span style={{ color: '#F7EDF0' }}>beet</span>
-      <span style={{ color: '#FF3D7F' }}>bot</span>
-    </span>
   );
 }
 

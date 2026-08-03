@@ -1,7 +1,15 @@
-import { useEffect, useState } from 'react';
-import { getProfiles, profileAvatarUrl, type Profile } from '@shared/api';
+import { useEffect, useRef, useState } from 'react';
+import {
+  deleteProfile,
+  getProfiles,
+  profileAvatarUrl,
+  type Profile,
+} from '@shared/api';
 import { cn, BAR } from '@shared/ui';
 import { Group, Row, Toggle } from '@shared/components/SettingsKit';
+import { SharingPeoplePanel } from '@shared/components/SharingPeoplePanel';
+import { InstallSheet } from './InstallSheet';
+import { isStandalone } from '../lib/install';
 import { usePlayerStore } from '../store';
 
 /**
@@ -17,12 +25,15 @@ export function SettingsScreen({
   profileId,
   onBack,
   onSwitchProfile,
+  onOpenStats,
   onDisconnect,
 }: {
   token: string;
   profileId: number | null;
   onBack: () => void;
   onSwitchProfile: () => void;
+  /** Open the listening-stats ("Wrapped") screen. */
+  onOpenStats: () => void;
   onDisconnect: () => void;
 }) {
   // The active profile's name + avatar, so Settings shows who you are. Fetched
@@ -30,8 +41,48 @@ export function SettingsScreen({
   // action buttons below still work (they don't need this).
   const [active, setActive] = useState<Profile | null>(null);
   const [avatarBroken, setAvatarBroken] = useState(false);
+  // Re-opening the home-screen instructions on demand, after the first-visit
+  // sheet has been dismissed.
+  const [showInstall, setShowInstall] = useState(false);
   const autoplay = usePlayerStore((s) => s.autoplay);
   const setAutoplay = usePlayerStore((s) => s.setAutoplay);
+  // Two-step delete: the first tap arms the button (with the real
+  // consequences spelled out), the second tap within the window commits.
+  // Steadier on a phone than a native confirm(), and impossible to trigger
+  // with a single stray touch.
+  const [deleteArmed, setDeleteArmed] = useState(false);
+  const [deleteBusy, setDeleteBusy] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const disarmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (disarmTimer.current) clearTimeout(disarmTimer.current);
+    },
+    [],
+  );
+
+  const handleDeleteProfile = async () => {
+    if (profileId == null || deleteBusy) return;
+    setDeleteError(null);
+    if (!deleteArmed) {
+      setDeleteArmed(true);
+      if (disarmTimer.current) clearTimeout(disarmTimer.current);
+      disarmTimer.current = setTimeout(() => setDeleteArmed(false), 6_000);
+      return;
+    }
+    setDeleteBusy(true);
+    try {
+      await deleteProfile(profileId, token);
+      // The profile is gone and the server unbound this session — hand the
+      // user back to "Who's listening?".
+      onSwitchProfile();
+    } catch (e) {
+      setDeleteError(e instanceof Error ? e.message : String(e));
+      setDeleteArmed(false);
+    } finally {
+      setDeleteBusy(false);
+    }
+  };
 
   useEffect(() => {
     let on = true;
@@ -75,6 +126,8 @@ export function SettingsScreen({
         <h1 className="text-xl font-bold tracking-tight">Settings</h1>
       </header>
 
+      {showInstall && <InstallSheet forced onClose={() => setShowInstall(false)} />}
+
       <div className="px-4 pt-5 pb-12">
         {/* Account — identity + switch profile */}
         <Group label="Account">
@@ -104,8 +157,24 @@ export function SettingsScreen({
               <p className="text-xs text-neutral-500">Listening on this device</p>
             </div>
           </div>
+          <Row divider label="Listening stats" chevron onClick={onOpenStats} />
           <Row divider label="Switch profile" chevron onClick={onSwitchProfile} />
         </Group>
+
+        {/* Add to home screen. Hidden once it already is — there is nothing left
+            to suggest, and offering it would read as "this didn't work". */}
+        {!isStandalone() && (
+          <Group
+            label="This device"
+            footer="Opens like an app, and keeps playing when your screen locks."
+          >
+            <Row
+              label="Add to home screen"
+              chevron
+              onClick={() => setShowInstall(true)}
+            />
+          </Group>
+        )}
 
         {/* Playback — the one preference the web player carries */}
         <Group
@@ -120,15 +189,40 @@ export function SettingsScreen({
           />
         </Group>
 
-        {/* Device — destructive, set apart */}
-        <Group footer="Profiles are created and edited in the Beetbot desktop app. Disconnecting asks for a pairing code next time.">
+        {/* Who else can open this server. Renders nothing unless the person
+            looking at it is the owner AND the host build supplies a sharing
+            provider — so a guest's phone shows no trace of it. Same panel the
+            desktop shows. */}
+        <SharingPeoplePanel />
+
+        {/* Destructive actions — set apart */}
+        <Group
+          footer={
+            deleteError ??
+            'Deleting removes this profile, its playlists and listening history from the Beetbot server — for every device. Profiles can also be managed in the desktop app. Disconnecting asks for a pairing code next time.'
+          }
+        >
           <button
             type="button"
-            onClick={onDisconnect}
-            className="w-full text-left text-sm font-medium text-red-400 active:opacity-70"
+            disabled={deleteBusy || profileId == null}
+            onClick={() => void handleDeleteProfile()}
+            className="w-full text-left text-sm font-medium text-red-400 active:opacity-70 disabled:opacity-50"
           >
-            Disconnect this device
+            {deleteBusy
+              ? 'Deleting…'
+              : deleteArmed
+                ? `Really delete ${active?.name ?? 'this profile'}? Tap again`
+                : 'Delete this profile'}
           </button>
+          <div className="mt-3 border-t border-white/10 pt-3">
+            <button
+              type="button"
+              onClick={onDisconnect}
+              className="w-full text-left text-sm font-medium text-red-400 active:opacity-70"
+            >
+              Disconnect this device
+            </button>
+          </div>
         </Group>
       </div>
     </div>

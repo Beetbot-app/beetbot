@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { cn, POPOVER } from '../ui';
+import { SLEEP_OPTIONS } from '../sleep';
 
 interface Props {
   /** Epoch-ms the timer fires at, or null. */
@@ -12,15 +13,6 @@ interface Props {
   placement?: 'top' | 'bottom';
   className?: string;
 }
-
-const OPTIONS: { label: string; value: 'off' | 'track' | number }[] = [
-  { label: 'Off', value: 'off' },
-  { label: 'End of track', value: 'track' },
-  { label: '15 minutes', value: 15 },
-  { label: '30 minutes', value: 30 },
-  { label: '45 minutes', value: 45 },
-  { label: '1 hour', value: 60 },
-];
 
 /**
  * Moon-icon button + popover for the sleep timer. Highlights when active and
@@ -60,10 +52,13 @@ export function SleepTimerButton({
         onClick={() => setOpen((v) => !v)}
         aria-label="Sleep timer"
         title="Sleep timer"
-        className={`h-8 min-w-8 px-1 grid place-items-center rounded-md transition ${
+        // rounded-lg + neutral-500 idle to match the neighboring chrome
+        // buttons (lyrics/queue/connect) — this one had drifted to rounded-md
+        // and a lighter idle tint.
+        className={`h-8 min-w-8 px-1 grid place-items-center rounded-lg transition ${
           active
             ? 'text-neutral-100 bg-white/10'
-            : 'text-neutral-400 hover:text-neutral-100 hover:bg-neutral-900'
+            : 'text-neutral-500 hover:text-neutral-200 hover:bg-neutral-900'
         }`}
       >
         {remainingMin != null && remainingMin > 0 ? (
@@ -103,7 +98,7 @@ export function SleepTimerButton({
             <div className="px-3 py-1.5 text-[10px] uppercase tracking-wide text-neutral-500">
               Sleep timer
             </div>
-            {OPTIONS.map((o) => {
+            {SLEEP_OPTIONS.map((o) => {
               const selected =
                 (o.value === 'track' && sleepAtTrackEnd) ||
                 (o.value === 'off' && !active);

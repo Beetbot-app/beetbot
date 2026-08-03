@@ -1,5 +1,4 @@
 import { create } from 'zustand';
-import { persist, createJSONStorage } from 'zustand/middleware';
 
 /**
  * Desktop audio-effects SETTINGS (Equalizer, Normalize, Mono).
@@ -12,6 +11,11 @@ import { persist, createJSONStorage } from 'zustand/middleware';
  * planned native Rust audio engine (~/Downloads/beetbot-native-audio-plan.md)
  * can drive them without rebuilding the UI. The Settings "Sound" group stays
  * hidden (SHOW_SOUND_FX in Settings.tsx) until that engine backs it.
+ *
+ * These are personal taste, so they persist PER PROFILE (a { [profileId]: fx }
+ * map): one listener's EQ/normalize shouldn't reshape everyone's sound. The
+ * active profile's slice is mirrored as reactive fields; `setProfile(id)` swaps
+ * it and is wired from App.tsx alongside the pins/saved/appearance stores.
  */
 
 export const EQ_BANDS = [
@@ -46,57 +50,152 @@ export const LOUDNESS_TARGET_LUFS: Record<Loudness, number> = {
   quiet: -19,
 };
 
-interface AudioFxState {
+/** The per-profile slice — the effect settings that follow each profile. */
+type FxPrefs = {
   eqEnabled: boolean;
   eqPreset: EqPreset;
   eqGains: number[];
   mono: boolean;
   normalize: boolean;
   loudness: Loudness;
+};
+const FX_DEFAULTS: FxPrefs = {
+  eqEnabled: false,
+  eqPreset: 'flat',
+  eqGains: [...EQ_PRESETS.flat],
+  mono: false,
+  normalize: false,
+  loudness: 'normal',
+};
+
+// One localStorage key holds a { [profileId]: FxPrefs } map; LEGACY_KEY is the
+// old global zustand-persist blob we migrate away from once.
+const FX_KEY = 'beetbot.desktop.audiofx.byProfile';
+const LEGACY_KEY = 'beetbot.desktop.audiofx';
+type ByProfile = Record<string, FxPrefs>;
+
+function loadMap(): ByProfile {
+  try {
+    return JSON.parse(localStorage.getItem(FX_KEY) || '{}') as ByProfile;
+  } catch {
+    return {};
+  }
+}
+function saveMap(map: ByProfile): void {
+  try {
+    localStorage.setItem(FX_KEY, JSON.stringify(map));
+  } catch {
+    /* storage may be blocked; the effects just won't survive a relaunch */
+  }
+}
+
+/** One-time upgrade: fold the old global effects blob into the owner's slot
+ *  (profile 1) so an update keeps the existing sound. Runs until FX_KEY exists. */
+function migrateLegacy(map: ByProfile): ByProfile {
+  if (localStorage.getItem(FX_KEY) != null) return map;
+  try {
+    const raw = localStorage.getItem(LEGACY_KEY);
+    if (raw) {
+      const blob = JSON.parse(raw) as { state?: Partial<FxPrefs> };
+      const st = (blob?.state ?? blob) as Partial<FxPrefs>;
+      map = {
+        ...map,
+        '1': {
+          eqEnabled: st.eqEnabled === true,
+          eqPreset: st.eqPreset ?? 'flat',
+          eqGains: Array.isArray(st.eqGains) ? [...st.eqGains] : [...EQ_PRESETS.flat],
+          mono: st.mono === true,
+          normalize: st.normalize === true,
+          loudness: st.loudness ?? 'normal',
+        },
+      };
+    }
+  } catch {
+    /* unreadable legacy blob → start clean */
+  }
+  saveMap(map);
+  return map;
+}
+
+let map = migrateLegacy(loadMap());
+
+function slice(id: number | null): FxPrefs {
+  return id == null ? FX_DEFAULTS : (map[String(id)] ?? FX_DEFAULTS);
+}
+
+interface AudioFxState extends FxPrefs {
+  /** Active profile whose effects are mirrored below (null before sign-in). */
+  profileId: number | null;
+  /** Load a profile's effect settings into the store. Called on every switch. */
+  setProfile: (id: number | null) => void;
   setEqEnabled: (v: boolean) => void;
   setEqPreset: (p: EqPreset) => void;
   setEqGain: (i: number, dB: number) => void;
   setMono: (v: boolean) => void;
   setNormalize: (v: boolean) => void;
   setLoudness: (l: Loudness) => void;
-  /** Turn every effect off and restore the flat/normal defaults. */
+  /** Turn every effect off and restore the flat/normal defaults (active profile). */
   reset: () => void;
 }
 
-export const useAudioFxStore = create<AudioFxState>()(
-  persist(
-    (set) => ({
-      eqEnabled: false,
-      eqPreset: 'flat',
-      eqGains: [...EQ_PRESETS.flat],
-      mono: false,
-      normalize: false,
-      loudness: 'normal',
-      setEqEnabled: (v) => set({ eqEnabled: v }),
-      setEqPreset: (p) =>
-        set(p === 'custom' ? { eqPreset: 'custom' } : { eqPreset: p, eqGains: [...EQ_PRESETS[p]] }),
-      setEqGain: (i, dB) =>
-        set((s) => {
-          const eqGains = [...s.eqGains];
-          eqGains[i] = dB;
-          return { eqGains, eqPreset: 'custom' };
-        }),
-      setMono: (v) => set({ mono: v }),
-      setNormalize: (v) => set({ normalize: v }),
-      setLoudness: (l) => set({ loudness: l }),
-      reset: () =>
-        set({
-          eqEnabled: false,
-          eqPreset: 'flat',
-          eqGains: [...EQ_PRESETS.flat],
-          mono: false,
-          normalize: false,
-          loudness: 'normal',
-        }),
-    }),
-    {
-      name: 'beetbot.desktop.audiofx',
-      storage: createJSONStorage(() => localStorage),
+export const useAudioFxStore = create<AudioFxState>()((set, get) => {
+  /** Write the current effect fields back to the active profile's slot. */
+  const persistActive = (next: FxPrefs) => {
+    const { profileId } = get();
+    if (profileId != null) {
+      map = { ...map, [String(profileId)]: next };
+      saveMap(map);
+    }
+  };
+  const current = (): FxPrefs => {
+    const s = get();
+    return {
+      eqEnabled: s.eqEnabled,
+      eqPreset: s.eqPreset,
+      eqGains: s.eqGains,
+      mono: s.mono,
+      normalize: s.normalize,
+      loudness: s.loudness,
+    };
+  };
+  return {
+    ...FX_DEFAULTS,
+    profileId: null,
+    setProfile: (id) => set({ profileId: id, ...slice(id) }),
+    setEqEnabled: (v) => {
+      set({ eqEnabled: v });
+      persistActive({ ...current(), eqEnabled: v });
     },
-  ),
-);
+    setEqPreset: (p) => {
+      const patch =
+        p === 'custom'
+          ? { eqPreset: 'custom' as EqPreset }
+          : { eqPreset: p, eqGains: [...EQ_PRESETS[p]] };
+      set(patch);
+      persistActive({ ...current(), ...patch });
+    },
+    setEqGain: (i, dB) => {
+      const eqGains = [...get().eqGains];
+      eqGains[i] = dB;
+      set({ eqGains, eqPreset: 'custom' });
+      persistActive({ ...current(), eqGains, eqPreset: 'custom' });
+    },
+    setMono: (v) => {
+      set({ mono: v });
+      persistActive({ ...current(), mono: v });
+    },
+    setNormalize: (v) => {
+      set({ normalize: v });
+      persistActive({ ...current(), normalize: v });
+    },
+    setLoudness: (l) => {
+      set({ loudness: l });
+      persistActive({ ...current(), loudness: l });
+    },
+    reset: () => {
+      const next = { ...FX_DEFAULTS, eqGains: [...EQ_PRESETS.flat] };
+      set(next);
+      persistActive(next);
+    },
+  };
+});

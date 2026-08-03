@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type CSSProperties } from 'react';
 
 /**
  * One-line text that, when its enclosing `.group` (a card/tile) is hovered AND
@@ -11,12 +11,42 @@ import { useEffect, useRef, useState } from 'react';
  * are measured per-string (≈45px/s), so short titles don't move and long ones
  * take proportionally longer.
  */
-export function Marquee({ text, className }: { text: string; className?: string }) {
+export function Marquee({
+  text,
+  className,
+  lines = 1,
+}: {
+  text: string;
+  className?: string;
+  /** Touch-only: how many lines to wrap to before ellipsizing (Spotify mobile
+   *  uses 2 for the quick-pick tiles, 1 for card titles). Ignored on desktop,
+   *  which scrolls the single line on hover. */
+  lines?: number;
+}) {
+  // A touch device can't hover to scroll, so a long title would just sit
+  // clipped. Fall back to a clean line-clamped ellipsis there — the Spotify-
+  // mobile behaviour — and keep the hover-scroll where there IS a pointer.
+  // "No hover" (a real phone) OR a phone-width window — either way there's no
+  // pointer to scroll the marquee, so clamp instead. The width clause also lets
+  // the desktop browser preview at a phone size show the real mobile treatment;
+  // the desktop app runs ≥1024px, so it keeps the hover-scroll.
+  const MQ = '(hover: none), (max-width: 767px)';
+  const [touch, setTouch] = useState(
+    typeof window !== 'undefined' && window.matchMedia(MQ).matches,
+  );
+  useEffect(() => {
+    const mq = window.matchMedia(MQ);
+    const on = () => setTouch(mq.matches);
+    mq.addEventListener('change', on);
+    return () => mq.removeEventListener('change', on);
+  }, []);
+
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const spanRef = useRef<HTMLSpanElement | null>(null);
   const [shift, setShift] = useState(0);
 
   useEffect(() => {
+    if (touch) return; // no scroll measuring on touch — we line-clamp instead
     const wrap = wrapRef.current;
     const span = spanRef.current;
     if (!wrap || !span) return;
@@ -28,7 +58,23 @@ export function Marquee({ text, className }: { text: string; className?: string 
     const ro = new ResizeObserver(measure);
     ro.observe(wrap);
     return () => ro.disconnect();
-  }, [text]);
+  }, [text, touch]);
+
+  if (touch) {
+    return (
+      <div
+        title={text}
+        className={`overflow-hidden ${className ?? ''}`}
+        style={{
+          display: '-webkit-box',
+          WebkitLineClamp: lines,
+          WebkitBoxOrient: 'vertical',
+        } as CSSProperties}
+      >
+        {text}
+      </div>
+    );
+  }
 
   const overflowing = shift > 0;
   const dur = Math.max(1.2, shift / 45);
