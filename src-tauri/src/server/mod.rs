@@ -160,9 +160,19 @@ fn build_router(state: AppState, web_dir: Option<PathBuf>) -> Router {
         .route("/api/profiles", get(list_profiles_handler))
         .route(
             "/api/profiles/{id}",
-            axum::routing::delete(delete_profile_handler),
+            axum::routing::delete(delete_profile_handler)
+                .patch(update_profile_handler),
         )
-        .route("/api/profiles/{id}/avatar", get(profile_avatar_handler))
+        .route(
+            "/api/profiles/{id}/avatar",
+            get(profile_avatar_handler)
+                .post(set_profile_avatar_handler)
+                .delete(clear_profile_avatar_handler)
+                // A photo straight off a modern phone camera is routinely
+                // several MB; axum's 2MB default would reject the ordinary
+                // case. Bounded anyway — this writes a file to the hub.
+                .layer(axum::extract::DefaultBodyLimit::max(AVATAR_MAX_BYTES)),
+        )
         .route(
             "/api/profiles/{id}/verify",
             axum::routing::post(verify_profile_pin_handler),
@@ -231,6 +241,7 @@ fn build_router(state: AppState, web_dir: Option<PathBuf>) -> Router {
         .route("/api/search", get(spotify_search))
         .route("/api/browse", get(browse))
         .route("/api/home", get(home_handler))
+        .route("/api/home/report", get(home_report_handler))
         .route("/api/genres", get(list_genres))
         .route("/api/genres/{id}/artists", get(genre_artists))
         .route("/api/catalog/playlists/{id}", get(get_catalog_playlist))
@@ -969,6 +980,174 @@ async fn list_profiles_handler(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+/// Largest profile photo the hub will accept.
+const AVATAR_MAX_BYTES: usize = 12 * 1024 * 1024;
+
+#[derive(serde::Deserialize)]
+struct UpdateProfileBody {
+    name: String,
+}
+
+/// May the caller edit this profile? The desktop owner may edit any; a paired
+/// device may edit only the profile its own session is bound to. Mirrors
+/// `delete_profile_handler`, including the 404 (not 403) so a paired device
+/// can't probe which profile ids exist.
+fn may_edit_profile_with_query(
+    state: &AppState,
+    headers: &HeaderMap,
+    addr: &SocketAddr,
+    q: &TokenQuery,
+    id: i64,
+) -> Option<Response> {
+    if is_this_machine(headers, addr) {
+        return None;
+    }
+    let Some(token) = extract_token(headers, q) else {
+        return Some((StatusCode::UNAUTHORIZED, "missing session token").into_response());
+    };
+    if state.session_profile(&token) != Some(id) {
+        return Some(StatusCode::NOT_FOUND.into_response());
+    }
+    None
+}
+
+/// PATCH /api/profiles/{id} — rename. The colour is carried through unchanged:
+/// it is picked when the profile is created and has no editor on the phone, so
+/// re-sending it would only be a way to lose it.
+async fn update_profile_handler(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Query(q): Query<TokenQuery>,
+    Json(body): Json<UpdateProfileBody>,
+) -> Response {
+    if let Err(r) = require_token(&state, &headers, &q) {
+        return r;
+    }
+    if let Some(r) = may_edit_profile_with_query(&state, &headers, &addr, &q, id) {
+        return r;
+    }
+    let name = body.name.trim().to_string();
+    if name.is_empty() {
+        return (StatusCode::BAD_REQUEST, "name can't be empty").into_response();
+    }
+    if name.chars().count() > 60 {
+        return (StatusCode::BAD_REQUEST, "name is too long").into_response();
+    }
+    let conn = state.db.lock().expect("db mutex poisoned");
+    let current = match crate::profiles::get(&conn, id) {
+        Ok(p) => p,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+    match crate::profiles::update(&conn, id, &name, &current.avatar_color) {
+        Ok(p) => Json(p).into_response(),
+        Err(e) => {
+            tracing::error!(?e, "update_profile");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// POST /api/profiles/{id}/avatar — raw image bytes, extension from the
+/// content type. Stored beside the desktop's own avatars, and the previous
+/// file is removed once the new one is recorded.
+async fn set_profile_avatar_handler(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Query(q): Query<TokenQuery>,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Err(r) = require_token(&state, &headers, &q) {
+        return r;
+    }
+    if let Some(r) = may_edit_profile_with_query(&state, &headers, &addr, &q, id) {
+        return r;
+    }
+    if body.is_empty() {
+        return (StatusCode::BAD_REQUEST, "empty image").into_response();
+    }
+    // Trust the bytes, not the header: an extension only decides the filename,
+    // and the file is served back with its type sniffed from disk.
+    let ext = match body.as_ref() {
+        [0xFF, 0xD8, 0xFF, ..] => "jpg",
+        [0x89, b'P', b'N', b'G', ..] => "png",
+        [b'G', b'I', b'F', ..] => "gif",
+        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => "webp",
+        _ => return (StatusCode::BAD_REQUEST, "unsupported image format").into_response(),
+    };
+    // `Manager` scoped to this handler: the trait is only needed for the one
+    // `.path()` call, and importing it at module scope would shadow nothing
+    // useful while widening what the rest of this file can reach for.
+    use tauri::Manager as _;
+    let dir = match state.app.path().app_data_dir() {
+        Ok(d) => d.join("library").join("avatars"),
+        Err(e) => {
+            tracing::error!(?e, "avatar dir");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::error!(?e, "avatar dir");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let dest = dir.join(format!("{id}-{}.{ext}", uuid::Uuid::new_v4()));
+    if let Err(e) = std::fs::write(&dest, &body) {
+        tracing::error!(?e, "avatar write");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let dest_str = dest.to_string_lossy().into_owned();
+    let old = {
+        let conn = state.db.lock().expect("db mutex poisoned");
+        let old = crate::profiles::avatar_path(&conn, id).ok().flatten();
+        if let Err(e) = crate::profiles::set_avatar(&conn, id, Some(&dest_str)) {
+            tracing::error!(?e, "set_avatar");
+            let _ = std::fs::remove_file(&dest);
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        old
+    };
+    // Only once the new path is recorded — a failure above must not leave the
+    // profile pointing at a file we already deleted.
+    if let Some(old) = old {
+        if old != dest_str {
+            let _ = std::fs::remove_file(old);
+        }
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// DELETE /api/profiles/{id}/avatar — back to the coloured initial.
+async fn clear_profile_avatar_handler(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Query(q): Query<TokenQuery>,
+) -> Response {
+    if let Err(r) = require_token(&state, &headers, &q) {
+        return r;
+    }
+    if let Some(r) = may_edit_profile_with_query(&state, &headers, &addr, &q, id) {
+        return r;
+    }
+    let old = {
+        let conn = state.db.lock().expect("db mutex poisoned");
+        let old = crate::profiles::avatar_path(&conn, id).ok().flatten();
+        if let Err(e) = crate::profiles::set_avatar(&conn, id, None) {
+            tracing::error!(?e, "clear_avatar");
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        old
+    };
+    if let Some(old) = old {
+        let _ = std::fs::remove_file(old);
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// GET /api/profiles/{id}/avatar — serve a profile's custom photo (when set).
@@ -2659,6 +2838,15 @@ struct CatalogTrackOut {
     title: String,
     artists: Vec<String>,
     album: Option<String>,
+    /// Catalog id of `album`, when the source told us one. The name on its own
+    /// is a poor key — "After Hours" and "After Hours (Deluxe)" are two
+    /// strings for one record — so anything matching a track back to an album
+    /// (the artist page's Essential Albums) keys on this first.
+    ///
+    /// `serde(default)`: the client posts this same shape back on
+    /// add-to-playlist and has no reason to echo it.
+    #[serde(default)]
+    album_id: Option<String>,
     album_art_url: Option<String>,
     duration_ms: i64,
     /// Carries through when Deezer happens to know it. Used as a dedup key
@@ -2732,7 +2920,7 @@ fn annotate_with_library_state(
     // `local_path` is the source of truth for "downloaded" — it's only
     // set after a local-file import successfully finishes.
     let mut stmt_lookup = conn.prepare_cached(
-        "SELECT id, local_path FROM tracks
+        "SELECT id, local_path, artists FROM tracks
          WHERE spotify_id = ?1
             OR (?2 IS NOT NULL AND isrc = ?2)
          LIMIT 1",
@@ -2764,12 +2952,16 @@ fn annotate_with_library_state(
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty());
-        let found: Option<(i64, Option<String>)> = stmt_lookup
+        let found: Option<(i64, Option<String>, Option<String>)> = stmt_lookup
             .query_row(params![synthetic_id, isrc], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
             })
             .ok();
-        if let Some((tid, local_path)) = found {
+        if let Some((tid, local_path, lib_artists)) = found {
             let playlists: Vec<i64> = stmt_playlists
                 .query_map(params![tid, pid], |r| r.get(0))?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -2780,6 +2972,22 @@ fn annotate_with_library_state(
             track.in_playlist_ids = playlists;
             track.in_saved_album_ids = saved_albums;
             track.has_audio = local_path.is_some();
+            // The library is the source of truth for a track you own. Catalog
+            // endpoints (search, album tracklists) carry only the primary
+            // artist, while the library row holds full credits (import-time
+            // enrichment / credit backfill) — so a catalog surface rendering
+            // an owned track would otherwise show "James Blake" where the row
+            // knows "James Blake, Travis Scott, Ludwig Göransson". Richer
+            // wins, same rule as upsert_track; a thin library row (not yet
+            // backfilled) never *removes* names the catalog provided.
+            if let Some(names) = lib_artists
+                .as_deref()
+                .and_then(|j| serde_json::from_str::<Vec<String>>(j).ok())
+            {
+                if names.len() > track.artists.len() {
+                    track.artists = names;
+                }
+            }
         }
     }
     Ok(())
@@ -2985,6 +3193,7 @@ async fn spotify_search(
             title: t.title,
             artists: vec![t.artist.name],
             album: Some(t.album.title.clone()),
+            album_id: Some(t.album.id.to_string()),
             album_art_url: t.album.best_cover(),
             // Deezer reports track duration in seconds.
             duration_ms: (t.duration as i64) * 1000,
@@ -3170,13 +3379,33 @@ async fn list_genres(
 }
 
 /// Map a Deezer `TrackHit` onto the catalog wire shape.
+/// Full credits from a hit's `contributors` (primary first, deduped by name),
+/// falling back to the single `artist` when the endpoint didn't provide them
+/// (/search and album tracklists don't; /track/{id} and /track/isrc do).
+pub(crate) fn credit_names(contributors: &[crate::deezer::ArtistRef], primary: &str) -> Vec<String> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for a in contributors {
+        let name = a.name.trim();
+        if name.is_empty() || !seen.insert(name.to_lowercase()) {
+            continue;
+        }
+        out.push(name.to_string());
+    }
+    if out.is_empty() {
+        out.push(primary.to_string());
+    }
+    out
+}
+
 fn track_hit_to_out(t: crate::deezer::TrackHit) -> CatalogTrackOut {
     CatalogTrackOut {
         source: "deezer".into(),
         source_id: t.id.to_string(),
         title: t.title,
-        artists: vec![t.artist.name],
+        artists: credit_names(&t.contributors, &t.artist.name),
         album: Some(t.album.title.clone()),
+        album_id: Some(t.album.id.to_string()),
         album_art_url: t.album.best_cover(),
         duration_ms: (t.duration as i64) * 1000,
         isrc: t.isrc,
@@ -4335,6 +4564,8 @@ async fn get_album_tracks(
             // neither, so without this every album-tracklist consumer (play,
             // import) would persist a cover-less library row.
             album: album_name.clone(),
+            // The album whose tracklist this is, by construction.
+            album_id: Some(album_id.to_string()),
             album_art_url: album_cover.clone(),
             duration_ms: (t.duration as i64) * 1000,
             isrc: t.isrc,
@@ -4490,6 +4721,7 @@ async fn get_artist_top_tracks(
             title: t.title,
             artists: vec![t.artist.name],
             album: Some(t.album.title.clone()),
+            album_id: Some(t.album.id.to_string()),
             album_art_url: t.album.best_cover(),
             duration_ms: (t.duration as i64) * 1000,
             isrc: t.isrc,
@@ -4791,6 +5023,123 @@ fn tidy_genre_label(label: &str) -> String {
         .join(" ")
 }
 
+/// Wikidata classes that disqualify an entity from being somewhere you are
+/// "from". Verified against the case that prompted this: Ludwig Göransson's
+/// place of birth is *Linköping Cathedral Congregation*, whose P31 is
+/// `parish of the Church of Sweden` **and** `organization` — a congregation,
+/// not a town.
+const NOT_A_PLACE_YOU_ARE_FROM: [&str; 4] = [
+    "Q43229",   // organization
+    "Q2977",    // cathedral
+    "Q16970",   // church building
+    "Q1370598", // place of worship
+];
+
+/// Administrative suffixes worth trimming. A municipality in the Nordics and
+/// much of Europe takes the name of its seat, so "Linköping Municipality" is
+/// the town of Linköping wearing its paperwork.
+const ADMIN_SUFFIXES: [&str; 3] = [" Municipality", " Parish", " Township"];
+
+/// Turn a raw birthplace entity into somewhere a person would say they are
+/// from, and pair it with its country.
+///
+/// Wikidata records place of birth at whatever precision the article happened
+/// to use, which is regularly below the level anyone names — a parish, a
+/// hospital, a neighbourhood. Rendering that under "From" is technically
+/// correct and reads like a church, which is exactly what it was.
+///
+/// So: reject entities that are organizations rather than places, walk up P131
+/// (located in the administrative territorial entity) when rejected, trim the
+/// administrative suffix off whatever we land on, and append P17 (country).
+/// If every candidate is rejected, the **country alone** is the answer —
+/// "Sweden" tells the truth and reads fine, where a parish does neither.
+///
+/// Three hops: beyond that we are naming counties and states, no more sayable
+/// than the parish. Country is captured from the first entity that has one,
+/// since the parish itself knows it is in Sweden.
+async fn resolve_place_name(client: &reqwest::Client, start_qid: &str) -> Option<String> {
+    let fetch = |qid: String| {
+        let client = client.clone();
+        async move {
+            client
+                .get("https://www.wikidata.org/w/api.php")
+                .query(&[
+                    ("action", "wbgetentities"),
+                    ("ids", qid.as_str()),
+                    ("props", "claims|labels"),
+                    ("languages", "en"),
+                    ("format", "json"),
+                    ("formatversion", "2"),
+                ])
+                .send()
+                .await
+                .ok()
+                .filter(|r| r.status().is_success())?
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+        }
+    };
+    let first_id = |v: &serde_json::Value, prop: &str| -> Option<String> {
+        v["claims"][prop][0]["mainsnak"]["datavalue"]["value"]["id"]
+            .as_str()
+            .map(str::to_string)
+    };
+
+    let mut qid = start_qid.to_string();
+    let mut place: Option<String> = None;
+    let mut country_qid: Option<String> = None;
+    for _ in 0..3 {
+        let Some(resp) = fetch(qid.clone()).await else { break };
+        let ent = resp["entities"][qid.as_str()].clone();
+        if country_qid.is_none() {
+            country_qid = first_id(&ent, "P17");
+        }
+        let disqualified = ent["claims"]["P31"]
+            .as_array()
+            .map(|cs| {
+                cs.iter().any(|c| {
+                    c["mainsnak"]["datavalue"]["value"]["id"]
+                        .as_str()
+                        .is_some_and(|id| NOT_A_PLACE_YOU_ARE_FROM.contains(&id))
+                })
+            })
+            .unwrap_or(false);
+        if !disqualified {
+            place = ent["labels"]["en"]["value"].as_str().map(|l| {
+                let mut name = l.to_string();
+                for suffix in ADMIN_SUFFIXES {
+                    if let Some(trimmed) = name.strip_suffix(suffix) {
+                        name = trimmed.to_string();
+                        break;
+                    }
+                }
+                name
+            });
+            break;
+        }
+        match first_id(&ent, "P131") {
+            Some(parent) => qid = parent,
+            None => break,
+        }
+    }
+
+    let country = match country_qid {
+        Some(c) => fetch(c.clone()).await.and_then(|v| {
+            v["entities"][c.as_str()]["labels"]["en"]["value"]
+                .as_str()
+                .map(str::to_string)
+        }),
+        None => None,
+    };
+    match (place, country) {
+        (Some(p), Some(c)) if p != c => Some(format!("{p}, {c}")),
+        (Some(p), _) => Some(p),
+        (None, Some(c)) => Some(c),
+        (None, None) => None,
+    }
+}
+
 /// Fetch Apple-style About facts (born / from / genre) for a Wikidata entity.
 /// Two requests: the entity's claims, then one batched label lookup for the
 /// place + genre entities those claims point at. Any miss → that fact is None.
@@ -4877,7 +5226,16 @@ async fn fetch_wikidata_facts(
             }
         }
     }
-    let from = place_qid.and_then(|p| labels.get(&p).cloned());
+    // `place_qid` is resolved through `resolve_place_name` rather than looked
+    // up in the batch above: the raw entity is frequently a parish, hospital
+    // or neighbourhood, and only the walk turns it into a place name.
+    let from = match &place_qid {
+        Some(p) => match resolve_place_name(client, p).await {
+            Some(name) => Some(name),
+            None => labels.get(p).cloned(),
+        },
+        None => None,
+    };
     let genres: Vec<String> = genre_qids
         .iter()
         .filter_map(|g| labels.get(g))
@@ -5917,12 +6275,12 @@ fn insert_album_playlist(
 /// playlist. Dedups by ISRC, then by synthetic `source:source_id`. Returns
 /// `(track_id, inserted_new_row)`. Used by tap-to-play on search/browse results,
 /// which only needs a track id to reference the library row.
-fn upsert_track(conn: &Connection, track: &CatalogTrackOut) -> Result<(i64, bool), rusqlite::Error> {
-    let synthetic_id = format!("{}:{}", track.source.trim(), track.source_id.trim());
-    let artists_json = serde_json::to_string(&track.artists)
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-
-    let by_isrc: Option<i64> = track.isrc.as_deref().and_then(|isrc| {
+/// The library row a catalog track would dedup onto: by ISRC first, then by the
+/// synthetic `{source}:{source_id}` id. Extracted from `upsert_track` so the
+/// import-time credit enrichment can ask "do we already have this?" with the
+/// SAME rules the upsert will apply — two copies of this lookup would drift.
+fn find_track_id(conn: &Connection, isrc: Option<&str>, synthetic_id: &str) -> Option<i64> {
+    let by_isrc: Option<i64> = isrc.and_then(|isrc| {
         let trimmed = isrc.trim();
         if trimmed.is_empty() {
             None
@@ -5935,22 +6293,99 @@ fn upsert_track(conn: &Connection, track: &CatalogTrackOut) -> Result<(i64, bool
             .ok()
         }
     });
-    let by_synth: Option<i64> = if by_isrc.is_none() {
+    by_isrc.or_else(|| {
         conn.query_row(
             "SELECT id FROM tracks WHERE spotify_id = ?1",
             params![synthetic_id],
             |r| r.get::<_, i64>(0),
         )
         .ok()
-    } else {
-        None
-    };
+    })
+}
 
-    if let Some(tid) = by_isrc.or(by_synth) {
+/// Deezer's /search and album-tracklist hits carry only the primary artist;
+/// the /track/{id} detail carries full credits ("When I'm Home" is James
+/// Blake + Travis Scott + Ludwig Göransson, but arrives as James Blake
+/// alone). Fetch the detail ONCE, at import time, so the library row is born
+/// with full credits — display paths stay un-fetched on purpose (a credits
+/// call per rendered search row would multiply catalog traffic for
+/// cosmetics).
+///
+/// No-op unless the track is Deezer-sourced, single-artist, and NOT already
+/// in the library — an existing row is the backfill sweep's job, and richer
+/// rows are protected from downgrade by `upsert_track` itself. Any fetch
+/// failure returns the input unchanged: an import must never fail because a
+/// credits lookup did.
+async fn with_full_credits(state: &AppState, track: CatalogTrackOut) -> CatalogTrackOut {
+    if track.source.trim() != "deezer" || track.artists.len() != 1 {
+        return track;
+    }
+    let Ok(deezer_id) = track.source_id.trim().parse::<u64>() else {
+        return track;
+    };
+    let synthetic_id = format!("{}:{}", track.source.trim(), track.source_id.trim());
+    let exists = {
+        let conn = state.db.lock().expect("db mutex poisoned");
+        find_track_id(&conn, track.isrc.as_deref(), &synthetic_id).is_some()
+    };
+    if exists {
+        return track;
+    }
+    match crate::deezer::DeezerClient::new().get_track(deezer_id).await {
+        Ok(hit) if !hit.contributors.is_empty() => {
+            let primary = track.artists[0].clone();
+            CatalogTrackOut {
+                artists: credit_names(&hit.contributors, &primary),
+                ..track
+            }
+        }
+        _ => track,
+    }
+}
+
+/// Bulk `with_full_credits`, order-preserving, bounded by the shared resolve
+/// limiter so a 100-track album import stays polite to the catalog.
+async fn with_full_credits_bulk(
+    state: &AppState,
+    tracks: Vec<CatalogTrackOut>,
+) -> Vec<CatalogTrackOut> {
+    let sem = resolve_limiter();
+    let n = tracks.len();
+    let mut set = tokio::task::JoinSet::new();
+    for (i, t) in tracks.into_iter().enumerate() {
+        let state = state.clone();
+        let sem = sem.clone();
+        set.spawn(async move {
+            let _permit = sem.acquire_owned().await.ok();
+            (i, with_full_credits(&state, t).await)
+        });
+    }
+    let mut buf: Vec<Option<CatalogTrackOut>> = (0..n).map(|_| None).collect();
+    while let Some(r) = set.join_next().await {
+        if let Ok((i, t)) = r {
+            buf[i] = Some(t);
+        }
+    }
+    buf.into_iter().flatten().collect()
+}
+
+fn upsert_track(conn: &Connection, track: &CatalogTrackOut) -> Result<(i64, bool), rusqlite::Error> {
+    let synthetic_id = format!("{}:{}", track.source.trim(), track.source_id.trim());
+    let artists_json = serde_json::to_string(&track.artists)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+
+    if let Some(tid) = find_track_id(conn, track.isrc.as_deref(), &synthetic_id) {
+        // The artists CASE below: never DOWNGRADE credits. A /search hit
+        // carries one artist where the stored row may hold full contributors
+        // (import-time enrichment, the Spotify sync, or the backfill).
+        // Re-touching a track via search used to silently shrink a full
+        // credits array back to one name; keep whichever array knows more.
         conn.execute(
             "UPDATE tracks SET
                  title = ?2,
-                 artists = ?3,
+                 artists = CASE
+                     WHEN json_array_length(?3) > json_array_length(artists)
+                     THEN ?3 ELSE artists END,
                  album = COALESCE(?4, album),
                  album_art_url = COALESCE(?5, album_art_url),
                  duration_ms = ?6,
@@ -6033,6 +6468,9 @@ async fn resolve_catalog_track(
     if body.source.trim().is_empty() || body.source_id.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "missing source/source_id").into_response();
     }
+    // Before the DB lock: enrichment awaits the network, and the row should be
+    // born with full credits (no-op for 'local' and already-known tracks).
+    let body = with_full_credits(&state, body).await;
     let conn = state.db.lock().expect("db mutex poisoned");
     // 'local' rows are already library tracks — return the id directly instead
     // of upserting a bogus "local:<id>" duplicate.
@@ -6087,9 +6525,12 @@ async fn resolve_catalog_tracks(
     if let Err(r) = require_token(&state, &headers, &q) {
         return r;
     }
+    // Bulk credit enrichment before the lock (order-preserving; no-ops for
+    // 'local' entries and tracks the library already knows).
+    let tracks = with_full_credits_bulk(&state, body.tracks).await;
     let conn = state.db.lock().expect("db mutex poisoned");
-    let mut resolved = Vec::with_capacity(body.tracks.len());
-    for t in &body.tracks {
+    let mut resolved = Vec::with_capacity(tracks.len());
+    for t in &tracks {
         if t.source.trim().is_empty() || t.source_id.trim().is_empty() {
             resolved.push(ResolveTrackResult {
                 track_id: 0,
@@ -7876,6 +8317,114 @@ async fn build_because_you_played(
     )
 }
 
+/// Drop the seed song itself and the seed artist's own catalog from a
+/// song-similar candidate list, dedup by catalog id, cap. Pure, so the
+/// filtering rules are unit-testable. Unlike `tag_shelf_pick` this does NOT
+/// drop every library artist: songs that travel with a song you loved
+/// naturally include artists you know, and pruning them would gut the shelf's
+/// point. The seed's own artist IS dropped — their catalog is what the
+/// artist-level shelves already cover.
+fn song_similar_pick(
+    hits: Vec<crate::deezer::TrackHit>,
+    seed_title: &str,
+    seed_artist: &str,
+    cap: usize,
+) -> Vec<CatalogTrackOut> {
+    let seed_t = seed_title.trim().to_lowercase();
+    let seed_a = norm_artist(seed_artist);
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut out: Vec<CatalogTrackOut> = Vec::new();
+    for h in hits {
+        if norm_artist(&h.artist.name) == seed_a {
+            continue;
+        }
+        if h.title.trim().to_lowercase() == seed_t {
+            continue;
+        }
+        if !seen.insert(h.id) {
+            continue;
+        }
+        out.push(track_hit_to_out(h));
+        if out.len() >= cap {
+            break;
+        }
+    }
+    out
+}
+
+/// `More like "{song}"` — the only shelf seeded by an exact TRACK rather than
+/// an artist, tag or chart (docs/home-feed.md, build order phase 2 / open
+/// question 6). Last.fm's `track.getsimilar` is co-listening over the exact
+/// song — the most granular signal in the app, previously confined to radio
+/// autoplay.
+///
+/// The seed is a track the user FINISHED in the last 7 days (a completed play
+/// is the strongest implicit positive we have), rotated across the three most
+/// recent by the day seed so the shelf's mood moves day to day. The whole
+/// result is cached with the daily discovery pool like every other builder —
+/// the day seed pins the song for the day, so the per-track fan-out that keeps
+/// this signal out of cacheable paths elsewhere costs one lookup per profile
+/// per day here.
+///
+/// Quoted title on purpose: `More like {artist}` already exists, and the
+/// quotes are what tell a scanning eye this row is about a song.
+async fn build_more_like_song(
+    state: &AppState,
+    profile_id: Option<i64>,
+    sem: ResolveLimiter,
+    day_seed: u64,
+) -> Option<HomeShelf> {
+    let key = read_lastfm_key(state)?;
+    // The three most recently finished distinct tracks, newest first.
+    let recent: Vec<(String, String)> = {
+        let conn = state.db.lock().expect("db mutex poisoned");
+        conn.prepare(
+            "SELECT t.title, json_extract(t.artists, '$[0]')
+             FROM play_events pe JOIN tracks t ON t.id = pe.track_id
+             WHERE (pe.profile_id IS ?1) AND pe.completed = 1
+               AND pe.played_at >= CAST(strftime('%s','now','-7 days') AS INTEGER)
+             GROUP BY t.id ORDER BY MAX(pe.played_at) DESC LIMIT 3",
+        )
+        .and_then(|mut s| {
+            s.query_map(params![profile_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default()))
+            })
+            .map(|rows| rows.filter_map(|x| x.ok()).collect())
+        })
+        .unwrap_or_default()
+    };
+    let candidates: Vec<&(String, String)> =
+        recent.iter().filter(|(t, a)| !t.trim().is_empty() && !a.trim().is_empty()).collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    let (seed_title, seed_artist) =
+        candidates[(day_seed % candidates.len() as u64) as usize].clone();
+    let pairs = crate::charts::lastfm_track_similar(&key, &seed_artist, &seed_title, 30).await;
+    if pairs.is_empty() {
+        return None;
+    }
+    let hits = deezer_resolve_tracks_parallel(pairs, sem).await;
+    let mut tracks = song_similar_pick(hits, &seed_title, &seed_artist, 24);
+    if tracks.len() < 5 {
+        return None;
+    }
+    {
+        let conn = state.db.lock().expect("db mutex poisoned");
+        let _ = annotate_with_library_state(&conn, &mut tracks, profile_id);
+    }
+    Some(
+        HomeShelf::track_row(
+            format!("More like \"{seed_title}\""),
+            // Honest provenance: track.getsimilar IS co-listening data.
+            Some("You played it to the end — people who love it play these".into()),
+            tracks,
+        )
+        .rotating(4, 12)
+        .discovery(),
+    )
+}
+
 #[derive(Deserialize)]
 struct RadioParams {
     /// Seed artist name (the currently-playing track's primary artist).
@@ -9152,7 +9701,10 @@ fn build_top_songs(conn: &Connection, pid: Option<i64>, seed: u64) -> Option<Hom
         &[&pid],
     );
     let tracks = seeded_shuffle_take(tracks, seed, 16);
-    (!tracks.is_empty()).then(|| HomeShelf::stat_row("Top songs", None, tracks))
+    // "Your top songs", not "Top songs": on a page that mixes personal shelves
+    // with global charts, an unqualified "Top" reads as everyone's. The title
+    // should answer "mine or the world's?" on its own.
+    (!tracks.is_empty()).then(|| HomeShelf::stat_row("Your top songs", None, tracks))
 }
 
 fn build_from_your_past(conn: &Connection, pid: Option<i64>) -> Option<HomeShelf> {
@@ -9987,7 +10539,12 @@ fn build_cold_start_shelves() -> Vec<HomeShelf> {
     if chart_tracks.len() >= MIN_SHELF {
         out.push(HomeShelf::track_row(
             "Trending now",
-            Some("What everyone's playing".into()),
+            // The why, not the what. A brand-new user's first question is "why
+            // is my page generic?", and this is the moment they decide whether
+            // the app understands them. Naming the reason also frames the page
+            // as *going* somewhere, which softens the otherwise-cliff switch to
+            // a personalised feed when station_ready flips (docs/home-feed.md).
+            Some("Until we know your taste".into()),
             chart_tracks,
         ));
     }
@@ -10207,6 +10764,7 @@ async fn build_external_shelves(
         because,
         weekly,
         more_like_mixed,
+        more_like_song,
     ) = tokio::join!(
         build_more_like_favorites(state, pid, sem.clone(), seed),
         build_top_artists(state, pid, sem.clone()),
@@ -10232,6 +10790,11 @@ async fn build_external_shelves(
             } else {
                 build_more_like_mixed(state, pid, sem.clone(), seed).await
             }
+        },
+        async {
+            // A per-track fan-out (track.getsimilar + resolution) — too slow
+            // for the fast partial, cached with the daily pool like the rest.
+            if fast { None } else { build_more_like_song(state, pid, sem.clone(), seed).await }
         },
     );
     // Tag each shelf with its intent lane (N5) so arrange_shelves can pick a
@@ -10266,6 +10829,7 @@ async fn build_external_shelves(
         tag(because, ShelfIntent::Discover),
         tag(weekly, ShelfIntent::Discover), // rail shelf; intent unused (bypasses lanes)
         tag(more_like_mixed, ShelfIntent::Discover),
+        tag(more_like_song, ShelfIntent::Discover),
     ]
     .into_iter()
     .flatten()
@@ -10433,7 +10997,7 @@ pub fn spawn_home_prewarm(state: &AppState) {
 ///   • cross-shelf de-dup — in display order, show each track in AT MOST ONE
 ///     shelf (the highest), so the same songs don't repeat as you scroll;
 ///   • a shelf left with fewer than MIN_SHELF unique tracks is dropped, which
-///     also collapses near-duplicate shelves (e.g. "Your 2020s" ≈ "Top songs").
+///     also collapses near-duplicate shelves (e.g. "Your 2020s" ≈ "Your top songs").
 /// Discovery shelves (track/album/artist rows) are left untouched.
 fn curate_home_shelves(
     shelves: Vec<HomeShelf>,
@@ -10953,11 +11517,12 @@ fn log_home_impressions(
     {
         let Ok(mut stmt) = tx.prepare_cached(
             "INSERT INTO home_impressions
-                 (profile_id, item_kind, item_key, first_shown, last_shown, shown_days)
-             VALUES (?1, ?2, ?3, ?4, ?4, 1)
+                 (profile_id, item_kind, item_key, first_shown, last_shown, shown_days, shelf)
+             VALUES (?1, ?2, ?3, ?4, ?4, 1, ?5)
              ON CONFLICT(profile_id, item_kind, item_key) DO UPDATE SET
                  shown_days = shown_days + (last_shown < excluded.last_shown),
-                 last_shown = max(last_shown, excluded.last_shown)",
+                 last_shown = max(last_shown, excluded.last_shown),
+                 shelf = excluded.shelf",
         ) else {
             return;
         };
@@ -10968,7 +11533,8 @@ fn log_home_impressions(
                     pid0,
                     "track",
                     format!("{}:{}", t.source, t.source_id),
-                    date
+                    date,
+                    s.title
                 ]);
             }
             for a in &s.albums {
@@ -10976,18 +11542,20 @@ fn log_home_impressions(
                     pid0,
                     "album",
                     format!("{}:{}", a.source, a.source_id),
-                    date
+                    date,
+                    s.title
                 ]);
             }
             for a in &s.artists {
-                let _ = stmt.execute(params![pid0, "artist", norm_artist(&a.name), date]);
+                let _ = stmt.execute(params![pid0, "artist", norm_artist(&a.name), date, s.title]);
             }
             for p in &s.playlists {
                 let _ = stmt.execute(params![
                     pid0,
                     "playlist",
                     format!("{}:{}", p.source, p.source_id),
-                    date
+                    date,
+                    s.title
                 ]);
             }
             // mixed_row items carry their own kind; log each under the same key
@@ -10996,14 +11564,15 @@ fn log_home_impressions(
                 match it {
                     MixedItem::Artist { artist } => {
                         let _ =
-                            stmt.execute(params![pid0, "artist", norm_artist(&artist.name), date]);
+                            stmt.execute(params![pid0, "artist", norm_artist(&artist.name), date, s.title]);
                     }
                     MixedItem::Album { album } => {
                         let _ = stmt.execute(params![
                             pid0,
                             "album",
                             format!("{}:{}", album.source, album.source_id),
-                            date
+                            date,
+                    s.title
                         ]);
                     }
                     MixedItem::Playlist { playlist } => {
@@ -11011,7 +11580,8 @@ fn log_home_impressions(
                             pid0,
                             "playlist",
                             format!("{}:{}", playlist.source, playlist.source_id),
-                            date
+                            date,
+                    s.title
                         ]);
                     }
                 }
@@ -11028,6 +11598,136 @@ fn log_home_impressions(
     if let Err(e) = tx.commit() {
         tracing::warn!(?e, "home impressions: commit failed");
     }
+}
+
+// --- The discovery funnel (docs/home-feed.md, build order phase 1) ----------
+//
+// Impressions record what Home SHOWED; play history records what got played.
+// Crossing them answers the question nothing else can: which shelves earn
+// their slot, and which are exposure with no adoption. The join key is exact —
+// a catalog track imported to the library gets `spotify_id = "{source}:{id}"`,
+// the same string the impression logged as `item_key`.
+//
+// Track impressions only: plays are track-level, so albums/artists/playlists
+// have no adoption edge to measure yet. Their impressions still accrue for
+// fatigue; they are simply absent here.
+
+/// One impressed discovery track's funnel state.
+#[derive(Serialize)]
+struct DiscoveryFunnelItem {
+    item_key: String,
+    shelf: Option<String>,
+    shown_days: i64,
+    first_shown: String,
+    last_shown: String,
+    /// The track was imported to the library at some point (adoption step 1).
+    in_library: bool,
+    /// Plays since the day it was first shown (adoption step 2).
+    plays_since_shown: i64,
+    completed_since_shown: i64,
+}
+
+/// Per-shelf rollup of the above.
+#[derive(Serialize)]
+struct DiscoveryShelfReport {
+    shelf: String,
+    items: i64,
+    total_shown_days: i64,
+    in_library: i64,
+    played: i64,
+}
+
+#[derive(Serialize)]
+struct DiscoveryReport {
+    shelves: Vec<DiscoveryShelfReport>,
+    items: Vec<DiscoveryFunnelItem>,
+}
+
+/// Pure query, separated from the handler so the join is unit-testable.
+/// `played_at >= strftime('%s', first_shown)` compares against UTC midnight of
+/// the shown date — day-granularity, which is all a funnel report needs.
+fn home_discovery_report(conn: &Connection, pid: Option<i64>) -> DiscoveryReport {
+    let mut items: Vec<DiscoveryFunnelItem> = Vec::new();
+    let res: rusqlite::Result<()> = (|| {
+        let mut stmt = conn.prepare_cached(
+            "SELECT hi.item_key, hi.shelf, hi.shown_days, hi.first_shown, hi.last_shown,
+                    t.id IS NOT NULL,
+                    COUNT(pe.id),
+                    COALESCE(SUM(pe.completed), 0)
+             FROM home_impressions hi
+             LEFT JOIN tracks t ON t.spotify_id = hi.item_key
+             LEFT JOIN play_events pe ON pe.track_id = t.id
+                  AND (pe.profile_id IS ?2)
+                  AND pe.played_at >= strftime('%s', hi.first_shown)
+             WHERE hi.profile_id = ?1 AND hi.item_kind = 'track'
+             GROUP BY hi.item_key
+             ORDER BY hi.shown_days DESC, hi.item_key",
+        )?;
+        let rows = stmt.query_map(params![pid.unwrap_or(0), pid], |r| {
+            Ok(DiscoveryFunnelItem {
+                item_key: r.get(0)?,
+                shelf: r.get(1)?,
+                shown_days: r.get(2)?,
+                first_shown: r.get(3)?,
+                last_shown: r.get(4)?,
+                in_library: r.get::<_, i64>(5)? != 0,
+                plays_since_shown: r.get(6)?,
+                completed_since_shown: r.get(7)?,
+            })
+        })?;
+        items.extend(rows.flatten());
+        Ok(())
+    })();
+    if let Err(e) = res {
+        tracing::warn!(?e, "home discovery report: query failed");
+    }
+    // Rollup in Rust rather than a second SQL pass: the item list is already in
+    // hand and bounded (impressions are pruned at 180 days).
+    let mut by_shelf: std::collections::BTreeMap<String, DiscoveryShelfReport> =
+        std::collections::BTreeMap::new();
+    for it in &items {
+        let key = it.shelf.clone().unwrap_or_else(|| "(before v027)".into());
+        let e = by_shelf.entry(key.clone()).or_insert(DiscoveryShelfReport {
+            shelf: key,
+            items: 0,
+            total_shown_days: 0,
+            in_library: 0,
+            played: 0,
+        });
+        e.items += 1;
+        e.total_shown_days += it.shown_days;
+        e.in_library += i64::from(it.in_library);
+        e.played += i64::from(it.plays_since_shown > 0);
+    }
+    DiscoveryReport {
+        shelves: by_shelf.into_values().collect(),
+        items,
+    }
+}
+
+/// GET /api/home/report — the discovery funnel for the acting profile.
+///
+/// Owner-only (`is_this_machine`): this is listening history, a desktop
+/// analysis surface, not something a paired device should be able to pull.
+async fn home_report_handler(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Query(pq): Query<ProfileQuery>,
+) -> Response {
+    if let Err(r) = require_token(&state, &headers, &q) {
+        return r;
+    }
+    if !is_this_machine(&headers, &addr) {
+        return (StatusCode::FORBIDDEN, "owner surface").into_response();
+    }
+    let pid = read_scope_profile(&state, &headers, &addr, &q, pq.profile_id);
+    let report = {
+        let conn = state.db.lock().expect("db mutex poisoned");
+        home_discovery_report(&conn, pid)
+    };
+    Json(report).into_response()
 }
 
 #[derive(Serialize)]
@@ -11069,6 +11769,8 @@ async fn add_track_to_playlist(
     if body.source.trim().is_empty() || body.source_id.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "missing source/source_id").into_response();
     }
+    // Enrich before the lock — the library row should be born with full credits.
+    let body = with_full_credits(&state, body).await;
 
     let (track_id, inserted) = {
         let conn = state.db.lock().expect("db mutex poisoned");
@@ -11138,7 +11840,7 @@ async fn import_album(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(q): Query<TokenQuery>,
-    Json(body): Json<ImportAlbumBody>,
+    Json(mut body): Json<ImportAlbumBody>,
 ) -> Response {
     if let Err(r) = require_token(&state, &headers, &q) {
         return r;
@@ -11163,6 +11865,9 @@ async fn import_album(
             .into_response();
     }
 
+    // Enrich the whole album's credits before the transaction (bounded by the
+    // shared resolve limiter; no-ops for tracks the library already knows).
+    body.tracks = with_full_credits_bulk(&state, std::mem::take(&mut body.tracks)).await;
     let total = body.tracks.len() as i64;
     let (playlist_id, freshly_linked): (i64, Vec<i64>) = {
         let mut conn = state.db.lock().expect("db mutex poisoned");
@@ -11327,7 +12032,7 @@ async fn import_playlist(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(q): Query<TokenQuery>,
-    Json(body): Json<ImportPlaylistBody>,
+    Json(mut body): Json<ImportPlaylistBody>,
 ) -> Response {
     if let Err(r) = require_token(&state, &headers, &q) {
         return r;
@@ -11350,6 +12055,8 @@ async fn import_playlist(
             .into_response();
     }
 
+    // Same pre-transaction credit enrichment as import_album.
+    body.tracks = with_full_credits_bulk(&state, std::mem::take(&mut body.tracks)).await;
     let total = body.tracks.len() as i64;
     let (playlist_id, freshly_linked): (i64, Vec<i64>) = {
         let mut conn = state.db.lock().expect("db mutex poisoned");
@@ -11445,7 +12152,7 @@ async fn patch_track_playlists(
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Query(q): Query<TokenQuery>,
-    Json(body): Json<PatchTrackPlaylistsBody>,
+    Json(mut body): Json<PatchTrackPlaylistsBody>,
 ) -> Response {
     if let Err(r) = require_token(&state, &headers, &q) {
         return r;
@@ -11457,11 +12164,15 @@ async fn patch_track_playlists(
             return r;
         }
     }
-    let source = body.track.source.trim();
-    let source_id = body.track.source_id.trim();
+    // Owned copies: the enrichment below replaces `body.track`, so borrows of
+    // its fields must not outlive that assignment.
+    let source = body.track.source.trim().to_string();
+    let source_id = body.track.source_id.trim().to_string();
     if source.is_empty() || source_id.is_empty() {
         return (StatusCode::BAD_REQUEST, "missing track.source/source_id").into_response();
     }
+    // Enrich before the lock — the library row should be born with full credits.
+    body.track = with_full_credits(&state, body.track).await;
 
     // Whether the track row existed before this call.
     let (track_id, was_new) = {
@@ -11470,7 +12181,7 @@ async fn patch_track_playlists(
         // is the track id. Link that existing row instead of upserting a bogus
         // "local:<id>" duplicate (the same guard resolve_catalog_track uses).
         if source == "local" {
-            match lookup_local_track(&conn, source_id) {
+            match lookup_local_track(&conn, &source_id) {
                 Some(r) => (r.track_id, false),
                 None => {
                     return (StatusCode::NOT_FOUND, "unknown local track").into_response();
@@ -12785,6 +13496,7 @@ mod tests {
             preview: None,
             explicit_lyrics: false,
             rank: 0,
+            contributors: Vec::new(),
         }
     }
 
@@ -13489,6 +14201,7 @@ mod tests {
             preview: None,
             explicit_lyrics: false,
             rank,
+            contributors: Vec::new(),
         }
     }
 
@@ -13576,7 +14289,7 @@ mod tests {
     }
 
     // Hoisting win-back to the FRONT lets it claim its tracks under curation's
-    // first-claimant rule; left in the trail, Top songs guts it (shared tracks).
+    // first-claimant rule; left in the trail, "Your top songs" guts it (shared tracks).
     #[test]
     fn win_back_hoist_survives_curation() {
         let conn = open_test_db();
@@ -13590,7 +14303,7 @@ mod tests {
                 None,
                 200_000,
             );
-            // Loved long ago → qualifies for BOTH "From your past" and "Top songs".
+            // Loved long ago → qualifies for BOTH "From your past" and "Your top songs".
             seed_play(&conn, id, None, old, 200_000, true);
             seed_play(&conn, id, None, old - 100, 200_000, true);
         }
@@ -14225,6 +14938,103 @@ mod tests {
     // --- N0 impression memory -------------------------------------------
 
     #[test]
+    fn annotate_overlays_library_credits_onto_catalog_hits_richer_wins() {
+        let conn = open_test_db();
+        // A library row healed to full credits (backfill / import enrichment).
+        let full = catalog_track(
+            "deezer",
+            "77",
+            "When I'm Home",
+            &["James Blake", "Travis Scott", "Ludwig Göransson"],
+            None,
+            None,
+            None,
+        );
+        upsert_track(&conn, &full).unwrap();
+        // The same track arriving from a catalog surface (album tracklist /
+        // search), which only ever knows the primary artist…
+        let mut hits =
+            vec![catalog_track("deezer", "77", "When I'm Home", &["James Blake"], None, None, None)];
+        annotate_with_library_state(&conn, &mut hits, None).unwrap();
+        assert_eq!(
+            hits[0].artists,
+            vec!["James Blake", "Travis Scott", "Ludwig Göransson"],
+            "an owned track shows its library credits on catalog surfaces"
+        );
+        assert!(hits[0].local_track_id.is_some());
+
+        // …and the reverse: a THIN library row must never strip names the
+        // catalog provided.
+        let thin = catalog_track("deezer", "78", "Solo", &["A"], None, None, None);
+        upsert_track(&conn, &thin).unwrap();
+        let mut hits2 = vec![catalog_track("deezer", "78", "Solo", &["A", "B"], None, None, None)];
+        annotate_with_library_state(&conn, &mut hits2, None).unwrap();
+        assert_eq!(hits2[0].artists, vec!["A", "B"]);
+    }
+
+    #[test]
+    fn credit_names_prefers_contributors_dedups_and_falls_back_to_primary() {
+        let refs = |names: &[&str]| -> Vec<crate::deezer::ArtistRef> {
+            names.iter().map(|n| crate::deezer::ArtistRef { name: (*n).into() }).collect()
+        };
+        // Full credits, order preserved, case-insensitive dedup, blanks dropped.
+        assert_eq!(
+            credit_names(
+                &refs(&["James Blake", "Travis Scott", "james blake", " ", "Ludwig Göransson"]),
+                "James Blake"
+            ),
+            vec!["James Blake", "Travis Scott", "Ludwig Göransson"]
+        );
+        // No contributors (search hits) → the primary artist alone.
+        assert_eq!(credit_names(&refs(&[]), "James Blake"), vec!["James Blake"]);
+    }
+
+    #[test]
+    fn upsert_never_downgrades_a_richer_artists_array() {
+        let conn = open_test_db();
+        // Born with full credits (the import-time enrichment or Spotify sync).
+        let full = catalog_track(
+            "deezer",
+            "42",
+            "When I'm Home",
+            &["James Blake", "Travis Scott", "Ludwig Göransson"],
+            None,
+            None,
+            Some("USQ4E2600373"),
+        );
+        let (tid, new) = upsert_track(&conn, &full).unwrap();
+        assert!(new);
+        // Re-touched later via a /search hit that only knows one artist —
+        // exactly what tap-to-play sends. This used to shrink the array.
+        let thin = catalog_track(
+            "deezer",
+            "42",
+            "When I'm Home",
+            &["James Blake"],
+            None,
+            None,
+            Some("USQ4E2600373"),
+        );
+        let (tid2, new2) = upsert_track(&conn, &thin).unwrap();
+        assert_eq!((tid2, new2), (tid, false), "same row, not a duplicate");
+        let stored: String = conn
+            .query_row("SELECT artists FROM tracks WHERE id = ?1", params![tid], |r| r.get(0))
+            .unwrap();
+        let names: Vec<String> = serde_json::from_str(&stored).unwrap();
+        assert_eq!(names.len(), 3, "full credits survive a thin re-upsert: {stored}");
+        // And the reverse still upgrades: a thin row later touched with full
+        // credits adopts them.
+        let thin2 = catalog_track("deezer", "43", "Solo", &["A"], None, None, None);
+        let (t2, _) = upsert_track(&conn, &thin2).unwrap();
+        let full2 = catalog_track("deezer", "43", "Solo", &["A", "B"], None, None, None);
+        upsert_track(&conn, &full2).unwrap();
+        let stored2: String = conn
+            .query_row("SELECT artists FROM tracks WHERE id = ?1", params![t2], |r| r.get(0))
+            .unwrap();
+        assert_eq!(serde_json::from_str::<Vec<String>>(&stored2).unwrap(), vec!["A", "B"]);
+    }
+
+    #[test]
     fn home_impressions_bump_once_per_day_and_skip_non_discovery() {
         let conn = open_test_db();
         let disc =
@@ -14329,6 +15139,96 @@ mod tests {
             0,
             "an unseen item is freshest (tier 0)"
         );
+    }
+
+    /// Live smoke test for the Deezer resolution half of the song shelf's
+    /// network path (keyless API — needs only a network). Ignored by default;
+    /// run with `cargo test -- --ignored deezer`.
+    #[tokio::test]
+    #[ignore = "live network"]
+    async fn deezer_resolves_a_known_pair_to_playable_hits() {
+        let hits = deezer_resolve_tracks_parallel(
+            vec![("Believe".to_string(), "Cher".to_string())],
+            resolve_limiter(),
+        )
+        .await;
+        assert!(!hits.is_empty(), "a globally known track should resolve");
+        assert!(hits.iter().all(|h| h.id > 0 && !h.title.is_empty()));
+    }
+
+    #[test]
+    fn song_similar_pick_drops_seed_song_seed_artist_and_dupes_but_keeps_library_artists() {
+        let hits = vec![
+            th(1, "Pyramid Song", "Radiohead", 0), // the seed itself — dropped
+            th(2, "Weird Fishes", "Radiohead", 0), // seed artist's catalog — dropped
+            th(3, "Teardrop", "Massive Attack", 0),
+            th(3, "Teardrop", "Massive Attack", 0), // dupe id — dropped
+            th(4, "Roads", "Portishead", 0),
+        ];
+        let out = song_similar_pick(hits, "Pyramid Song", "Radiohead", 24);
+        let titles: Vec<&str> = out.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titles, vec!["Teardrop", "Roads"]);
+
+        // The cap is honored.
+        let many: Vec<_> = (10..40).map(|i| th(i, &format!("t{i}"), "X", 0)).collect();
+        assert_eq!(song_similar_pick(many, "seed", "Seed Artist", 5).len(), 5);
+    }
+
+    #[test]
+    fn discovery_report_joins_impressions_to_adoption_and_groups_by_shelf() {
+        let conn = open_test_db();
+        // play_events.profile_id gained an FK in migration 024 — the profile
+        // must exist before a play can reference it.
+        conn.execute("INSERT INTO profiles (id, name) VALUES (7, 'T')", [])
+            .unwrap();
+        let radar = track_row_shelf("Radar", vec![th(1, "kept", "A", 0)]).discovery();
+        let under = track_row_shelf("Under", vec![th(2, "ignored", "B", 0)]).discovery();
+        log_home_impressions(&conn, Some(7), "2026-07-01", &[radar, under]);
+
+        // Track 1 was adopted: imported to the library (catalog identity becomes
+        // spotify_id) and played twice after it was shown — one full listen, one
+        // partial. Track 2 was shown and never touched.
+        conn.execute(
+            "INSERT INTO tracks (spotify_id, title, artists, duration_ms)
+             VALUES ('deezer:1', 'kept', '[\"A\"]', 200000)",
+            [],
+        )
+        .unwrap();
+        let tid: i64 = conn
+            .query_row("SELECT id FROM tracks WHERE spotify_id = 'deezer:1'", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO play_events (track_id, profile_id, played_at, ms_played, completed)
+             VALUES (?1, 7, strftime('%s','2026-07-02'), 200000, 1),
+                    (?1, 7, strftime('%s','2026-07-03'), 90000, 0)",
+            params![tid],
+        )
+        .unwrap();
+        // A play from BEFORE the impression must not count toward the funnel.
+        conn.execute(
+            "INSERT INTO play_events (track_id, profile_id, played_at, ms_played, completed)
+             VALUES (?1, 7, strftime('%s','2026-06-01'), 200000, 1)",
+            params![tid],
+        )
+        .unwrap();
+
+        let rep = home_discovery_report(&conn, Some(7));
+        let kept = rep.items.iter().find(|i| i.item_key == "deezer:1").unwrap();
+        assert!(kept.in_library);
+        assert_eq!(kept.plays_since_shown, 2, "the pre-impression play is excluded");
+        assert_eq!(kept.completed_since_shown, 1);
+        assert_eq!(kept.shelf.as_deref(), Some("Radar"));
+        let ignored = rep.items.iter().find(|i| i.item_key == "deezer:2").unwrap();
+        assert!(!ignored.in_library);
+        assert_eq!(ignored.plays_since_shown, 0);
+
+        let radar_row = rep.shelves.iter().find(|s| s.shelf == "Radar").unwrap();
+        assert_eq!((radar_row.items, radar_row.in_library, radar_row.played), (1, 1, 1));
+        let under_row = rep.shelves.iter().find(|s| s.shelf == "Under").unwrap();
+        assert_eq!((under_row.items, under_row.in_library, under_row.played), (1, 0, 0));
+
+        // Another profile sees nothing — the funnel is profile-scoped.
+        assert!(home_discovery_report(&conn, Some(8)).items.is_empty());
     }
 
     // --- P16 station ---------------------------------------------------

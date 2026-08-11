@@ -151,6 +151,40 @@ const IS_IOS =
 // stepped away"; bounded so a forgotten pause doesn't hold an audio
 // session (and its slice of battery) all night.
 const PAUSE_KEEPALIVE_MAX_MS = 15 * 60_000;
+/** How long a track change may take before a `pause` from the element stops
+ *  counting as incidental. Generous on purpose: a cold cellular fetch can be
+ *  slow, and being wrong in this direction only costs the keepalive, whereas
+ *  being wrong the other way silences the next track. */
+const TRACK_CHANGE_GRACE_MS = 15_000;
+/** How long the element may sit without enough data to play, while we believe
+ *  playback is running, before we force a fresh load. iOS stalls a media fetch
+ *  started while the phone is locked often enough that this is a normal
+ *  condition, not an exceptional one — and it arrives with NO `error`, so none
+ *  of the error-driven recovery below ever sees it. Long enough not to fight a
+ *  slow cellular buffer; short enough that a stall doesn't cost a whole song. */
+const STALL_RECOVER_MS = 8_000;
+/** How many times a stalled stream may be reloaded before we stop and hand it
+ *  back to the user. Matches the error path's cap: past this, retrying is not
+ *  the problem. */
+const STALL_RETRY_MAX = 4;
+
+/** How long after an interruption we'll still resume playback when the user
+ *  comes back to their phone. Long enough to cover a real phone call, short
+ *  enough that music doesn't start up out of a pocket hours later — by then it
+ *  reads as the app deciding to play rather than finishing what it was doing. */
+const INTERRUPTION_RESUME_WINDOW_MS = 30 * 60_000;
+/** How long a starved element gets before we stop waiting for its own loader
+ *  and hand it the bytes directly. Measured on a locked iPhone 31 Jul: healthy
+ *  track changes reach a full buffer in 0.1-0.8s, so 1.5s only ever catches a
+ *  genuine stall. The reload watchdog above stays as the later fallback. */
+const BLOB_RESCUE_AFTER_MS = 1_500;
+/** Rescue attempts per track before we let the reload watchdog take over. Two
+ *  is enough for a transient miss; more would just be the same failure again. */
+const BLOB_RESCUE_MAX = 2;
+
+/** How many upcoming tracks we hold decoded audio for. The current track plus
+ *  the next two, at roughly 2-3MB each. */
+const PREFETCH_HOLD_MAX = 3;
 
 /**
  * A few seconds of genuine silence as an inline WAV. The pause
@@ -402,8 +436,43 @@ export function Player({
   // ~10 s after a lock-screen pause and the controls vanish). Created
   // lazily on first pause; capped by PAUSE_KEEPALIVE_MAX_MS.
   const keepaliveRef = useRef<HTMLAudioElement | null>(null);
+  // True while a track change is in flight. Swapping `src` makes the element
+  // fire `pause`, which is indistinguishable from a user pause at the store
+  // level — and starting the keepalive there is actively harmful: the silent
+  // loop takes the audio session at the exact moment the next track needs it.
+  // Backgrounded, the real element's play() then fails, `isPlaying` never
+  // returns true, and the loop holds the session until its 15-minute cap while
+  // MediaSession shows the new artwork and the clock keeps running. That is the
+  // "new song on the lock screen, no sound until you open the app" report.
+  const trackChangingRef = useRef(false);
+  const trackChangeSafetyRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const keepaliveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const keepaliveAssertRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Set when playback was stopped by something other than the user — a phone
+  // call, or another app taking the audio session. iOS hands a native app an
+  // "interruption ended" notification; a web page gets nothing at all, so this
+  // is the only record that we owe the user a resume.
+  //
+  // Telling the two apart needs no extra flag, because they arrive in opposite
+  // orders. A deliberate pause starts in the store — the button, the
+  // MediaSession handler — which sets `isPlaying` false and only then does the
+  // load effect call `a.pause()`, so the store is already false when the
+  // `pause` event lands. An interruption pauses the element directly and finds
+  // the store still true.
+  //
+  // Resuming happens ONLY when the page becomes visible again. A first attempt
+  // retried on a timer, on the assumption that `play()` would fail while a call
+  // held the audio session. **It doesn't** — tested on-device 1 Aug: the retry
+  // succeeded and the music played underneath the call, audible to both
+  // parties. `play()` succeeding is not evidence an interruption ended.
+  //
+  // Nothing can resume without the user coming back to the app, either. The
+  // page is suspended about twelve seconds after the audio stops — measured
+  // during a real call, heartbeats ceased 8.6s in and never returned — so no
+  // timer, listener or AudioContext state change can run to notice the call
+  // ending. That ceiling belongs to web pages, not to this code.
+  const interruptedRef = useRef(false);
+  const interruptedAtRef = useRef(0);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   // Ephemeral "source not available" flash shown when an unavailable track is
   // auto-skipped. Kept separate from `errorMsg` (which is wiped on every track
@@ -863,6 +932,24 @@ export function Player({
   // iOS grants those callbacks — a backgrounded page can't start
   // playback outside one) and from the isPlaying effect (covers in-app
   // pauses, which happen foregrounded where no gesture is needed).
+  // Raise the track-change flag, with a safety release: if the new track never
+  // reaches `playing` (a dead source, a failed fetch), the flag must not disable
+  // the keepalive forever. Releasing early only costs us the pre-#64 behaviour.
+  const markTrackChanging = useCallback(() => {
+    trackChangingRef.current = true;
+    if (trackChangeSafetyRef.current) clearTimeout(trackChangeSafetyRef.current);
+    trackChangeSafetyRef.current = setTimeout(() => {
+      trackChangingRef.current = false;
+    }, TRACK_CHANGE_GRACE_MS);
+  }, []);
+  const clearTrackChanging = useCallback(() => {
+    trackChangingRef.current = false;
+    if (trackChangeSafetyRef.current) {
+      clearTimeout(trackChangeSafetyRef.current);
+      trackChangeSafetyRef.current = null;
+    }
+  }, []);
+
   const stopSessionKeepalive = useCallback(() => {
     if (keepaliveTimerRef.current) {
       clearTimeout(keepaliveTimerRef.current);
@@ -917,9 +1004,17 @@ export function Player({
       return () => clearTimeout(t);
     }
     if (!track || castActive) stopSessionKeepalive();
-    else startSessionKeepalive();
+    // A pause raised by swapping `src` is not the user pausing. Starting the
+    // silent loop here steals the audio session from the track that is loading.
+    else if (!trackChangingRef.current) startSessionKeepalive();
   }, [isPlaying, track?.id, castActive, startSessionKeepalive, stopSessionKeepalive]);
-  useEffect(() => () => stopSessionKeepalive(), [stopSessionKeepalive]);
+  useEffect(
+    () => () => {
+      stopSessionKeepalive();
+      clearTrackChanging();
+    },
+    [stopSessionKeepalive, clearTrackChanging],
+  );
 
   // Optimistically raise the buffering flag the instant `isPlaying`
   // becomes true — that way the spinner appears on the play button
@@ -1425,7 +1520,8 @@ export function Player({
       blobUrlRef.current = null;
       // A track is playable only when it has an imported audio file; the queue
       // filter never enqueues a non-audio track, but guard anyway (null src).
-      setAudioSrc(playbackUrl(track, token));
+      // Held bytes win while hidden — see `resolvePlaybackSrc`.
+      setAudioSrc(resolvePlaybackSrc(track));
       setSourceMode('streaming');
       if (priorBlobUrl) URL.revokeObjectURL(priorBlobUrl);
       return;
@@ -1491,6 +1587,15 @@ export function Player({
         ? [ni >= 0 ? queue[ni] : undefined]
         : [queue[currentIndex + 1], queue[currentIndex + 2]]
     ).filter((t): t is NonNullable<typeof t> => Boolean(t && isPlayable(t)));
+    // Evict anything we're no longer about to need. The map is the sole owner
+    // of these object URLs, so this is the only place they're revoked — and the
+    // current track is always kept, since the element may be playing it.
+    const keep = new Set<number>([track.id, ...upcoming.map((t) => t.id)]);
+    for (const [id, objectUrl] of prefetchedRef.current) {
+      if (keep.has(id)) continue;
+      URL.revokeObjectURL(objectUrl);
+      prefetchedRef.current.delete(id);
+    }
     if (upcoming.length === 0) return;
     const ctrl = new AbortController();
     // Stagger by 2s and 6s so neither prefetch competes with the
@@ -1501,28 +1606,30 @@ export function Player({
       const id = window.setTimeout(() => {
         const url = playbackUrl(track, token);
         if (!url) return;
-        if (track.has_audio) {
-          // Downloaded file — pull it fully so the browser caches it; the audio
-          // element can then load from cache, which survives a locked screen.
-          fetch(url, { signal: ctrl.signal })
-            .then((r) => r.blob())
-            .catch(() => {});
-        } else {
-          // Streamed (/live) track — a tiny range request makes the desktop
-          // de-fragment it to its temp cache NOW, so the real request is ready
-          // the instant the queue advances. This is exactly the case that
-          // failed before: a non-downloaded next song cold-starting a /live
-          // fetch while the phone is locked, in iOS's tiny background window.
-          // We don't keep the bytes — only the server-side prep matters.
-          fetch(url, {
-            method: 'GET',
-            headers: { Range: 'bytes=0-1' },
-            cache: 'no-store',
-            signal: ctrl.signal,
+        if (prefetchedRef.current.has(track.id)) return;
+        // Pull the whole track and KEEP it. Warming the HTTP cache is not
+        // enough: a media element's own loader is suspended while the page is
+        // backgrounded and its range requests miss the cache `fetch()` filled,
+        // so the element would still go to the network and still be slow. Bytes
+        // we already hold can be handed over as an object URL with no request
+        // at all, which is the only way a backgrounded boundary reliably beats
+        // iOS's suspension fuse.
+        //
+        // /live tracks get the same treatment now. They used to receive a
+        // 2-byte range request purely to make the desktop de-fragment them, but
+        // they are the slowest to start (2-4s observed) and so the likeliest to
+        // run the fuse down.
+        fetch(url, { signal: ctrl.signal })
+          .then((r) => (r.ok ? r.blob() : null))
+          .then((blob) => {
+            if (!blob || ctrl.signal.aborted) return;
+            if (prefetchedRef.current.has(track.id)) return;
+            if (prefetchedRef.current.size >= PREFETCH_HOLD_MAX) return;
+            prefetchedRef.current.set(track.id, URL.createObjectURL(blob));
           })
-            .then((r) => r.arrayBuffer())
-            .catch(() => {});
-        }
+          .catch(() => {
+            /* the boundary falls back to the network URL, as it always did */
+          });
       }, delay);
       timeouts.push(id);
     };
@@ -1555,6 +1662,10 @@ export function Player({
   useEffect(
     () => () => {
       if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current);
+      for (const objectUrl of prefetchedRef.current.values()) {
+        URL.revokeObjectURL(objectUrl);
+      }
+      prefetchedRef.current.clear();
     },
     [],
   );
@@ -1591,6 +1702,13 @@ export function Player({
   // as the prior `ended` event, which empirically keeps playback
   // alive across background track changes.
   const loadedSrcRef = useRef<string | null>(null);
+  // What we last assigned to `audio.src`. Needed because the element's `src`
+  // getter returns an absolutised URL, so it can never be compared against the
+  // relative paths `audioSrc` holds. The element's source is driven
+  // imperatively — see the load effect and `startNextTrackNow` below — rather
+  // than through a React `src` prop, because the prop's write lands in a later
+  // commit and that delay is what loses the audio session on a locked phone.
+  const currentSrcKeyRef = useRef<string | null>(null);
 
   // Live-stream error recovery: the phone streams audio from the desktop, so a
   // dropped stream (the desktop restarting, or a stale URL after the app was
@@ -1598,6 +1716,197 @@ export function Player({
   // forces a fresh load() of the SAME src to recover; `retryRef` caps the
   // auto-retries with a backoff so a genuinely-bad track still surfaces an error.
   const [reloadNonce, setReloadNonce] = useState(0);
+  // Decoded audio for the tracks we expect to play next, keyed by track id.
+  // Holding the bytes is what makes a backgrounded track change instant — see
+  // `resolvePlaybackSrc`. This map owns its object URLs and revokes them on
+  // eviction; nothing else may revoke them.
+  const prefetchedRef = useRef<Map<number, string>>(new Map());
+  /** The source to hand the element for `t`.
+   *
+   *  Normally the network URL. When the page is hidden and we already hold the
+   *  track's bytes, the object URL instead — because a backgrounded track change
+   *  has to produce audio almost immediately, and a network round trip is too
+   *  slow to guarantee that.
+   *
+   *  The deadline is hard and it is not ours. iOS keeps a backgrounded page
+   *  running *because* it is playing audio; once audio actually stops, that
+   *  justification lapses and the whole page is suspended — timers, callbacks,
+   *  even Web Inspector evaluation. Measured on a locked iPhone 1 Aug: audio
+   *  stopped at 22:55:39 and all script execution ceased at 22:55:51. So every
+   *  recovery mechanism is racing a ~12s fuse, and the only reliable answer is
+   *  not to let the audio stop in the first place.
+   *
+   *  Foreground stays on the network URL, and so does AirPlay: a Blob lives in
+   *  this page's JS context, so an AirPlay receiver handed one spins forever
+   *  (see the note on the src effect). Neither is the case that fails. */
+  const resolvePlaybackSrc = useCallback(
+    (t: { id: number; has_audio: boolean }): string | null => {
+      const net = playbackUrl(t, token);
+      if (!net || !document.hidden) return net;
+      const el = audioRef.current as
+        | (HTMLAudioElement & { webkitCurrentPlaybackTargetIsWireless?: boolean })
+        | null;
+      if (el?.webkitCurrentPlaybackTargetIsWireless) return net;
+      return prefetchedRef.current.get(t.id) ?? net;
+    },
+    [token],
+  );
+  // Stall watchdog. `stalled`/`waiting` say the fetch produced no data; neither
+  // sets `a.error`, so the error paths below never fire and the element sits at
+  // readyState 1 (metadata only) indefinitely. Observed on a locked phone
+  // 30 Jul: the next track loaded its header, stalled, and never played — the
+  // lock screen showed the right duration over silence until the app was
+  // foregrounded, which un-stalled the network on its own.
+  const stallTimerRef = useRef<number>(0);
+  /** Cancel a pending stall recovery — the stream started moving again. */
+  const clearStallWatchdog = useCallback(() => {
+    if (stallTimerRef.current) {
+      window.clearTimeout(stallTimerRef.current);
+      stallTimerRef.current = 0;
+    }
+  }, []);
+  /** Arm the stall watchdog. Re-arming is harmless: the newest timer wins.
+   *  Recovery is a fresh load of the same src — the identical move the error
+   *  path makes — because a stalled fetch will not resume on its own while the
+   *  phone stays locked, and the request that replaces it usually does. */
+  const armStallWatchdog = useCallback(() => {
+    clearStallWatchdog();
+    stallTimerRef.current = window.setTimeout(() => {
+      stallTimerRef.current = 0;
+      const a = audioRef.current;
+      if (!a || !usePlayerStore.getState().isPlaying) return;
+      // HAVE_FUTURE_DATA (3) is the bar for "can actually keep playing".
+      // Anything less, this long after a stall, is stuck rather than slow.
+      if (a.readyState >= 3) return;
+      const r = retryRef.current;
+      if (r.count >= STALL_RETRY_MAX) {
+        setErrorMsg('Couldn’t reach the stream — tap play to try again.');
+        usePlayerStore.setState({ isPlaying: false });
+        return;
+      }
+      r.count += 1;
+      raiseBuffering();
+      setReloadNonce((n) => n + 1);
+    }, STALL_RECOVER_MS);
+  }, [clearStallWatchdog]);
+  useEffect(() => clearStallWatchdog, [clearStallWatchdog]);
+
+  // ---- Blob rescue -------------------------------------------------------
+  //
+  // Reloading a stalled src (the watchdog above) assumes the element's loader
+  // can still reach the network. Backgrounded on iOS it cannot, and no amount
+  // of reloading changes that. Instrumented on a locked iPhone 31 Jul:
+  //
+  //   EVT stalled  ready=1 buf=0        <- element has nothing
+  //   fetch(sameUrl) -> 2863KB in 5ms   <- page networking is untouched
+  //
+  // Five milliseconds, because the prefetch had already put those bytes in the
+  // HTTP cache. The audio was sitting on the phone and the element still could
+  // not reach it: a media element's resource loading is suspended while
+  // backgrounded, and its Range requests miss the cache `fetch()` populated.
+  // Handing the same bytes over as an in-memory Blob took readyState 0 -> 4 in
+  // ~50ms with the screen still locked, twice, in the same run in which the
+  // one boundary we deliberately left unrescued stalled as it always had.
+  //
+  // So this is deliberately NOT the normal source path. `audioSrc` stays a
+  // stable HTTP URL (see the AirPlay note on the src effect above) and we only
+  // swap in a Blob once the element has demonstrably failed to load on its own.
+  // The assignment is made straight to the DOM node rather than through state:
+  // React's `src` prop is unchanged, so no reconciliation undoes it and the
+  // load effect's `loadKey` stays put.
+  const blobRescueTimerRef = useRef<number>(0);
+  const blobRescueCountRef = useRef(0);
+  /** Cancel a pending rescue — the element started loading after all. */
+  const clearBlobRescue = useCallback(() => {
+    if (blobRescueTimerRef.current) {
+      window.clearTimeout(blobRescueTimerRef.current);
+      blobRescueTimerRef.current = 0;
+    }
+  }, []);
+  /** Arm the rescue. Unlike the reload watchdog this does NOT re-arm: `waiting`
+   *  and `stalled` often arrive together, and pushing the deadline out on each
+   *  one would let a wedged element keep deferring its own rescue. */
+  const armBlobRescue = useCallback(() => {
+    if (blobRescueTimerRef.current) return;
+    blobRescueTimerRef.current = window.setTimeout(() => {
+      blobRescueTimerRef.current = 0;
+      const a = audioRef.current;
+      if (!a || !usePlayerStore.getState().isPlaying) return;
+      // Backgrounded only. The defect is that a media element's own loader is
+      // suspended while the page is hidden. In the foreground `waiting` means
+      // an ordinarily slow network, and swapping to a Blob there would be a
+      // regression: playback would wait for the whole file instead of resuming
+      // progressively after a few hundred KB.
+      if (!document.hidden) return;
+      // HAVE_FUTURE_DATA — it recovered on its own while we waited.
+      if (a.readyState >= 3) return;
+      if (a.src.startsWith('blob:')) return;
+      if (blobRescueCountRef.current >= BLOB_RESCUE_MAX) return;
+      // AirPlay can't play a Blob: the bytes live in this page's JS context and
+      // the receiver spins forever. Read the live element property rather than
+      // the React mirror so a route that changed mid-stall is still respected.
+      const wireless = (
+        a as HTMLAudioElement & { webkitCurrentPlaybackTargetIsWireless?: boolean }
+      ).webkitCurrentPlaybackTargetIsWireless;
+      if (wireless) return;
+      const url = a.currentSrc;
+      if (!url || url.startsWith('blob:') || url.startsWith('data:')) return;
+      blobRescueCountRef.current += 1;
+      void (async () => {
+        let objectUrl: string | null = null;
+        try {
+          const resp = await fetch(url);
+          if (!resp.ok) return;
+          const blob = await resp.blob();
+          const el = audioRef.current;
+          // Re-check everything: the fetch is async and the track may have
+          // changed, recovered, or been paused while it was in flight.
+          if (!el || el !== a) return;
+          if (el.readyState >= 3 || el.src.startsWith('blob:')) return;
+          if (el.currentSrc !== url) return;
+          if (!usePlayerStore.getState().isPlaying) return;
+          const resumeAt = el.currentTime;
+          objectUrl = URL.createObjectURL(blob);
+          // Mid-track stalls have a position worth keeping; track boundaries
+          // sit at ~0. Restore only once the new source knows its duration.
+          if (resumeAt > 0.5) {
+            el.addEventListener(
+              'loadedmetadata',
+              () => {
+                try {
+                  el.currentTime = resumeAt;
+                } catch {
+                  /* seek refused — better to restart the track than stay silent */
+                }
+              },
+              { once: true },
+            );
+          }
+          const prior = blobUrlRef.current;
+          blobUrlRef.current = objectUrl;
+          // Assigning src runs the load algorithm; the bytes are already local
+          // so this resolves without touching the network.
+          el.src = objectUrl;
+          objectUrl = null; // handed over — the track-change effect revokes it
+          await el.play();
+          if (prior) URL.revokeObjectURL(prior);
+        } catch {
+          // Leave it to the reload watchdog, then the error path.
+        } finally {
+          if (objectUrl) URL.revokeObjectURL(objectUrl);
+        }
+      })();
+    }, BLOB_RESCUE_AFTER_MS);
+  }, []);
+  useEffect(() => clearBlobRescue, [clearBlobRescue]);
+  // A new track gets a clean slate: cancel any rescue still armed for the one
+  // before it, and hand back the full allowance. Kept out of the src effect
+  // above so nothing in the AirPlay-sensitive path has to move.
+  useEffect(() => {
+    clearBlobRescue();
+    blobRescueCountRef.current = 0;
+  }, [track?.id, clearBlobRescue]);
+
   const retryRef = useRef<{ count: number; timer: number }>({ count: 0, timer: 0 });
   // Consecutive tracks auto-skipped because their source 404'd — a stale queue
   // (e.g. after a library migration/rebrand, or a pruned discovery row) points
@@ -1616,7 +1925,23 @@ export function Player({
   // PLAYING tick would re-fire `a.play()` on the local element.
   useEffect(() => {
     const a = audioRef.current;
-    if (!a || !audioSrc) return;
+    if (!a) return;
+    if (!audioSrc) {
+      // No track: tear the element down. This used to happen for free when
+      // React rendered `src={undefined}`; now that the source is imperative
+      // it has to be done here.
+      if (currentSrcKeyRef.current !== null) {
+        currentSrcKeyRef.current = null;
+        loadedSrcRef.current = null;
+        a.removeAttribute('src');
+        try {
+          a.load();
+        } catch {
+          /* teardown races are harmless */
+        }
+      }
+      return;
+    }
     if (castActive) {
       a.pause();
       return;
@@ -1631,9 +1956,20 @@ export function Player({
     // don't reset playback to 0.
     const loadKey = `${audioSrc}#${reloadNonce}`;
     if (loadedSrcRef.current !== loadKey || a.error) {
+      const srcChanged = currentSrcKeyRef.current !== audioSrc;
       loadedSrcRef.current = loadKey;
       try {
-        a.load();
+        if (srcChanged) {
+          // Assigning src *is* the load algorithm; calling load() as well
+          // would run it twice, and the second run can interrupt the play()
+          // the first one just enabled.
+          currentSrcKeyRef.current = audioSrc;
+          a.src = audioSrc;
+        } else {
+          // Same source, forced reload: the stream-error retry bumping
+          // `reloadNonce`, or a play tap after `a.error`.
+          a.load();
+        }
       } catch {
         /* load() can throw on some browsers during teardown — harmless */
       }
@@ -1662,6 +1998,66 @@ export function Player({
     }
   }, [isPlaying, audioSrc, castActive, reloadNonce]);
 
+  /** Point the element at the freshly-advanced track *inside the `ended`
+   *  event's call stack*, rather than waiting for `audioSrc` to travel through
+   *  two React renders.
+   *
+   *  That wait is the lock-screen bug. `onEnded` only mutates the store; the
+   *  source change then needs one render for `isPlaying` and another for
+   *  `setAudioSrc` before the effect above touches the element. Backgrounded,
+   *  iOS drops the page's audio session across that gap, and the new track then
+   *  sits at readyState 1 with an empty buffer indefinitely — from any source,
+   *  network URL or fully in-memory Blob alike.
+   *
+   *  What hid this for so long is an accident. When React renders the
+   *  `isPlaying` flip on its own, the effect fires once while `audioSrc` still
+   *  names the *old* track, re-playing the just-ended one for ~100ms, and that
+   *  incidental playback holds the session until the real source lands. When
+   *  React batches the `pause` and `ended` updates into a single render,
+   *  `isPlaying` nets to no change, the effect never runs, the replay never
+   *  happens, and playback dies. Instrumented on a locked iPhone 1 Aug: 20 of
+   *  20 surviving boundaries showed that replay; both failures showed none.
+   *
+   *  Online path only — the offline branch resolves a Blob from the cache
+   *  asynchronously and so cannot run here, and a phone with no network is not
+   *  the case this protects. */
+  const startNextTrackNow = useCallback(
+    (endedTrackId: number | undefined) => {
+      const a = audioRef.current;
+      if (!a || castActive || !navigator.onLine) return;
+      const st = usePlayerStore.getState();
+      // Not advancing: end of the queue, or the sleep timer stopping here.
+      if (!st.isPlaying) return;
+      const next = currentTrack(st);
+      if (!next) return;
+      // repeat-'one' stays on the same track — the element already holds it,
+      // and reloading would re-download it to play the same thing.
+      if (endedTrackId !== undefined && next.id === endedTrackId) return;
+      // Held bytes win while hidden. This is the whole point of the prefetch
+      // cache: at a backgrounded boundary the element must start producing
+      // audio before iOS's suspension fuse burns down, and a network round trip
+      // is not reliably fast enough.
+      const url = resolvePlaybackSrc(next);
+      if (!url) return;
+      currentSrcKeyRef.current = url;
+      // Claim the load so the effect above treats this source as handled and
+      // doesn't run the load algorithm a second time on the next render.
+      loadedSrcRef.current = `${url}#${reloadNonce}`;
+      try {
+        a.src = url;
+        void a.play().catch(() => {
+          /* the effect and the error path each still get their turn */
+        });
+      } catch {
+        /* fall back to the effect-driven path */
+      }
+    },
+    // `token` isn't listed: the source now comes from `resolvePlaybackSrc`,
+    // which carries that dependency itself.
+    [castActive, reloadNonce, resolvePlaybackSrc],
+  );
+
+
   // Background-audio recovery. iOS Safari sometimes leaves the audio
   // element in a stuck state after an in-background track change:
   // store.isPlaying is still true (because we never received an
@@ -1682,16 +2078,37 @@ export function Player({
       // visibility flip would re-start playback even when the user
       // intentionally paused before locking the phone.
       const playing = usePlayerStore.getState().isPlaying;
-      if (!playing) return;
+      // …or when an interruption stopped us. `isPlaying` is false there too —
+      // the music really did stop, and the UI should say so — but we still owe
+      // the user a resume, which is what `interruptedRef` remembers.
+      let interrupted = interruptedRef.current;
+      if (
+        interrupted &&
+        Date.now() - interruptedAtRef.current > INTERRUPTION_RESUME_WINDOW_MS
+      ) {
+        // Long enough ago that picking the music back up would surprise rather
+        // than help — a call an hour ago is not a request to start playing.
+        interruptedRef.current = false;
+        interrupted = false;
+      }
+      if (!playing && !interrupted) return;
       if (a.error) {
         // The stream died while backgrounded (server moved on / URL went stale)
         // — force a fresh load to resume from the saved position.
         retryRef.current.count = 0;
         setReloadNonce((n) => n + 1);
       } else if (a.paused) {
-        void a.play().catch(() => {
-          /* If iOS still refuses, leave it for the user to tap play. */
-        });
+        if (interrupted) {
+          // Put the store back first and let the play/pause effect issue the
+          // actual play(), so there is still exactly one caller driving the
+          // element rather than two racing.
+          interruptedRef.current = false;
+          usePlayerStore.setState({ isPlaying: true });
+        } else {
+          void a.play().catch(() => {
+            /* If iOS still refuses, leave it for the user to tap play. */
+          });
+        }
       }
     };
     document.addEventListener('visibilitychange', onVisible);
@@ -1805,10 +2222,17 @@ export function Player({
       // reclaims it (and the lock-screen card) ~10 s from now.
       startSessionKeepalive();
     });
-    ms.setActionHandler('previoustrack', () =>
-      usePlayerStore.getState().prev(),
-    );
-    ms.setActionHandler('nexttrack', () => usePlayerStore.getState().next());
+    // Same incidental-pause problem as a natural track end: skipping swaps
+    // `src`, the element fires `pause`, and without the flag the keepalive
+    // would grab the session the new track is about to need.
+    ms.setActionHandler('previoustrack', () => {
+      markTrackChanging();
+      usePlayerStore.getState().prev();
+    });
+    ms.setActionHandler('nexttrack', () => {
+      markTrackChanging();
+      usePlayerStore.getState().next();
+    });
     // Intentionally do NOT register seekto / seekbackward / seekforward.
     // iOS Safari picks the lock-screen UI based on what's registered:
     //   - any seek handler present  → ±10s skip-button variant
@@ -1829,6 +2253,7 @@ export function Player({
     currentArtworkDataUrl,
     startSessionKeepalive,
     stopSessionKeepalive,
+    markTrackChanging,
   ]);
 
   // (3) Playback state — flips when isPlaying changes. Cheap.
@@ -2217,7 +2642,10 @@ export function Player({
     >
       <audio
         ref={audioRef}
-        src={audioSrc ?? undefined}
+        // No `src` prop: the source is assigned imperatively (see the load
+        // effect and `startNextTrackNow`). A React-rendered `src` lands in a
+        // later commit, and on a locked phone that delay costs the audio
+        // session — see the comment on `startNextTrackNow`.
         // `auto` (vs `metadata`) tells the browser to start streaming
         // the whole file as soon as src is set, not only the header.
         // Tapping play after a track loads is then near-instant — the
@@ -2279,7 +2707,14 @@ export function Player({
               durMs: track.duration_ms,
             };
           }
+          markTrackChanging();
+          const endedId = track?.id;
           handleTrackEnded();
+          // The store is already advanced, so the next source is knowable
+          // right here. Handing it to the element now — rather than two
+          // renders later — is what keeps the audio session across a
+          // backgrounded track change.
+          startNextTrackNow(endedId);
         }}
         // Treat the element as the source of truth for play/pause state.
         // Without these handlers there's a desync window after a lock-
@@ -2291,10 +2726,26 @@ export function Player({
         // reflects what the audio is *actually* doing.
         onPlay={() => {
           usePlayerStore.setState({ isPlaying: true });
+          // Playing again, however that came about — nothing is owed.
+          interruptedRef.current = false;
+          // And whatever swap was in flight has landed.
+          clearTrackChanging();
           // Stop any preview clip so the two audio sources don't overlap.
           audioStarted('main');
         }}
-        onPause={() => usePlayerStore.setState({ isPlaying: false })}
+        onPause={() => {
+          const a = audioRef.current;
+          const wasPlaying = usePlayerStore.getState().isPlaying;
+          usePlayerStore.setState({ isPlaying: false });
+          // The store being true here means nothing in the app asked for this
+          // pause — an interruption stopped us. See `interruptedRef`.
+          // `ended` pauses the element too, but that's a track change with the
+          // next song already on its way, not something to resume.
+          if (wasPlaying && a && !a.ended) {
+            interruptedRef.current = true;
+            interruptedAtRef.current = Date.now();
+          }
+        }}
         // The native `playing` event fires when the audio element has
         // started outputting frames after a buffer / src change. We use
         // it to lift the post-track-change scrubber freeze (see
@@ -2303,7 +2754,12 @@ export function Player({
         onPlaying={() => {
           // Audio is flowing again — reset the stream-retry + gone-skip counters
           // so a future hiccup gets a fresh set of retries.
+          clearStallWatchdog();
+          clearBlobRescue();
           retryRef.current.count = 0;
+          // Frames are flowing, so this track earned a fresh set of rescues if
+          // it stalls again later. Each one still costs a real stall first.
+          blobRescueCountRef.current = 0;
           goneRef.current = 0;
           // Audio is flowing — clear any lingering error/flash banner.
           setErrorMsg(null);
@@ -2321,6 +2777,18 @@ export function Player({
         onWaiting={() => {
           if (usePlayerStore.getState().isPlaying) {
             raiseBuffering();
+            armBlobRescue();
+            armStallWatchdog();
+          }
+        }}
+        // `stalled` is the one that mattered on a locked phone: the fetch for the
+        // next track delivered its header and then nothing, with no `error` to
+        // trigger any of the recovery below. Without a watchdog the element sits
+        // at readyState 1 until the app is foregrounded.
+        onStalled={() => {
+          if (usePlayerStore.getState().isPlaying) {
+            armBlobRescue();
+            armStallWatchdog();
           }
         }}
         onError={(e) => {
@@ -2834,10 +3302,12 @@ function NowPlayingOverlay({
           (handlers live on the root), so no touch wiring is needed here. */}
       <div className="shrink-0 pt-2 pb-1 flex justify-center">
         {/* Tappable as well as draggable: the swipe still works, but a tap on
-            the handle is the quickest way back and costs nothing to offer. */}
+            the handle is the quickest way back and costs nothing to offer.
+            Goes through requestClose so it slides out like every other dismiss
+            — calling onClose directly made this one path vanish instantly. */}
         <button
           type="button"
-          onClick={onClose}
+          onClick={requestClose}
           aria-label="Close Now Playing"
           className="p-2 -m-1 active:opacity-70"
         >
@@ -3004,18 +3474,28 @@ function NowPlayingOverlay({
               )}
             </h2>
             {primaryArtist ? (
-              // Tap the artist name → open the artist's page.
-              <button
-                type="button"
-                onClick={() => {
-                  openArtistNav(primaryArtist);
-                  onClose();
-                }}
-                className="block max-w-full truncate text-left text-sm text-white/70 hover:text-white hover:underline active:opacity-80 mt-1"
-                title={`Go to artist · ${primaryArtist}`}
-              >
-                {artists.join(', ')}
-              </button>
+              // Each credited artist is its own tap target — a collab line like
+              // "James Blake, Travis Scott, Ludwig Göransson" navigates to the
+              // name that was tapped, not always the first. Same pattern as the
+              // desktop NowPlayingView.
+              <div className="max-w-full truncate text-sm text-white/70 mt-1">
+                {artists.map((a, i) => (
+                  <span key={`${a}-${i}`}>
+                    {i > 0 ? ', ' : ''}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        openArtistNav(a);
+                        onClose();
+                      }}
+                      className="hover:text-white hover:underline active:opacity-80"
+                      title={`Go to artist · ${a}`}
+                    >
+                      {a}
+                    </button>
+                  </span>
+                ))}
+              </div>
             ) : (
               <div className="text-sm text-white/70 truncate mt-1">
                 {artists.join(', ')}

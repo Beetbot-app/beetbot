@@ -872,15 +872,20 @@ export function LibraryPage({ onOpenPlaylist, onOpenSettings }: Props) {
               : 'Filter artists…';
 
   return (
-    <div
-      ref={scrollRef}
-      className="relative h-full overflow-auto px-8 pb-8 pt-6 max-w-6xl mx-auto"
-    >
-      <header className="mb-6">
+    // The header sits OUTSIDE the scroller, and only the list scrolls. It
+    // was a sticky header inside it, which pinned the controls correctly but
+    // left the scrollbar running the full height of the card — a track and
+    // thumb beside a header that never moves. Chrome above, scrollport
+    // below: the scrollbar now measures exactly what it scrolls.
+    <div className="h-full flex flex-col max-w-6xl mx-auto">
+      {/* The tab chips, sort and search are how you steer a long library,
+          so they stay put — scrolling used to carry them away, and
+          narrowing a list meant scrolling back to the top first. */}
+      <header className="shrink-0 border-b border-white/5 px-8 pt-6 pb-4">
         <h1 className="text-3xl font-bold tracking-tight">Library</h1>
         {/* Chips (type filters) on the left; sort/view + search share the row on
             the right, so the controls sit next to what they act on. */}
-        <div className="mt-4 flex items-center gap-1">
+        <div className="mt-3 flex items-center gap-1">
           {TABS.filter((t) => t.id !== 'downloaded' || canDownload).map((t) => (
             <button
               key={t.id}
@@ -961,6 +966,10 @@ export function LibraryPage({ onOpenPlaylist, onOpenSettings }: Props) {
           </div>
         </div>
       </header>
+      {/* `relative` stays on the scroller: the virtualizers read
+          `listRef.offsetTop` for their scrollMargin, which has to be
+          measured against the element that actually scrolls. */}
+      <div ref={scrollRef} className="relative flex-1 min-h-0 overflow-auto px-8 pt-6 pb-8">
 
       {error && (
         <div className={cn(CALLOUT_ERROR, 'mb-4')}>
@@ -1455,6 +1464,7 @@ export function LibraryPage({ onOpenPlaylist, onOpenSettings }: Props) {
           onClose={() => setSeedOpen(false)}
         />
       )}
+      </div>
     </div>
   );
 }

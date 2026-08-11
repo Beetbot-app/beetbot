@@ -44,7 +44,18 @@ function startsInScrolledRegion(target: HTMLElement | null): boolean {
  * Wire `handlers` to the sheet root, spread `sheetStyle` into its style, and add
  * `transitionClass` to its className. Call `requestClose` from anything that
  * dismisses (handle tap, Escape) so it slides out rather than vanishing.
+ *
+ * The slide-out is CATCHABLE: a pointer landing on the sheet while it leaves
+ * cancels the close and slides it back. Without that, a tap during those
+ * 280ms was simply lost — the sheet still covers the screen and still
+ * hit-tests, and the parent's open-state never changed, so re-opening was a
+ * no-op setState that the pending close then overrode. Catching it here fixes
+ * both sheets at once and needs nothing from either parent.
  */
+/** Slide-out duration. The transition below uses the same number — when the
+ *  unmount timer was shorter than the animation, the sheet vanished mid-slide. */
+const CLOSE_MS = 280;
+
 export function useSheetDismiss({
   onClose,
   /** Drag distance, in px, past which release dismisses instead of springing back. */
@@ -67,6 +78,8 @@ export function useSheetDismiss({
   // on an interactive control, or inside a scrolled-down region.
   const dismissDisabled = useRef(false);
   const closeTimerRef = useRef<number | null>(null);
+  // Sliding out but still mounted — the window in which a tap can catch it.
+  const [closing, setClosing] = useState(false);
 
   useEffect(() => {
     const id = requestAnimationFrame(() => setEntered(true));
@@ -98,11 +111,26 @@ export function useSheetDismiss({
     if (closeTimerRef.current != null) return;
     setDragging(false);
     setEntered(false);
+    setClosing(true);
     closeTimerRef.current = window.setTimeout(() => {
       closeTimerRef.current = null;
+      setClosing(false);
       onClose();
-    }, 280);
+    }, CLOSE_MS);
   }, [onClose, reduceMotion]);
+
+  // Catch a sheet that is on its way out and bring it back. Bound to
+  // pointerdown on the root, so "tap it again" reads as grabbing the sheet
+  // before it goes — which is exactly what the tap meant. A no-op whenever no
+  // close is pending, which is every other pointer event the sheet sees.
+  const catchClose = useCallback(() => {
+    if (closeTimerRef.current == null) return;
+    window.clearTimeout(closeTimerRef.current);
+    closeTimerRef.current = null;
+    setClosing(false);
+    setDragY(0);
+    setEntered(true);
+  }, []);
 
   // Cancel a pending slide-out if the sheet unmounts for an external reason
   // (the track clears, the device drops off) so onClose never fires post-unmount.
@@ -158,10 +186,14 @@ export function useSheetDismiss({
   return {
     reduceMotion,
     entered,
+    /** Sliding out, still mounted. Exposed so a caller can drop hit targets or
+     *  skip work while the sheet leaves. */
+    closing,
     dragY,
     dragging,
     requestClose,
     handlers: {
+      onPointerDown: catchClose,
       onTouchStart,
       onTouchMove,
       onTouchEnd,
@@ -174,6 +206,8 @@ export function useSheetDismiss({
       borderRadius: dragY > 0 ? Math.min(28, dragY * 0.6) : 0,
     } as React.CSSProperties,
     transitionClass:
-      dragging || reduceMotion ? '' : 'transition-[transform,border-radius] duration-300',
+      dragging || reduceMotion
+        ? ''
+        : 'transition-[transform,border-radius] duration-[280ms]',
   };
 }

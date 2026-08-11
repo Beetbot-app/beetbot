@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { ipc, type Profile } from '@/lib/tauri';
+import { useProfilesVersion } from '@shared/profilesChanged';
 import { useProfileStore } from '@/lib/profile';
 
 /**
@@ -40,6 +41,9 @@ export function TopBar({
   barSlotRef: (el: HTMLDivElement | null) => void;
 }) {
   const [profiles, setProfiles] = useState<Profile[]>([]);
+  // Re-read when a profile may have changed elsewhere — including on a phone,
+  // which writes over HTTP and is otherwise invisible to this window.
+  const profilesVersion = useProfilesVersion();
   useEffect(() => {
     let cancelled = false;
     ipc
@@ -51,7 +55,7 @@ export function TopBar({
     return () => {
       cancelled = true;
     };
-  }, [profileId]);
+  }, [profileId, profilesVersion]);
   const profile = profiles.find((p) => p.id === profileId) ?? null;
 
   return (

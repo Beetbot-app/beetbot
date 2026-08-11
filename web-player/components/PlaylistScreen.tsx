@@ -425,9 +425,15 @@ export function PlaylistScreen({ token, playlistId, profileId, onBack }: Props) 
     );
   }
 
-  const playable = detail.tracks.filter(canStream);
   // Play/Shuffle enable whenever a track is playable (local file or live).
   const streamableCount = detail.tracks.filter(canStream).length;
+  // Tracks whose audio actually sits on the hub. NOT a canStream filter: it is a
+  // *capability* check (a local file OR this build's ability to live-stream
+  // anything), so on the full build every track passes it and a "downloaded"
+  // count taken from it always reads n of n — including for a playlist with
+  // zero files. `has_audio` is the server's `local_path IS NOT NULL`, which is
+  // the question both the header and the offline toggle are actually asking.
+  const downloaded = detail.tracks.filter((t) => t.has_audio);
   // Whether THIS playlist is the current playback source — so the hero + sticky
   // play buttons reflect ⏸ while it plays and toggle play/pause (instead of
   // always restarting). When a track from another source is current, the button
@@ -435,7 +441,7 @@ export function PlaylistScreen({ token, playlistId, profileId, onBack }: Props) 
   const playlistActive = !!playing && detail.tracks.some((t) => t.id === playing.id);
   const playlistPlaying = playlistActive && isPlaying;
   const togglePlay = () => (playlistActive ? playPause() : playAll());
-  const cachedInPlaylist = playable.filter((t) => cachedIds.has(t.id)).length;
+  const cachedInPlaylist = downloaded.filter((t) => cachedIds.has(t.id)).length;
   // A saved album is stored as a playlist but is really an *album* — the page's
   // copy (delete / rename / offline tooltips) calls it that, not "playlist".
   const isAlbum = detail.source === 'album';
@@ -445,8 +451,10 @@ export function PlaylistScreen({ token, playlistId, profileId, onBack }: Props) 
     setDeleteError(null);
     try {
       await deletePlaylist(playlistId, token);
-      // Pop the user back to the library. The library will refetch on
-      // mount and the deleted playlist won't be in the response.
+      // Refetching is not enough on its own: `/api/playlists` is served
+      // stale-while-revalidate, so the library's next read still contains the
+      // playlist we just deleted. notifyLibraryChanged evicts it first.
+      notifyLibraryChanged();
       onBack();
     } catch (e) {
       setDeleteError(friendlyError(e));
@@ -459,8 +467,10 @@ export function PlaylistScreen({ token, playlistId, profileId, onBack }: Props) 
     setRenameError(null);
     try {
       await renamePlaylist(playlistId, name, token, description);
-      // Reflect the edit in the header immediately. The Library grid refetches
-      // on its next mount, so it picks up the change on the way back.
+      // The Library grid refetches on its next mount, but that read comes from
+      // the service worker's cache — so evict it, or it shows the old name.
+      notifyLibraryChanged();
+      // Reflect the edit in this header immediately too.
       setDetail((prev) =>
         prev ? { ...prev, name, description: description.trim() || null } : prev,
       );
@@ -592,7 +602,7 @@ export function PlaylistScreen({ token, playlistId, profileId, onBack }: Props) 
           <div ref={heroSentinelRef} className="h-px w-px" aria-hidden />
           {/* h1 above is the sentinel anchor; keep the meta line below it. */}
           <p className="mt-1 text-xs text-neutral-400">
-            {detail.tracks.length} songs · {playable.length} downloaded
+            {detail.tracks.length} songs · {downloaded.length} downloaded
             {cachedInPlaylist > 0 ? (
               <>
                 {' '}· {cachedInPlaylist} offline
@@ -656,7 +666,7 @@ export function PlaylistScreen({ token, playlistId, profileId, onBack }: Props) 
                 offlineMode={offlineMode}
                 progress={progress}
                 cachedInPlaylist={cachedInPlaylist}
-                total={playable.length}
+                total={downloaded.length}
                 isAlbum={isAlbum}
                 onEnable={handleEnableOffline}
                 onDisable={handleDisableOffline}

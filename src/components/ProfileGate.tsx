@@ -713,23 +713,32 @@ export function ProfileDraftFields({ draft }: { draft: ProfileDraft }) {
         ) : null}
       </div>
 
-      <div>
-        <div className="text-xs uppercase tracking-wide text-neutral-500 mb-2">Color</div>
-        <div className="flex flex-wrap gap-2">
-          {AVATAR_COLORS.map((c) => (
-            <button
-              key={c}
-              type="button"
-              onClick={() => setColor(c)}
-              className={`h-8 w-8 rounded-full transition ${
-                color === c ? 'ring-2 ring-white ring-offset-2 ring-offset-neutral-900' : ''
-              }`}
-              style={{ backgroundColor: c }}
-              aria-label={`Color ${c}`}
-            />
-          ))}
+      {/* The colour is the backdrop for the initial, and the initial only shows
+          when there is no photo — so with one set, this row is a choice with
+          nothing to show for it. It comes back if the photo is removed, and the
+          stored value is left alone meanwhile: the picker is hidden, not
+          reset. (One invisible exception: the "Who's listening?" gate tints on
+          hover from the photo's own dominant colour and falls back to this if
+          that fails.) */}
+      {!(avatarPath || pendingData) && (
+        <div>
+          <div className="text-xs uppercase tracking-wide text-neutral-500 mb-2">Color</div>
+          <div className="flex flex-wrap gap-2">
+            {AVATAR_COLORS.map((c) => (
+              <button
+                key={c}
+                type="button"
+                onClick={() => setColor(c)}
+                className={`h-8 w-8 rounded-full transition ${
+                  color === c ? 'ring-2 ring-white ring-offset-2 ring-offset-neutral-900' : ''
+                }`}
+                style={{ backgroundColor: c }}
+                aria-label={`Color ${c}`}
+              />
+            ))}
+          </div>
         </div>
-      </div>
+      )}
 
       <div>
         <div className="text-xs uppercase tracking-wide text-neutral-500 mb-2">

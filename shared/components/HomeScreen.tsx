@@ -49,6 +49,7 @@ import { SettingsAvatar, useActiveProfile } from './PhoneTopBar';
 import { ContextMenu, MenuGlyphs, type MenuItem, type MenuState } from './ContextMenu';
 import { extractDominantColor } from '../albumColor';
 import { CardPlayButton, Marquee } from './Marquee';
+import { ShowAllTitle } from './ShowAllTitle';
 import { Toast } from './Toast';
 import { useHubReachable } from '../useHubReachable';
 import { useToast } from '../useToast';
@@ -233,7 +234,10 @@ const HOME_FEED_LS_MAX_AGE_MS = 3 * 24 * 60 * 60 * 1000;
 // persisted pre-fix feed would otherwise keep showing (e.g. a "Your top artists"
 // row built when Drake resolved to a same-name impostor's photo) for up to the
 // max age. A version bump discards those caches once and forces a clean rebuild.
-const HOME_FEED_VERSION = 2;
+// v3: "Top songs" became "Your top songs" — a RETITLE changes the append-by-title
+// key, so without a bump the cached shelf and the renamed one would both render
+// until the cache aged out.
+const HOME_FEED_VERSION = 3;
 
 function readHomeFeedLS(pid: number | null | undefined): HomeFeedCacheEntry | null {
   try {
@@ -1290,6 +1294,8 @@ export function HomeScreen({
                 <TrackCard
                   key={`${shelf.kind}:${i}:${t.source_id}`}
                   track={t}
+                  onOpenArtist={onOpenArtist}
+                  onOpenAlbum={onOpenAlbum}
                   onClick={() => onPlayTrack(t, list, i + 1)}
                   onLongPress={() => setAddTrack(t)}
                   active={
@@ -1315,6 +1321,7 @@ export function HomeScreen({
             <AlbumCard
               key={`${al.source}:${al.source_id}`}
               album={al}
+              onOpenArtist={onOpenArtist}
               size={size}
               onClick={() => openAlbumCard(al)}
               onPlay={() => playAlbumCard(al)}
@@ -1359,6 +1366,8 @@ export function HomeScreen({
             <TrackCard
               key={`local:${t.source_id}`}
               track={t}
+              onOpenArtist={onOpenArtist}
+              onOpenAlbum={onOpenAlbum}
               size={size}
               onClick={() => onPlayTrack(t, list, i)}
               onLongPress={() => setAddTrack(t)}
@@ -1414,6 +1423,8 @@ export function HomeScreen({
             <TrackCard
               key={`${t.source}:${t.source_id}`}
               track={t}
+              onOpenArtist={onOpenArtist}
+              onOpenAlbum={onOpenAlbum}
               size={size}
               onClick={() => onPlayTrack(t, tracks, i)}
               onLongPress={() => setAddTrack(t)}
@@ -1467,6 +1478,7 @@ export function HomeScreen({
                 <AlbumCard
                   key={`album:${al.source}:${al.source_id}`}
                   album={al}
+                  onOpenArtist={onOpenArtist}
                   size={size}
                   onClick={() => openAlbumCard(al)}
                   onPlay={() => playAlbumCard(al)}
@@ -2316,6 +2328,11 @@ function Shelf({
   const [expanded, setExpanded] = useState(false);
   const count = Children.count(children);
   const showGrid = forceExpand || expanded;
+  // Offer either affordance only when there's actually more to see, and never
+  // on the phone (its rows scroll) or in an already-expanded grid.
+  const offerShowAll = count > 4 && !forceExpand && !!desktop;
+  const drillable = offerShowAll && !!onShowAll;
+  const expandable = offerShowAll && !onShowAll;
   return (
     <section className="mb-7 lg:mb-10">
       <div className="px-4 lg:px-8 mb-2.5 lg:mb-4 flex items-end justify-between gap-3">
@@ -2333,18 +2350,30 @@ function Shelf({
                 {eyebrow}
               </p>
             ) : null}
-            <h2 className="text-lg lg:text-2xl font-bold tracking-tight truncate">{title}</h2>
+            {/* The title IS the show-all link when there's a page to drill to —
+                "Golden ›" — matching the artist page instead of a separate
+                right-aligned text link. Desktop only: phone rows just scroll,
+                like Spotify's mobile home. */}
+            <h2 className="text-lg lg:text-2xl font-bold tracking-tight">
+              <ShowAllTitle
+                label={title}
+                onShowAll={
+                  drillable ? onShowAll : undefined
+                }
+              />
+            </h2>
           </div>
         </div>
-        {/* Desktop only: phone home rows just scroll (no in-place expand), like
-            Spotify's mobile home. Desktop keeps "Show all" (drill page or expand). */}
-        {count > 4 && !forceExpand && desktop && (
+        {/* The expand-in-place shelves keep a text toggle: a bare chevron can
+            say "there's more", but nothing about it says "collapse", and this
+            control has to say both. */}
+        {expandable && (
           <button
             type="button"
-            onClick={onShowAll ?? (() => setExpanded((v) => !v))}
+            onClick={() => setExpanded((v) => !v)}
             className="shrink-0 pb-0.5 text-xs font-medium text-neutral-400 hover:text-neutral-100 active:text-neutral-100"
           >
-            {onShowAll ? 'Show all' : expanded ? 'Show less' : 'Show all'}
+            {expanded ? 'Show less' : 'Show all'}
           </button>
         )}
       </div>
@@ -2490,6 +2519,39 @@ function HeroCard({
   );
 }
 
+/** Per-name artist links for a card's credit line. stopPropagation keeps the
+ *  card's own click (play/open) from firing under a name tap. Only rendered
+ *  when a navigation handler exists — the phone home passes none, so its
+ *  tiles keep plain text and stay single-tap targets. */
+function ArtistLinks({
+  artists,
+  onOpen,
+}: {
+  artists: string[];
+  onOpen: (name: string) => void;
+}) {
+  return (
+    <>
+      {artists.map((a, i) => (
+        <span key={`${a}-${i}`}>
+          {i > 0 ? ', ' : ''}
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onOpen(a);
+            }}
+            className="hover:underline hover:text-neutral-300"
+            title={`Go to ${a}`}
+          >
+            {a}
+          </button>
+        </span>
+      ))}
+    </>
+  );
+}
+
 /** A square track card (album art + title + artists). Used for both local
  *  play-log shelves and external catalog shelves. Long-press opens the
  *  add-to-playlist sheet (Spotify-style inline card action). */
@@ -2502,6 +2564,8 @@ function TrackCard({
   active = false,
   isPlaying = false,
   onToggle,
+  onOpenArtist,
+  onOpenAlbum,
 }: {
   track: SearchTrackResult;
   onClick: () => void;
@@ -2513,6 +2577,10 @@ function TrackCard({
   active?: boolean;
   isPlaying?: boolean;
   onToggle?: () => void;
+  /** Desktop-only navigation (absent on the phone): title → the album page,
+   *  each artist name → that artist's page. */
+  onOpenArtist?: (name: string) => void;
+  onOpenAlbum?: (name: string, artist: string | null) => void;
 }) {
   const lp = useLongPress(() => onLongPress?.());
   // Re-render on hub-reachability changes; a non-downloaded track can't start
@@ -2573,10 +2641,26 @@ function TrackCard({
             />
           ) : null}
         </div>
-        <Marquee text={track.title} className="mt-1.5 lg:mt-2.5 text-sm" />
-        <div className="truncate text-xs text-neutral-500">
-          {track.artists.join(', ')}
-        </div>
+        <Marquee text={track.title} className="mt-1.5 lg:mt-2.5 text-sm">
+          {onOpenAlbum && track.album ? (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onOpenAlbum(track.album!, track.artists[0] ?? null);
+              }}
+              className="hover:underline"
+              title={`Go to album: ${track.album}`}
+            >
+              {track.title}
+            </button>
+          ) : undefined}
+        </Marquee>
+        <Marquee text={track.artists.join(', ')} className="text-xs text-neutral-500">
+          {onOpenArtist ? (
+            <ArtistLinks artists={track.artists} onOpen={onOpenArtist} />
+          ) : undefined}
+        </Marquee>
       </div>
     </div>
   );
@@ -2591,6 +2675,7 @@ function AlbumCard({
   active = false,
   isPlaying = false,
   onToggle,
+  onOpenArtist,
 }: {
   album: SearchAlbumResult;
   onClick: () => void;
@@ -2601,6 +2686,9 @@ function AlbumCard({
   active?: boolean;
   isPlaying?: boolean;
   onToggle?: () => void;
+  /** Desktop-only: each artist name → that artist's page. (The card itself
+   *  already opens the album, so the title needs no separate link.) */
+  onOpenArtist?: (name: string) => void;
 }) {
   const lp = useLongPress(() => onLongPress?.());
   const box = size === 'lg' ? 'w-40 lg:w-44' : 'w-32 lg:w-44';
@@ -2656,9 +2744,11 @@ function AlbumCard({
           />
         </div>
         <Marquee text={album.name} className="mt-1.5 lg:mt-2.5 text-sm" />
-        <div className="truncate text-xs text-neutral-500">
-          {album.artists.join(', ')}
-        </div>
+        <Marquee text={album.artists.join(', ')} className="text-xs text-neutral-500">
+          {onOpenArtist ? (
+            <ArtistLinks artists={album.artists} onOpen={onOpenArtist} />
+          ) : undefined}
+        </Marquee>
       </div>
     </div>
   );

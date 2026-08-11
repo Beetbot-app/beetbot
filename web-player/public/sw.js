@@ -75,7 +75,85 @@
 // cache-first navigation then served the placeholder on every launch no matter
 // what the computer was doing. Bumping reaps the poisoned entry, which is the
 // only way an already-affected phone recovers.
-const SHELL_CACHE = 'beetbot-shell-v371';
+// v373: playback resumes after an interruption. iOS pauses media for a phone
+// call and hands a web page no "interruption ended" signal at all, so the music
+// simply stayed paused — three times in one afternoon of testing. Resume fires
+// when the page becomes visible again, which is the only signal available: the
+// page is suspended ~12s into a call, so nothing can run to notice it ending.
+// v374: Home labelling — "Top songs" is now "Your top songs" (HOME_FEED_VERSION
+// bumped with it), and the cold-start shelf now says why it's generic ("Until
+// we know your taste"). Bump so phones pick the new bundle up on next launch.
+// v375: tappable credits — every artist on the Now Playing overlay is its own
+// tap target, and the track sheet's "Go to Artist" lists each credited artist
+// on a collab instead of always the first.
+// v376: backgrounded track changes. iOS keeps a backgrounded page alive
+// *because* it is playing audio; when the audio stops, script execution ceases
+// about twelve seconds later and nothing in-page can recover — measured on a
+// locked iPhone 1 Aug. Every recovery mechanism was therefore racing a fuse it
+// could not beat, so the fix is to stop the audio ever stopping: the prefetch
+// now keeps the next tracks' bytes and the boundary plays them from memory with
+// no network request. Bump so a phone picks the new bundle up on the next
+// launch rather than the one after (navigation is stale-while-revalidate).
+// v377: three polish fixes. The playlist header's "downloaded" count was
+// reading a capability flag (true for every track on the full build), so it
+// always claimed n of n; it now counts files actually on the hub. Home shelf
+// titles carry their own "show all" chevron. And a sheet tapped during its
+// own slide-out is caught and brought back instead of the tap being lost.
+// v378: that chevron is sized in em, so it scales with the title it follows
+// instead of sitting at a fixed 16px beside a 24px shelf heading.
+// v379: phone library — the kind-filter chips are a real thumb target
+// (~36px, was 28), and the main scroller no longer paints a scrollbar, which
+// looked like a desktop artefact beside the native apps it sits next to.
+// v380: the page itself no longer rubber-bands. Dragging the library moved
+// the whole app — sticky header and bottom bar with it — because the document
+// was bouncing, not the list. overscroll-behavior:none at the root refuses it.
+// v381: the offline set is browsable. "N songs cached offline" was a fact you
+// could not act on, sitting above the library as a banner; the songs are now
+// an Offline chip in the library and the storage math + Clear all moved to
+// Settings, which is how the desktop has always split it.
+// v382: "Saved on this device" is a screen you can open — the songs listed
+// like a playlist, with Clear all beside the tracks it would delete instead
+// of on a settings row.
+// v383: the offline collection looks like a collection — cover, title,
+// shuffle/play — and a row swiped left asks before it removes that one song.
+// v384: the stats range control rides in the pinned header — it decides what
+// every number means, and it used to scroll away with them.
+// v385: phone settings stops over-explaining. Footers became short row
+// subtitles or went away, sharing moved behind a People row, and the delete
+// warning now appears only once a tap has armed it.
+// v386: you can edit your own profile from the phone — name and photo. The
+// card was display-only because the hub had no endpoint for either.
+// v387: Done on the profile editor is always live — the photo saves on pick,
+// so gating it on a pending rename left it dim right after a visible change.
+// v388: deleting a profile moved onto the profile's own screen, and Switch
+// profile joined the card it switches away from.
+// v389: the profile card uses the shared chevron (a text glyph sat on the
+// baseline, reading smaller and out of line with the row below) and drops
+// "Listening on this device", which was stating the obvious.
+// v390: a profile deleted on the phone disappears from "Who's listening?"
+// straight away — /api/profiles is cached stale-while-revalidate, so the gate
+// was re-reading the list from before the delete.
+// v391: the settings/editor avatar shares the preloaded URL again — the
+// cache-busting nonce is appended only after a photo actually changes.
+// v392: four phone writes that never evicted their cached read — creating,
+// renaming and deleting a playlist, and favouriting a catalog track. Found by
+// auditing every write against the cacheable set rather than waiting for the
+// next report.
+// v393: the artist About card stops being four things at once — the bio's
+// "more" is the Wikipedia link, the listener count is gone, and the related
+// row is "Fans also like" without a repeated kind label under every face.
+// v394: the artist About card is About again — one caption line instead of a
+// column grid, no repeated artist name in the heading, and Fans also like is
+// its own shelf rather than a footnote to a biography.
+// v395: the artist page's closing stretch is a change of shade, not a card,
+// and the artist row stopped slicing the hover highlight off its first tile.
+// v396: the artist page's closing shade reaches the bottom edge — it was
+// stopping short of ModalShell's own pb-6, leaving a dark strip beneath it.
+// v397: the drill-in overlay stops padding the bottom of a full-bleed page —
+// three ancestors were each adding space under the artist page's closing band.
+// v398: Essential Albums no longer repeats the Latest Release — a new record
+// usually dominates its artist's top songs, so both were showing one cover.
+const SHELL_CACHE = 'beetbot-shell-v400';
 // Bump the cache name to invalidate everything ever cached at v1. The
 // v1 cache held m4a files downloaded before we started embedding album
 // art via ffmpeg post-process — those old bytes have no `covr` atom,

@@ -10,6 +10,12 @@ interface Props {
   /** Show the in-header back chevron. Desktop hides it (the global top-bar
    *  Back/Forward already covers it); the phone keeps it as its only way back. */
   showBack?: boolean;
+  /** Own the scrolling: render as a flex column with the header OUTSIDE a body
+   *  scroller, so the scrollbar measures only the numbers. The desktop passes
+   *  this because each page card is its own scrollport; the phone leaves it
+   *  off, since there the whole app scrolls in one container and the header
+   *  just pins inside it. */
+  ownScroller?: boolean;
 }
 
 const RANGES: { key: string; label: string; days: number }[] = [
@@ -25,7 +31,13 @@ const RANGES: { key: string; label: string; days: number }[] = [
  * segmented range control, big headline numerals, and grouped lists with inset
  * hairline separators, centred in a readable column.
  */
-export function StatsScreen({ token, profileId, onBack, showBack = true }: Props) {
+export function StatsScreen({
+  token,
+  profileId,
+  onBack,
+  showBack = true,
+  ownScroller = false,
+}: Props) {
   const [rangeKey, setRangeKey] = useState('4w');
   const [stats, setStats] = useState<ListeningStats | null>(null);
   const [loading, setLoading] = useState(true);
@@ -100,12 +112,20 @@ export function StatsScreen({ token, profileId, onBack, showBack = true }: Props
     // No solid page background: let the app-shell ambient wash show through
     // (the same top fade as the Settings page). The phone body is bg-neutral-950,
     // so it stays flat dark there.
-    <div className="min-h-full text-neutral-100">
+    <div
+      className={cn(
+        'text-neutral-100',
+        ownScroller ? 'h-full flex flex-col' : 'min-h-full',
+      )}
+    >
       {/* Sticky nav bar — flush at the top of the scroll container, frosted. */}
       <header
         className={cn(
           BAR,
-          'sticky top-0 z-10 border-b border-white/5 flex items-center gap-2 px-4 sm:px-5 py-3',
+          'z-10 border-b border-white/5 flex flex-wrap items-center gap-x-2 gap-y-2 px-4 sm:px-5 py-3',
+          // Owning the scroller means the header is a sibling of it — nothing
+          // to stick to, and nothing scrolls underneath.
+          ownScroller ? 'shrink-0' : 'sticky top-0',
         )}
       >
         {showBack && (
@@ -121,40 +141,47 @@ export function StatsScreen({ token, profileId, onBack, showBack = true }: Props
           </button>
         )}
         <h1 className="text-lg font-bold tracking-tight">Your stats</h1>
-      </header>
-
-      <div className="mx-auto w-full max-w-2xl px-4 sm:px-6 pb-20">
-        {/* Segmented range control (Apple-style: a pill track with a solid
-            selected segment). */}
-        <div className="mt-5 flex justify-center">
-          <div
-            role="tablist"
-            aria-label="Time range"
-            className="inline-flex gap-1 rounded-full bg-white/[0.06] p-1"
-          >
-            {RANGES.map((r) => {
-              const active = rangeKey === r.key;
-              return (
-                <button
-                  key={r.key}
-                  type="button"
-                  role="tab"
-                  aria-selected={active}
-                  onClick={() => setRangeKey(r.key)}
-                  className={cn(
-                    'rounded-full px-3.5 py-1.5 text-[13px] font-medium transition',
-                    active
-                      ? 'bg-white text-neutral-900 shadow-sm'
-                      : 'text-neutral-400 hover:text-neutral-100',
-                  )}
-                >
-                  {r.label}
-                </button>
-              );
-            })}
+        {/* The range control rides in the header. It decides what every number
+            below means, and it used to scroll away with the body — so changing
+            window meant scrolling back to the top to find it. */}
+        <div className="ml-auto min-w-0">
+          <div className="flex justify-center sm:justify-end">
+            <div
+              role="tablist"
+              aria-label="Time range"
+              className="inline-flex gap-1 rounded-full bg-white/[0.06] p-1"
+            >
+              {RANGES.map((r) => {
+                const active = rangeKey === r.key;
+                return (
+                  <button
+                    key={r.key}
+                    type="button"
+                    role="tab"
+                    aria-selected={active}
+                    onClick={() => setRangeKey(r.key)}
+                    className={cn(
+                      'rounded-full px-3.5 py-1.5 text-[13px] font-medium transition',
+                      active
+                        ? 'bg-white text-neutral-900 shadow-sm'
+                        : 'text-neutral-400 hover:text-neutral-100',
+                    )}
+                  >
+                    {r.label}
+                  </button>
+                );
+              })}
+            </div>
           </div>
         </div>
+      </header>
 
+      <div
+        className={cn(
+          'mx-auto w-full max-w-2xl px-4 sm:px-6 pb-20',
+          ownScroller && 'flex-1 min-h-0 overflow-y-auto',
+        )}
+      >
         {loading ? (
           <p className="mt-16 text-center text-sm text-neutral-500">Loading…</p>
         ) : empty ? (

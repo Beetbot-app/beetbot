@@ -18,6 +18,31 @@ export interface SavedArtist {
    *  placeholder the bulk "Add from your songs" seed stores). Gates the
    *  one-time portrait backfill so we resolve each artist at most once. */
   portrait?: boolean;
+  /** When the backfill last resolved this artist (ms). Only meaningful for a
+   *  resolved MISS (`portrait` set, `art` null): a miss is a point-in-time
+   *  answer from Deezer, not a permanent fact, so it expires. See
+   *  `isStalePortraitMiss`. Absent on records written before this existed,
+   *  which reads as "expired" and earns them one re-check. */
+  artAt?: number;
+}
+
+/** How long a resolved "no portrait exists" answer is trusted before the
+ *  backfill asks again. A miss can be Deezer's genuine gap, but it can equally
+ *  be a throttled search or a catalogue entry that had no image that day — and
+ *  those were previously frozen in forever. Mirrors the server's 7-day iTunes
+ *  art-miss TTL (`ITUNES_MISS_RETRY_SECS`) so both halves of the app forget a
+ *  miss on the same schedule. */
+export const PORTRAIT_MISS_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** A resolved miss that has aged out and should be retried. Deliberately NOT
+ *  `isReplaceableArt`: that asks "is the stored image a stand-in?", which a
+ *  null can never be. This asks the different question "is our *answer* stale?".
+ *  Re-querying stays bounded — at most one search per artist per TTL, and the
+ *  in-session `backfillTried` set stops repeats within a run — so the
+ *  never-loops property still holds. */
+export function isStalePortraitMiss(a: SavedArtist, now = Date.now()): boolean {
+  if (a.art !== null || !a.portrait) return false;
+  return now - (a.artAt ?? 0) >= PORTRAIT_MISS_TTL_MS;
 }
 
 /** Stable identity for dedupe/toggle. By lowercased display name (like pins),
@@ -183,12 +208,19 @@ export const useSavedStore = create<SavedState>((set, get) => ({
     if (profileId == null) return;
     const id = savedArtistId(name);
     const cur = map[String(profileId)] ?? [];
+    const now = Date.now();
     let changed = false;
     const next = cur.map((x) => {
       if (savedArtistId(x.name) !== id) return x;
-      if (x.portrait && x.art === art) return x; // already resolved to this
+      // Already resolved to this same portrait — nothing to do. Only misses
+      // carry a meaningful `artAt`, so a repeat hit needs no re-stamp.
+      if (x.portrait && x.art === art && art !== null) return x;
       changed = true;
-      return { ...x, art, portrait: true };
+      // Stamp the time on every write, including a repeat miss that changes
+      // nothing else: the TTL has to measure from the LATEST answer. Leaving
+      // the original timestamp would keep the record permanently expired and
+      // re-query it every session — trading a frozen miss for a busy one.
+      return { ...x, art, portrait: true, artAt: now };
     });
     if (!changed) return;
     applyLocal(profileId, next);

@@ -83,10 +83,15 @@ Everything below stays **off until you add your own credentials**, which never l
 Beetbot is open source. To run the open build from this repository:
 
 ```sh
-# prerequisites: Node 20+, pnpm, Rust (stable), and Tauri's macOS build deps
+# prerequisites: pnpm, Rust (stable), Tauri's macOS build deps, and the Node
+# version in .nvmrc — `nvm use` picks it up. Node has to be 22.22.2+, 24.15+ or
+# 26+; jsdom (which the tests run in) supports no version between those, and on
+# an unsupported one the whole suite fails at `window.localStorage`.
+nvm use
 pnpm install
 pnpm tauri:dev      # run it
 pnpm tauri:build    # build a .app
+pnpm test           # run the frontend tests
 ```
 
 ## License

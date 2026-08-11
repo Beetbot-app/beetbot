@@ -1,20 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   createPlaylist,
-  evictAllAudio,
   friendlyError,
   getCachedTrackIds,
   getOfflinePlaylistIds,
   profileScopedKey,
   getPlaylist,
-  getStorageEstimate,
   listLibrarySongs,
   listPlaylists,
   offlineCacheAvailable,
   playlistArtUrl,
   prefetchPlaylistDetails,
   reconcileOfflinePlaylists,
-  setOfflinePlaylistIds,
   sortPlaylistsByRecent,
   trackArtUrl,
   type PlaylistRow,
@@ -27,8 +24,6 @@ import {
   BOTTOM_SHEET,
   BTN_PRIMARY,
   BTN_GHOST,
-  BTN_GHOST_DANGER,
-  CALLOUT_INFO,
   CALLOUT_ERROR,
   EYEBROW,
 } from '@shared/ui';
@@ -41,6 +36,8 @@ import { useHubReachable } from '@shared/useHubReachable';
 import { useSavedStore, type SavedArtist } from '@/lib/saved';
 import { canStream, useCatalogNav, usePlayerStore } from '../store';
 import { useRecentlyPlayedVersion } from '@shared/useRecentPlaylists';
+import { notifyLibraryChanged } from '@shared/libraryChanged';
+import { SongsList } from './SongsList';
 
 interface Props {
   token: string;
@@ -56,7 +53,7 @@ type SortMode = 'recent' | 'alpha' | 'added';
 // Client-side kind filter. Saved albums land in the same list as playlists
 // (typed `source: 'album'`), so a chip row can split them without any new
 // endpoint — it only appears when the library actually holds both kinds.
-type LibFilter = 'all' | 'playlists' | 'songs' | 'albums' | 'artists';
+type LibFilter = 'all' | 'playlists' | 'songs' | 'albums' | 'artists' | 'offline';
 
 const FILTER_LABEL: Record<LibFilter, string> = {
   all: 'All',
@@ -64,6 +61,11 @@ const FILTER_LABEL: Record<LibFilter, string> = {
   songs: 'Songs',
   albums: 'Albums',
   artists: 'Artists',
+  // "Offline", not "Downloaded": on the phone *downloaded* already means the
+  // hub holds the file (what the playlist header counts), while *offline*
+  // means the bytes are on THIS device. The desktop's Downloaded tab is the
+  // other meaning; keeping the words apart keeps both honest.
+  offline: 'Offline',
 };
 
 const VIEW_KEY = 'beetbot.library_view';
@@ -170,84 +172,6 @@ function ArtistsGrid({
   );
 }
 
-/** Library › Songs — a flat, title-sorted list of every track in the library.
- *  Tap plays it (queuing the rest). Non-playable rows dim. */
-function SongsList({
-  songs,
-  hasQuery,
-  query,
-  onPlay,
-}: {
-  songs: StreamTrack[] | null;
-  hasQuery: boolean;
-  query: string;
-  onPlay: (t: StreamTrack) => void;
-}) {
-  if (songs === null) {
-    return (
-      <ul className="flex flex-col" aria-hidden>
-        {Array.from({ length: 8 }).map((_, i) => (
-          <li key={i} className="flex items-center gap-3 py-2 px-1 animate-pulse">
-            <div className="h-12 w-12 shrink-0 rounded bg-neutral-900" />
-            <div className="flex-1">
-              <div className="h-3 w-1/2 rounded bg-neutral-900" />
-              <div className="mt-1.5 h-2.5 w-1/3 rounded bg-neutral-900" />
-            </div>
-          </li>
-        ))}
-      </ul>
-    );
-  }
-  if (songs.length === 0) {
-    return (
-      <div className="px-2 py-8 text-center text-sm text-neutral-500">
-        {hasQuery
-          ? `No matches for “${query}”.`
-          : 'No songs in your library yet.'}
-      </div>
-    );
-  }
-  return (
-    <ul className="flex flex-col">
-      {songs.map((t) => {
-        const playable = canStream(t);
-        return (
-          <li key={t.id}>
-            <button
-              type="button"
-              onClick={() => playable && onPlay(t)}
-              className={`w-full flex items-center gap-3 py-2 px-1 rounded-lg text-left ${
-                playable
-                  ? 'hover:bg-neutral-900 active:bg-neutral-900'
-                  : 'opacity-50'
-              }`}
-            >
-              <div className="h-12 w-12 shrink-0 grid place-items-center overflow-hidden rounded bg-neutral-800">
-                {t.album_art_url ? (
-                  <img
-                    src={t.album_art_url}
-                    alt=""
-                    loading="lazy"
-                    className="h-full w-full object-cover"
-                  />
-                ) : (
-                  <span className="text-neutral-600 text-xs">♪</span>
-                )}
-              </div>
-              <div className="flex-1 min-w-0">
-                <div className="text-sm font-medium truncate">{t.title}</div>
-                <div className="text-xs text-neutral-500 truncate">
-                  {t.artists.join(', ') || '—'}
-                </div>
-              </div>
-            </button>
-          </li>
-        );
-      })}
-    </ul>
-  );
-}
-
 export function LibraryScreen({
   token,
   onOpen,
@@ -260,10 +184,8 @@ export function LibraryScreen({
   const [playlists, setPlaylists] = useState<PlaylistRow[] | null>(null);
   const [offlineIds, setOfflineIds] = useState<Set<number>>(new Set());
   const [error, setError] = useState<string | null>(null);
-  const [cachedCount, setCachedCount] = useState<number>(0);
-  const [storage, setStorage] = useState<{ usage: number; quota: number } | null>(
-    null,
-  );
+  // The ids, not just a count: they are what makes the offline set browsable.
+  const [cachedIds, setCachedIds] = useState<Set<number>>(() => new Set());
   const [view, setView] = useState<ViewMode>(() =>
     readPref(VIEW_KEY, ['grid', 'list'] as const, 'list'),
   );
@@ -367,16 +289,14 @@ export function LibraryScreen({
   }, [sort]);
 
   const refresh = useCallback(async () => {
-    const [rows, ids, est] = await Promise.all([
+    const [rows, ids] = await Promise.all([
       listPlaylists(token, profileId),
       getCachedTrackIds(),
-      getStorageEstimate(),
     ]);
     // Store the raw rows; the active sort is applied in a useMemo so
     // changing sort order doesn't require a refetch.
     setPlaylists(rows);
-    setCachedCount(ids.size);
-    setStorage(est);
+    setCachedIds(ids);
     // Warm the SW cache for every playlist's detail. Without this, a
     // playlist the user hasn't yet visited online wouldn't be cached
     // and would show a TypeError when tapped offline. Fire-and-forget;
@@ -442,13 +362,6 @@ export function LibraryScreen({
     };
   }, [refresh]);
 
-  const handleClearOffline = useCallback(async () => {
-    if (!confirm('Remove all offline tracks from this device?')) return;
-    await evictAllAudio();
-    setOfflinePlaylistIds(new Set());
-    await refresh();
-  }, [refresh]);
-
   const recentsVersion = useRecentlyPlayedVersion();
   const sorted = useMemo(() => {
     if (!playlists) return null;
@@ -496,8 +409,9 @@ export function LibraryScreen({
     if (playlists && playlists.length > 0) out.push('songs');
     if (playlists?.some((p) => p.source === 'album')) out.push('albums');
     if (savedArtists.length > 0) out.push('artists');
+    if (offlineCacheAvailable() && cachedIds.size > 0) out.push('offline');
     return out;
-  }, [playlists, savedArtists]);
+  }, [playlists, savedArtists, cachedIds]);
   const showFilters = filters.length > 2;
 
   // If the active filter's chip disappears (e.g. the last saved artist was
@@ -533,7 +447,8 @@ export function LibraryScreen({
   // chip is opened, OR when there's a query on the "All" tab (so an "All" search
   // matches song titles too, not just playlist/album/artist names).
   useEffect(() => {
-    const needSongs = filter === 'songs' || (filter === 'all' && !!q);
+    const needSongs =
+      filter === 'songs' || filter === 'offline' || (filter === 'all' && !!q);
     if (!needSongs || songs !== null) return;
     let cancelled = false;
     listLibrarySongs(token, profileId)
@@ -558,12 +473,28 @@ export function LibraryScreen({
     );
   }, [songs, q]);
 
+  // Exactly the tracks whose audio sits in this device's cache — the set
+  // behind "N songs cached offline", finally browsable. Ordered by the songs
+  // list (title-sorted) so it reads like the rest of the library.
+  const shownOffline = useMemo(() => {
+    if (!shownSongs) return null;
+    return shownSongs.filter((t) => cachedIds.has(t.id));
+  }, [shownSongs, cachedIds]);
+
   // Tapping a song plays it and queues the whole (filtered) songs list from
   // that point — only the playable rows, matching the desktop's behavior.
   const playSong = (song: StreamTrack) => {
     const playable = (shownSongs ?? []).filter(canStream);
     const idx = playable.findIndex((t) => t.id === song.id);
     if (idx >= 0) setQueue(playable, idx);
+  };
+  // Queue only what is actually on this device: the point of the Offline view
+  // is that it plays with no hub and no signal, so its queue must not trail
+  // off into tracks that would need the network.
+  const playOffline = (song: StreamTrack) => {
+    const list = shownOffline ?? [];
+    const idx = list.findIndex((t) => t.id === song.id);
+    if (idx >= 0) setQueue(list, idx);
   };
 
   return (
@@ -633,14 +564,20 @@ export function LibraryScreen({
             {/* Kind filter chips — only when the library holds more than one
                 kind, so a single-kind library stays clean. */}
             {showFilters && (
-              <div className="flex items-center gap-2 px-1 overflow-x-auto">
+              // Chip row scrolls without a scrollbar, like every other
+              // horizontal scroller in the app.
+              <div className="flex items-center gap-2 px-1 overflow-x-auto overscroll-x-contain [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden">
                 {filters.map((f) => (
                   <button
                     key={f}
                     type="button"
                     onClick={() => setFilter(f)}
+                    // px-4/py-2 at text-sm puts these near 36px tall. They were
+                    // a 28px xs chip, which is a small target for a thumb and
+                    // read as secondary next to the same filters in the apps
+                    // people compare us to.
                     className={cn(
-                      'shrink-0 rounded-full px-3 py-1.5 text-xs font-medium transition active:bg-white/10',
+                      'shrink-0 rounded-full px-4 py-2 text-sm font-medium transition active:bg-white/10',
                       navPill(filter === f),
                     )}
                   >
@@ -700,14 +637,6 @@ export function LibraryScreen({
         </div>
       ) : (
       <div className="px-4 pt-3">
-      {offlineCacheAvailable() && cachedCount > 0 && (
-        <StorageBanner
-          cachedCount={cachedCount}
-          storage={storage}
-          onClear={handleClearOffline}
-        />
-      )}
-
       {/* Sort (left) + list/grid toggle (right) — scrolls with the content
           (not pinned), Spotify-style. */}
       <div className="flex items-center justify-between px-1 mb-3">
@@ -736,6 +665,14 @@ export function LibraryScreen({
           hasQuery={!!q}
           query={query.trim()}
           onPlay={playSong}
+        />
+      ) : filter === 'offline' ? (
+        <SongsList
+          songs={shownOffline}
+          hasQuery={!!q}
+          query={query.trim()}
+          emptyLabel="Nothing is saved on this device yet."
+          onPlay={playOffline}
         />
       ) : q &&
       (filter === 'artists'
@@ -850,6 +787,9 @@ export function LibraryScreen({
         <CreatePlaylistSheet
           onCreate={async (name) => {
             const pl = await createPlaylist(name, token, profileId);
+            // Without this the library's cached list has no idea the playlist
+            // exists, so coming back from it shows a library without it.
+            notifyLibraryChanged();
             setCreateOpen(false);
             onOpen(pl.id);
           }}
@@ -1197,64 +1137,3 @@ function GridIcon() {
   );
 }
 
-function StorageBanner({
-  cachedCount,
-  storage,
-  onClear,
-}: {
-  cachedCount: number;
-  storage: { usage: number; quota: number } | null;
-  onClear: () => void;
-}) {
-  return (
-    <div className={cn(CALLOUT_INFO, 'mb-3 flex items-center gap-3')}>
-      <svg
-        width="18"
-        height="18"
-        viewBox="0 0 24 24"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="2"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        className="shrink-0 text-neutral-400"
-        aria-hidden
-      >
-        <path d="M12 3v12" />
-        <path d="m7 10 5 5 5-5" />
-        <path d="M5 21h14" />
-      </svg>
-      <div className="flex-1 min-w-0 text-xs text-neutral-300">
-        <div>
-          {cachedCount} {cachedCount === 1 ? 'song' : 'songs'} cached offline
-          {storage ? <> · {formatBytes(storage.usage)} used</> : null}
-        </div>
-        {storage && storage.quota > 0 && (
-          <div className="text-neutral-500 mt-0.5">
-            {formatBytes(storage.quota - storage.usage)} free of{' '}
-            {formatBytes(storage.quota)}
-          </div>
-        )}
-      </div>
-      <button
-        type="button"
-        onClick={onClear}
-        className={cn(BTN_GHOST_DANGER, 'shrink-0 text-xs px-2 py-1 active:text-red-400')}
-      >
-        Clear all
-      </button>
-    </div>
-  );
-}
-
-function formatBytes(n: number): string {
-  if (!isFinite(n) || n < 0) return '?';
-  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-  let i = 0;
-  let v = n;
-  while (v >= 1024 && i < units.length - 1) {
-    v /= 1024;
-    i += 1;
-  }
-  return `${v.toFixed(v < 10 && i > 0 ? 1 : 0)} ${units[i]}`;
-}

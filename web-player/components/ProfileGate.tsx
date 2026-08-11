@@ -7,6 +7,7 @@ import {
   type Profile,
 } from '@shared/api';
 import { cn, SCRIM, SHEET, INPUT, BTN_PRIMARY, BTN_GHOST } from '@shared/ui';
+import { useProfilesVersion } from '@shared/profilesChanged';
 
 function initialOf(name: string): string {
   const t = name.trim();
@@ -59,6 +60,7 @@ export function ProfileGate({
   const [profiles, setProfiles] = useState<Profile[] | null>(null);
   const [pinFor, setPinFor] = useState<Profile | null>(null);
 
+  const profilesVersion = useProfilesVersion();
   useEffect(() => {
     getProfiles(token)
       .then((list) => {
@@ -76,7 +78,9 @@ export function ProfileGate({
         setProfiles(list);
       })
       .catch(() => setProfiles([]));
-  }, [token, onSelect]);
+    // `profilesVersion` re-runs this when a profile was added, renamed or
+    // deleted — including from this very phone, moments ago.
+  }, [token, onSelect, profilesVersion]);
 
   const pick = (p: Profile) => {
     if (p.has_pin) {
@@ -132,7 +136,7 @@ export function ProfileGate({
         </div>
       )}
       <p className="mt-10 text-xs text-neutral-600 text-center max-w-xs">
-        Add or edit profiles in the Beetbot desktop app.
+        Add profiles in the Beetbot desktop app.
       </p>
 
       {pinFor ? (

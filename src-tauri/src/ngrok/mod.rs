@@ -40,12 +40,24 @@ const SIDECAR: &str = "ngrok";
 const RETRY_DELAY: Duration = Duration::from_secs(3);
 /// How long app exit waits for the agent to be killed before proceeding anyway.
 const STOP_TIMEOUT: Duration = Duration::from_secs(4);
+/// How often to ask the public URL whether it is actually serving anybody.
+const EDGE_PROBE_INTERVAL: Duration = Duration::from_secs(300);
+/// A probe that hangs is a probe that tells us nothing; fail it fast.
+const EDGE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// ngrok stamps its own failures with this header. Its presence means the answer
+/// came from ngrok's edge, not from us.
+const EDGE_ERROR_HEADER: &str = "ngrok-error-code";
 
 #[derive(Debug, Default)]
 struct NgrokInner {
     running: bool,
     public_url: Option<String>,
     last_error: Option<String>,
+    /// True when `last_error` came from the edge probe rather than the agent's log.
+    /// A flag rather than matching on the message text, so the probe can clear its
+    /// own error without ever clearing a real agent error — and so rewording a
+    /// message can't quietly break that.
+    edge_error: bool,
     /// Sending/dropping this asks the supervisor to stop (and kill the agent).
     /// Present while a supervisor is alive; also the "already running" guard.
     shutdown: Option<oneshot::Sender<()>>,
@@ -139,7 +151,91 @@ pub fn start(
         inner.last_error = None;
         (shutdown_rx, done_tx)
     };
+    spawn_edge_probe(state.clone());
     spawn_supervisor(app, state, authtoken, domain, port, shutdown_rx, done_tx);
+}
+
+/// Ask the public URL, periodically, whether it is actually serving anybody.
+///
+/// The log scanner cannot answer this. ngrok's edge can be turning every visitor
+/// away — over quota, offline domain, interstitial — while the agent session stays
+/// perfectly healthy and silent, so a tunnel reports "on" and serves nobody. The
+/// only place that failure is visible is in a response from the public URL, and
+/// ngrok labels its own rejections with an `ngrok-error-code` header.
+///
+/// Deliberately probes **our own** `/api/health`: it is the cheapest thing we serve,
+/// and when the edge is rejecting, the request never reaches us at all, so the check
+/// costs essentially nothing in the state it exists to detect. The probe self-parks
+/// while the tunnel is down — there is nothing to learn from probing a URL the agent
+/// already says is offline — and ends when the supervisor clears `shutdown`.
+fn spawn_edge_probe(state: NgrokState) {
+    tauri::async_runtime::spawn(async move {
+        let client = match reqwest::Client::builder()
+            .timeout(EDGE_PROBE_TIMEOUT)
+            // A rejection is the signal; following ngrok's redirect to its own error
+            // page would lose the header that carries it.
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "ngrok: couldn't build the edge probe client");
+                return;
+            }
+        };
+
+        loop {
+            tokio::time::sleep(EDGE_PROBE_INTERVAL).await;
+
+            let (alive, url) = {
+                let inner = state.0.lock().expect("ngrok mutex poisoned");
+                // `shutdown` is cleared when the supervisor tears down; that's our exit.
+                if inner.shutdown.is_none() {
+                    return;
+                }
+                (inner.running, inner.public_url.clone())
+            };
+            let Some(url) = url.filter(|_| alive) else {
+                continue;
+            };
+
+            let probe = format!("{}/api/health", url.trim_end_matches('/'));
+            let Ok(resp) = client.get(&probe).send().await else {
+                // The probe itself failed (no network here, DNS, timeout). That says
+                // nothing about the edge, and the agent's own log is the authority on
+                // being disconnected — so stay quiet rather than invent an error.
+                continue;
+            };
+
+            let edge_error = resp
+                .headers()
+                .get(EDGE_ERROR_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+
+            let mut inner = state.0.lock().expect("ngrok mutex poisoned");
+            match edge_error {
+                Some(code) => {
+                    if !inner.edge_error {
+                        tracing::warn!(%code, "ngrok: the edge is refusing visitors");
+                    }
+                    // Deliberately NOT `running = false`: the tunnel genuinely is
+                    // connected, and saying otherwise would send the owner to look at
+                    // their computer — the exact misdirection this is here to end.
+                    inner.last_error = Some(friendly_edge_error(&code));
+                    inner.edge_error = true;
+                }
+                None if inner.edge_error => {
+                    // Serving again, and the error on screen is ours to clear. An
+                    // agent error is left alone — only the agent's own log clears it.
+                    tracing::info!("ngrok: the edge is serving traffic again");
+                    inner.last_error = None;
+                    inner.edge_error = false;
+                }
+                None => {}
+            }
+        }
+    });
 }
 
 fn spawn_supervisor(
@@ -267,6 +363,9 @@ fn ingest_log(state: &NgrokState, line: &str, fallback_url: &Option<String>) {
             inner.public_url = fallback_url.clone();
         }
         inner.last_error = None;
+        // The agent just spoke; whatever the probe concluded is stale. The next
+        // probe re-establishes it within one interval if the edge is still refusing.
+        inner.edge_error = false;
         if was_down {
             tracing::info!("ngrok: tunnel online");
         }
@@ -279,6 +378,9 @@ fn ingest_log(state: &NgrokState, line: &str, fallback_url: &Option<String>) {
         let mut inner = state.0.lock().expect("ngrok mutex poisoned");
         inner.running = false;
         inner.last_error = Some(friendly);
+        // An agent error outranks an edge one: the tunnel is genuinely down, so
+        // "the edge is refusing traffic" is no longer the useful thing to say.
+        inner.edge_error = false;
         return;
     }
 
@@ -328,6 +430,31 @@ fn friendly_ngrok_error(line: &str) -> Option<String> {
     None
 }
 
+/// Translate an `ngrok-error-code` seen on the *public* URL into plain language.
+///
+/// These are a different species from the ones above. Everything `friendly_ngrok_error`
+/// handles is a **control-plane** failure: the agent fails to connect and says so in
+/// its log, so watching the log is enough. The codes here are **data-plane** — the
+/// session establishes perfectly, the agent logs nothing at all, and ngrok's edge
+/// turns visitors away one request at a time. Nothing the agent can see ever changes.
+///
+/// Found 29 Jul 2026 with `ERR_NGROK_725`: the tunnel was registered, the local agent
+/// API reported it up with `count: 0` requests, the app said Remote streaming was on,
+/// and every visitor had been getting a 403 for an unknown length of time. The zero
+/// request count was the tell — the edge rejects before anything reaches the agent,
+/// which is exactly why the agent cannot report it.
+fn friendly_edge_error(code: &str) -> String {
+    let c = code.trim().to_uppercase();
+    match c.as_str() {
+        "ERR_NGROK_725" => "Your ngrok account has used up its bandwidth for the month, so ngrok is turning visitors away. The tunnel looks connected because it is — ngrok is refusing the traffic, not your computer. It clears when the quota resets, or on a paid plan.".into(),
+        "ERR_NGROK_3200" => "ngrok says this address isn't online. If Remote streaming was just turned on, give it a moment; otherwise check the domain in Settings.".into(),
+        "ERR_NGROK_6022" | "ERR_NGROK_6024" => "ngrok is showing visitors a warning page before your library. That's the free tier's interstitial.".into(),
+        _ => format!(
+            "ngrok is refusing visitors with {c}. Your computer is fine — the tunnel is connected and ngrok is turning traffic away at its end."
+        ),
+    }
+}
+
 /// Pull a string value out of a flat JSON log line: `"key":"value"`.
 fn extract_json_str(line: &str, key: &str) -> Option<String> {
     let needle = format!("\"{key}\":\"");
@@ -372,5 +499,88 @@ pub fn shutdown_blocking(state: &NgrokState) {
         let _ = tauri::async_runtime::block_on(async move {
             tokio::time::timeout(STOP_TIMEOUT + Duration::from_secs(1), done).await
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_bandwidth_cap_is_explained_without_blaming_the_owners_computer() {
+        // The whole point of this check. On 29 Jul 2026 the tunnel was connected,
+        // the app said Remote streaming was on, and every visitor had been getting
+        // a 403 for an unknown length of time. The message has to say where the
+        // fault is, or the owner goes and debugs a machine that is working.
+        let msg = friendly_edge_error("ERR_NGROK_725");
+        assert!(msg.contains("bandwidth"), "must name the actual cause: {msg}");
+        assert!(
+            msg.contains("not your computer"),
+            "must point away from the machine: {msg}"
+        );
+        assert!(!msg.contains("ERR_NGROK"), "raw codes don't belong in the UI: {msg}");
+    }
+
+    #[test]
+    fn an_unknown_edge_code_still_produces_something_useful() {
+        // ngrok adds codes over time. An unrecognised one must still tell the owner
+        // the tunnel is up and ngrok is refusing — never a blank or a bare code.
+        let msg = friendly_edge_error("ERR_NGROK_9999");
+        assert!(msg.contains("ERR_NGROK_9999"), "keep the code for support: {msg}");
+        assert!(msg.contains("Your computer is fine"), "still place the fault: {msg}");
+        assert!(msg.len() > 40, "not a stub: {msg}");
+    }
+
+    #[test]
+    fn edge_codes_are_matched_regardless_of_case_or_stray_whitespace() {
+        // It arrives off the wire as a header value; don't let formatting decide
+        // whether the owner gets a real explanation or the generic fallback.
+        let canonical = friendly_edge_error("ERR_NGROK_725");
+        for raw in ["err_ngrok_725", "  ERR_NGROK_725  ", "Err_Ngrok_725"] {
+            assert_eq!(friendly_edge_error(raw), canonical, "failed on {raw:?}");
+        }
+    }
+
+    #[test]
+    fn the_agent_and_the_probe_report_on_different_things() {
+        // Control-plane vs data-plane. The log scanner sees session failures; the
+        // probe sees the edge turning visitors away. Neither can see the other's,
+        // which is why 725 went unnoticed — so keep them from being confused for
+        // one another: 725 must NOT be something the log scanner claims to handle.
+        assert!(
+            friendly_ngrok_error("ERR_NGROK_725 bandwidth limit").is_none(),
+            "725 never appears in the agent log; the log scanner must not pretend to own it"
+        );
+        // And the codes the agent DOES own keep working.
+        assert!(friendly_ngrok_error("ERR_NGROK_105 authentication failed").is_some());
+        assert!(friendly_ngrok_error("ERR_NGROK_108 limited to 1").is_some());
+    }
+
+    #[test]
+    fn the_probes_error_is_cleared_only_by_the_probe() {
+        // The flag exists so a reworded message can't break this. An agent error
+        // must survive the probe finding the edge healthy, and vice versa.
+        let mut inner = NgrokInner::default();
+
+        // Probe raises an edge error, then finds it healthy → cleared.
+        inner.last_error = Some(friendly_edge_error("ERR_NGROK_725"));
+        inner.edge_error = true;
+        if inner.edge_error {
+            inner.last_error = None;
+            inner.edge_error = false;
+        }
+        assert!(inner.last_error.is_none(), "the probe clears what it raised");
+
+        // Agent raises its own error; the probe finding the edge healthy must NOT
+        // wipe it — the tunnel really is down and that message is the useful one.
+        inner.last_error = friendly_ngrok_error("ERR_NGROK_105 authentication failed");
+        inner.edge_error = false;
+        if inner.edge_error {
+            inner.last_error = None;
+        }
+        assert!(
+            inner.last_error.is_some_and(|e| e.contains("authtoken")),
+            "an agent error is not the probe's to clear"
+        );
     }
 }

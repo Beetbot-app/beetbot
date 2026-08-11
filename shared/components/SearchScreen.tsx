@@ -76,6 +76,7 @@ import { AddToPlaylistModal } from './modals/AddToPlaylistModal';
 import { AlbumDetailModal } from './modals/AlbumDetailModal';
 import { PreviewRing, ExplicitBadge, AlbumDownloadedBadge, ShelfRow, AlbumGrid, playAlbumCard, albumTypeLabel, formatReleaseDate, PREVIEW_RING_KEYFRAMES, type SidebarPinController } from './searchPrimitives';
 import { notifyLibraryChanged } from '../libraryChanged';
+import { ShowAllTitle } from './ShowAllTitle';
 // Re-export the extracted primitives + modal so existing external importers
 // (BrowseScreen, HomeScreen, Playlist, TrackRow, Search, web-player, detailControllers)
 // keep importing them from this module unchanged.
@@ -1349,8 +1350,12 @@ export function SearchScreen({
               // lives outside <main> entirely.
               showingPage
               ? // A drill-in page (artist/album) has a full-bleed hero, so it
-                // owns its edges + top clearance — no container padding.
-                'absolute inset-0 z-40 overflow-y-auto bg-neutral-950 pb-6'
+                // owns its edges + top clearance — no container padding. That
+                // includes the BOTTOM: this used to keep a pb-6, which is what
+                // stopped the artist page's closing shade short of the edge.
+                // A page that bleeds to three edges and not the fourth is just
+                // a card with extra steps.
+                'absolute inset-0 z-40 overflow-y-auto bg-neutral-950'
               : 'absolute inset-0 z-40 overflow-y-auto bg-neutral-950 px-4 pt-6 pb-6'
             : 'hidden'
           : 'px-4 pt-4 pb-6'
@@ -4193,6 +4198,7 @@ export async function playArtistCard(
  *  Browse page. `className` lets the shelf pin a fixed width (`w-36 shrink-0`)
  *  while the grid stays fluid. */
 export function ArtistCard({
+  showKind = true,
   artist: a,
   onOpen,
   onPlay,
@@ -4204,6 +4210,9 @@ export function ArtistCard({
       artist's top tracks (the card click still opens the page). */
   onPlay?: (a: SearchArtistResult) => void;
   className?: string;
+  /** Show the "Artist · N albums" line. Off where every tile is an
+   *  artist and the words would repeat under each face. */
+  showKind?: boolean;
 }) {
   return (
     <div
@@ -4251,10 +4260,15 @@ export function ArtistCard({
         </div>
         <div className="mt-2 w-full min-w-0">
           <div className="truncate text-sm font-medium">{a.name}</div>
-          <div className="truncate text-xs text-neutral-500">
-            Artist
-            {a.total_albums ? ` · ${a.total_albums} albums` : ''}
-          </div>
+          {/* The kind + album count earn their place in mixed search results,
+              where a row could be an album or a track. In a row that is all
+              artists they are the same words under every face. */}
+          {showKind ? (
+            <div className="truncate text-xs text-neutral-500">
+              Artist
+              {a.total_albums ? ` · ${a.total_albums} albums` : ''}
+            </div>
+          ) : null}
         </div>
       </div>
     </div>
@@ -4265,6 +4279,7 @@ export function ArtistGrid({
   artists,
   onOpen,
   onPlay,
+  showKind = true,
   layout = 'grid',
 }: {
   artists: SearchArtistResult[];
@@ -4273,6 +4288,8 @@ export function ArtistGrid({
   onPlay?: (a: SearchArtistResult) => void;
   /** 'grid' = wrapping grid; 'row' = horizontal scroller (artist-page carousel). */
   layout?: 'grid' | 'row';
+  /** Passed to each card — see `ArtistCard`. */
+  showKind?: boolean;
 }) {
   if (artists.length === 0) {
     return (
@@ -4282,17 +4299,28 @@ export function ArtistGrid({
   // Same grid breakpoints as AlbumGrid so the search results read as
   // a single visual rhythm regardless of which tab you're on.
   if (layout === 'row') {
+    // The scroller needs room for each card's -inset-3 hover highlight, or
+    // `overflow-x-auto` slices it off — the first tile shows a rectangle cut
+    // flat against the row's edge. Pad the scroller, then pull the padding
+    // back on an outer wrapper. The negative margin must NOT go on the
+    // scroller itself: that collapses ShelfRow's positioning box and takes
+    // the ‹ › arrows with it (the same lesson is written into Home's shelf).
     return (
-      <ShelfRow artClass="h-28 sm:h-32">
+      <div className="-mx-3 -my-3">
+      <ShelfRow
+        artClass="h-28 sm:h-32"
+        scrollerClassName="flex gap-3 overflow-x-auto overscroll-x-contain px-3 py-3 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+      >
         {artists.map((a) => (
           <div
             key={`${a.source}:${a.source_id}`}
             className="w-28 sm:w-32 shrink-0"
           >
-            <ArtistCard artist={a} onOpen={onOpen} onPlay={onPlay} />
+            <ArtistCard artist={a} onOpen={onOpen} onPlay={onPlay} showKind={showKind} />
           </div>
         ))}
       </ShelfRow>
+      </div>
     );
   }
   return (
@@ -4303,6 +4331,7 @@ export function ArtistGrid({
           artist={a}
           onOpen={onOpen}
           onPlay={onPlay}
+          showKind={showKind}
         />
       ))}
     </div>
@@ -4667,9 +4696,8 @@ function ArtistTopSongs({
   );
 }
 
-/** A section title with an optional show-all affordance. Apple-Music-style: the
- *  TITLE itself is the link, with a › chevron right after the words (not a
- *  separate right-aligned "Show all"), so "Albums ›" opens the full-grid page. */
+/** A section title with an optional show-all affordance. The affordance itself
+ *  lives in `ShowAllTitle` (shared with home's shelves); this only places it. */
 function SectionHeader({
   label,
   onShowAll,
@@ -4677,29 +4705,13 @@ function SectionHeader({
   label: string;
   onShowAll?: () => void;
 }) {
-  if (!onShowAll) {
-    return (
-      <div className="px-1 mb-2 text-lg font-bold tracking-tight">
-        {label}
-      </div>
-    );
-  }
   return (
     <div className="px-1 mb-2">
-      <button
-        type="button"
-        onClick={onShowAll}
-        aria-label={`Show all ${label}`}
-        className="group/sa inline-flex items-center gap-1 text-lg font-bold tracking-tight transition hover:text-white"
-      >
-        {label}
-        <span
-          aria-hidden="true"
-          className="text-base leading-none text-neutral-500 transition-transform group-hover/sa:translate-x-0.5 group-hover/sa:text-neutral-200"
-        >
-          ›
-        </span>
-      </button>
+      <ShowAllTitle
+        label={label}
+        onShowAll={onShowAll}
+        className="text-lg font-bold tracking-tight"
+      />
     </div>
   );
 }
@@ -4850,7 +4862,7 @@ function ArtistShowAll({
         ? 'Singles & EPs'
         : section === 'songs'
           ? 'Top Songs'
-          : 'Similar Artists';
+          : 'Fans also like';
 
   // Same split + newest-first ordering as the artist page, so the grid mirrors
   // the carousel it was opened from.
@@ -5018,6 +5030,35 @@ function sharedSavedAlbumId(tracks: SearchTrackResult[]): number | null {
   return [...shared][0] ?? null;
 }
 
+/** Words that mark a re-release of a record rather than a different record. */
+const EDITION = 'deluxe|expanded|remaster(?:ed)?|edition|anniversary|bonus|reissue|explicit|standard';
+
+/**
+ * A comparison key that gives one record one name, however many times the
+ * catalog lists it. Drops the edition marker — bracketed ("(Deluxe)",
+ * "[Remastered 2011]"), after a dash ("- Remastered and Reissued"), or just
+ * trailing ("B'Day Deluxe Edition") — then case and punctuation:
+ *
+ *   "After Hours (Deluxe)"           → "after hours"
+ *   "OK Computer OKNOTOK 1997 2017"  → unchanged — a different record, rightly
+ *   "Fearless (Taylor's Version)"    → unchanged — also a different record
+ *
+ * That last one is why "version" is not an edition word on its own: only the
+ * fixed phrases ("Standard Version", "Deluxe Version") count.
+ */
+function albumNameKey(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(new RegExp(`\\s*[([][^)\\]]*\\b(?:${EDITION})\\b[^)\\]]*[)\\]]`, 'g'), '')
+    .replace(new RegExp(`\\s*[-–—]\\s*[^-–—]*\\b(?:${EDITION})\\b.*$`), '')
+    .replace(
+      /\s+(?:deluxe|expanded|remastered?|standard|special|collector'?s)(?:\s+(?:edition|version))?$/,
+      '',
+    )
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .trim();
+}
+
 /**
  * Modal showing an artist's discography. Loads /api/artists/:id/albums
  * and renders the result with the same AlbumGrid we use on the search
@@ -5086,10 +5127,10 @@ export function ArtistDetailModal({
   const [topTracks, setTopTracks] = useState<SearchTrackResult[] | null>(null);
   const [related, setRelated] = useState<SearchArtistResult[] | null>(null);
   const [bio, setBio] = useState<ArtistBio | null>(null);
+  const [bioExpanded, setBioExpanded] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // Apple-style About: the bio clamps to a few lines with a MORE toggle.
   // (No reset needed — the modal remounts per artist via key=source_id.)
-  const [bioExpanded, setBioExpanded] = useState(false);
   // Apple-style rails, both best-effort (empty just hides the section):
   // albums by OTHERS featuring this artist, and catalog playlists about them.
   const [appearsOn, setAppearsOn] = useState<SearchAlbumResult[]>([]);
@@ -5129,23 +5170,66 @@ export function ArtistDetailModal({
   // signal, so the Top Songs ARE the signal: rank full albums by how many top
   // songs they carry and keep the ones with at least two. Popularity-derived,
   // honest, and zero extra requests.
+  //
+  // The Latest Release is excluded, because the page has already given it the
+  // hero. The two sections answer different questions — "what's new?" and
+  // "where do I start?" — but a new record usually dominates its artist's top
+  // songs for a while, so on exactly the artists you are most likely to be
+  // reading about, both would show the same cover twice and read as a bug.
   const essentials = useMemo(() => {
     if (!albums || !topTracks || topTracks.length === 0) return [];
+    // Excluding the Latest Release means excluding the *record*, not the one
+    // catalog row: with only the row gone, an artist whose newest entry is a
+    // reissue would put the same cover back under Essentials.
+    const featuredKey = featured ? albumNameKey(featured.name) : '';
+    const eligible = albums.filter((a) => {
+      if (featured && a.source_id === featured.source_id) return false;
+      if (featuredKey && albumNameKey(a.name) === featuredKey) return false;
+      const ty = (a.album_type ?? '').toLowerCase();
+      return ty !== 'single' && ty !== 'ep';
+    });
+    if (eligible.length === 0) return [];
+    // One group per record, holding every catalog row for it — the original
+    // and its reissues. Counting rows instead splits a record's top songs
+    // between its editions and can cost it its place: Lana Del Rey's "Born To
+    // Die" scores 3 as a record but 2 and 1 as two rows.
+    type Group = { rep: (typeof eligible)[number]; ids: Set<string> };
+    const groups = new Map<string, Group>();
+    for (const a of eligible) {
+      // Empty key (a title that is all punctuation) falls back to the id, so
+      // such albums group only with themselves rather than all together.
+      const key = albumNameKey(a.name) || a.source_id;
+      const held = groups.get(key);
+      if (!held) {
+        groups.set(key, { rep: a, ids: new Set([a.source_id]) });
+      } else {
+        held.ids.add(a.source_id);
+        // Show the plainest title of the group — the record, not the reissue.
+        if (a.name.length < held.rep.name.length) held.rep = a;
+      }
+    }
+    const groupOfId = new Map<string, string>();
+    for (const [key, g] of groups) for (const id of g.ids) groupOfId.set(id, key);
+
     const counts = new Map<string, number>();
     for (const t of topTracks) {
-      if (t.album) counts.set(t.album, (counts.get(t.album) ?? 0) + 1);
+      // The album id is exact and is tried first; the name is the fallback for
+      // a hub too old to send one, and for the tracks Deezer credits to a row
+      // outside this artist's album list.
+      let key = t.album_id ? groupOfId.get(t.album_id) : undefined;
+      if (key === undefined && t.album) {
+        const nameKey = albumNameKey(t.album);
+        if (groups.has(nameKey)) key = nameKey;
+      }
+      if (key !== undefined) counts.set(key, (counts.get(key) ?? 0) + 1);
     }
-    return albums
-      .filter((a) => {
-        const ty = (a.album_type ?? '').toLowerCase();
-        return ty !== 'single' && ty !== 'ep';
-      })
-      .map((a) => ({ a, n: counts.get(a.name) ?? 0 }))
+    return [...groups]
+      .map(([key, g]) => ({ a: g.rep, n: counts.get(key) ?? 0 }))
       .filter((x) => x.n >= 2)
       .sort((x, y) => y.n - x.n)
       .slice(0, 3)
       .map((x) => x.a);
-  }, [albums, topTracks]);
+  }, [albums, topTracks, featured]);
 
   // Re-fetch this artist page's fetched membership/saved indicators when the
   // library changes elsewhere (a Top Song added to a playlist via its ⋯ picker,
@@ -5512,14 +5596,14 @@ export function ArtistDetailModal({
               {/* Condensed-header trigger: once this scrolls under the top bar,
                   the compact sticky bar fades in (desktop). */}
               <div ref={heroSentinelRef} aria-hidden className="h-px w-px" />
-              {/* Listeners live under the About section's heading when there's
-                  a bio; show them here only as a fallback so the banner isn't
-                  redundant with About. */}
-              {!bio && artist.total_fans ? (
-                <div className="text-sm text-neutral-200 mt-3 font-medium drop-shadow">
-                  {formatCompact(artist.total_fans)} listeners
-                </div>
-              ) : !bio && artist.total_albums ? (
+              {/* No listener count here either. It used to appear only when
+                  there was no bio, on the reasoning that About showed it
+                  otherwise — but About no longer does, and a number that
+                  turns up on artists without a bio and vanishes on artists
+                  with one is worse than not showing it at all. It never told
+                  you anything about the music. The album count stays: it says
+                  how much there is to play. */}
+              {!bio && artist.total_albums ? (
                 <div className="text-xs text-neutral-300 mt-3">
                   {artist.total_albums} albums on Deezer
                 </div>
@@ -5892,65 +5976,79 @@ export function ArtistDetailModal({
           </div>
         ) : null}
 
-        {/* About + Similar Artists — one Apple-Music-style closing band.
-            Everything from "About" down sits on its own slightly-lighter
-            surface with a hairline top edge, so it reads as the page's footer
-            area rather than more floating sections. Full-bleed on the phone
-            (escapes the column's px-4/pb-4 and runs to the page bottom); a
-            rounded card on desktop, matching its floating-card chrome. */}
+        {/* The page's closing stretch, Apple's shape: the blurb reads down the
+            left with the facts beside it as a sidebar, and "Fans also like"
+            shares the same ground. Not a card — a card would be the only boxed
+            thing on a page of plain rows. Just a change of shade behind a
+            hairline, running to both edges at every width (escaping the
+            column's px-4). */}
         {bio || (related && related.length > 0) ? (
-          <div className="-mx-4 -mb-4 mt-2 flex flex-col gap-6 border-t border-white/[0.06] bg-neutral-900 px-4 pt-6 pb-8 sm:mx-0 sm:mb-0 sm:rounded-2xl sm:border sm:border-white/5 sm:px-6 sm:pb-6">
+          <div
+            className={cn(
+              'mt-2 flex flex-col gap-8 border-t border-white/[0.06] bg-neutral-900 pt-6 pb-10',
+              // Reach every edge. -mx-4 escapes this column's px-4; the bottom
+              // has to swallow the column's pb-4 AND, on the desktop page,
+              // ModalShell's own pb-6 wrapper outside it — 40px in total. Miss
+              // that second one and the shade stops short, leaving a dark strip
+              // under it. The phone's sheet has no such wrapper, so it only
+              // needs the 16.
+              '-mx-4 px-4 sm:px-6',
+              inline ? '-mb-10' : '-mb-4',
+            )}
+          >
             {bio ? (
-              <div>
-                <h2 className="text-lg font-bold tracking-tight">
-                  About {artist.name}
-                </h2>
-                {/* Apple-style: the bio clamps to a few lines with a MORE
-                    toggle instead of dumping the whole essay. */}
-                <p
-                  className={cn(
-                    'mt-3 max-w-2xl text-[15px] leading-relaxed text-neutral-300 whitespace-pre-line',
-                    !bioExpanded && 'line-clamp-3',
-                  )}
-                >
-                  {bio.extract}
-                </p>
-                {/* Collapsed: just MORE. The Wikipedia link is part of the
-                    expanded reading experience, so it only appears once the
-                    bio is opened (or when the bio is short enough that there
-                    is no clamp at all). */}
-                <div className="mt-2 flex items-center gap-5">
-                  {bio.extract.length > 220 ? (
-                    <button
-                      type="button"
-                      onClick={() => setBioExpanded((v) => !v)}
-                      className="text-[13px] font-semibold tracking-wide text-neutral-200 hover:text-white"
-                    >
-                      {bioExpanded ? 'LESS' : 'MORE'}
-                    </button>
-                  ) : null}
-                  {bio.url && (bioExpanded || bio.extract.length <= 220) ? (
-                    <a
-                      href={bio.url}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="text-sm font-medium text-neutral-400 hover:text-white underline underline-offset-2"
-                    >
-                      Read more on Wikipedia →
-                    </a>
-                  ) : null}
+              <div className="flex flex-col gap-6 sm:flex-row sm:gap-12">
+                <div className="min-w-0 flex-1">
+                  <h2 className="text-lg font-bold tracking-tight">
+                    About {artist.name}
+                  </h2>
+                  {/* Clamped, with MORE opening it in place. The Wikipedia
+                      link belongs to the opened state: it is where you go when
+                      the blurb was not enough, so it appears once you have
+                      asked for more (or when the bio is short enough that
+                      there was never anything to open). */}
+                  <p
+                    className={cn(
+                      'mt-3 max-w-2xl text-[15px] leading-relaxed text-neutral-300 whitespace-pre-line',
+                      !bioExpanded && 'line-clamp-4',
+                    )}
+                  >
+                    {bio.extract}
+                  </p>
+                  <div className="mt-2 flex items-center gap-5">
+                    {bio.extract.length > 220 ? (
+                      <button
+                        type="button"
+                        onClick={() => setBioExpanded((v) => !v)}
+                        className="text-[13px] font-semibold tracking-wide text-neutral-200 hover:text-white"
+                      >
+                        {bioExpanded ? 'LESS' : 'MORE'}
+                      </button>
+                    ) : null}
+                    {bio.url && (bioExpanded || bio.extract.length <= 220) ? (
+                      <a
+                        href={bio.url}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-sm font-medium text-neutral-400 hover:text-white underline underline-offset-2"
+                      >
+                        Read more on Wikipedia →
+                      </a>
+                    ) : null}
+                  </div>
                 </div>
-                {/* The facts column, Apple-style: stacked label/value rows on
-                    the phone, wrapping side-by-side on wider screens. Only the
-                    rows we actually know render (Wikidata is best-effort). */}
-                {artist.total_fans || bio.from || bio.born || bio.genre ? (
-                  <div className="mt-6 flex flex-col gap-5 sm:flex-row sm:flex-wrap sm:gap-x-14 sm:gap-y-5">
+                {/* The facts, stacked in their own column beside the prose.
+                    As a row under the bio they were four values of wildly
+                    different widths pretending to be columns; as a sidebar
+                    they are a short list that ends where it ends. */}
+                {bio.from || bio.born || bio.genre ? (
+                  <div className="flex shrink-0 flex-col gap-4 sm:w-60">
                     {bio.from ? (
                       <div>
                         <div className="text-[11px] uppercase tracking-wide text-neutral-500">
                           From
                         </div>
-                        <div className="text-base text-neutral-100 mt-1">
+                        <div className="mt-1 text-[15px] text-neutral-100">
                           {bio.from}
                         </div>
                       </div>
@@ -5960,7 +6058,7 @@ export function ArtistDetailModal({
                         <div className="text-[11px] uppercase tracking-wide text-neutral-500">
                           Born
                         </div>
-                        <div className="text-base text-neutral-100 mt-1">
+                        <div className="mt-1 text-[15px] text-neutral-100">
                           {bio.born}
                         </div>
                       </div>
@@ -5970,18 +6068,8 @@ export function ArtistDetailModal({
                         <div className="text-[11px] uppercase tracking-wide text-neutral-500">
                           Genre
                         </div>
-                        <div className="text-base text-neutral-100 mt-1">
+                        <div className="mt-1 text-[15px] text-neutral-100">
                           {bio.genre}
-                        </div>
-                      </div>
-                    ) : null}
-                    {artist.total_fans ? (
-                      <div>
-                        <div className="text-[11px] uppercase tracking-wide text-neutral-500">
-                          Listeners
-                        </div>
-                        <div className="text-base text-neutral-100 mt-1">
-                          {formatCompact(artist.total_fans)}
                         </div>
                       </div>
                     ) : null}
@@ -5990,12 +6078,10 @@ export function ArtistDetailModal({
               </div>
             ) : null}
 
-            {/* Similar Artists — related artists in a horizontal carousel
-                (Apple Music's last section); tapping drills into one. */}
             {related && related.length > 0 ? (
               <div>
                 <SectionHeader
-                  label="Similar Artists"
+                  label="Fans also like"
                   onShowAll={
                     onShowAll && related.length > 5
                       ? () => onShowAll('related', { related })
@@ -6007,6 +6093,7 @@ export function ArtistDetailModal({
                   onOpen={onPickArtist}
                   onPlay={(a) => playArtistCard(a, token, onPlay)}
                   layout="row"
+                  showKind={false}
                 />
               </div>
             ) : null}

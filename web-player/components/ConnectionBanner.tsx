@@ -1,5 +1,5 @@
 import { type ReactNode, useRef, useState } from 'react';
-import { pingHub } from '@shared/api';
+import { getSignInUrl, pingHub } from '@shared/api';
 import { cn } from '@shared/ui';
 import type { ConnPhase } from '../lib/useConnectivity';
 
@@ -52,6 +52,23 @@ const COPY: Record<
       </>
     ),
   },
+  'signed-out': {
+    label: 'Sign in again to reach your library',
+    tint: 'bg-sky-900/70',
+    text: 'text-sky-100',
+    icon: 'text-sky-300',
+    // A key — this is a permission problem, not a broken machine. Deliberately
+    // NOT the monitor glyph: the computer is fine and pointing at it is the
+    // mistake this whole state exists to stop making.
+    glyph: (
+      <>
+        <circle cx="7.5" cy="15.5" r="3.5" />
+        <path d="M10 13 20 3" />
+        <path d="m17 6 2 2" />
+        <path d="m14 9 2 2" />
+      </>
+    ),
+  },
   reconnected: {
     label: 'Back online',
     tint: 'bg-emerald-900/70',
@@ -96,6 +113,9 @@ export function ConnectionBanner({
       setRetrying(false);
     }
   };
+
+  // Read at render: the URL arrives with the 401 that produced this phase.
+  const signInHref = shown === 'signed-out' ? getSignInUrl() : null;
 
   const c = COPY[shown];
   const pulsing = shown !== 'reconnected';
@@ -149,6 +169,20 @@ export function ConnectionBanner({
         >
           {retrying ? 'Checking…' : 'Retry'}
         </button>
+      )}
+      {shown === 'signed-out' && signInHref && (
+        // A plain link, not a fetch: signing in is a browser journey (cookies,
+        // a redirect back), so it has to happen in a real navigation. Same tab —
+        // the gate sends the owner back here when it's done.
+        <a
+          href={signInHref}
+          className={cn(
+            'shrink-0 rounded-full px-3 py-1 text-[12px] font-semibold transition active:scale-95',
+            'bg-white/10 text-white/90 hover:bg-white/15',
+          )}
+        >
+          Sign in
+        </a>
       )}
     </div>
   );

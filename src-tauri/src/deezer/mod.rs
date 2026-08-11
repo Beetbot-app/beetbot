@@ -138,6 +138,13 @@ pub struct TrackHit {
     /// /search hits too; optional so callers handle the occasional absence.
     #[serde(default)]
     pub isrc: Option<String>,
+    /// FULL credits (primary first) — e.g. ["James Blake", "Travis Scott",
+    /// "Ludwig Göransson"] where `artist` alone says only "James Blake".
+    /// Present on /track/{id} and /track/isrc:{isrc}; ABSENT on /search and
+    /// album-tracklist hits, so an empty vec means "not provided", never
+    /// "solo track".
+    #[serde(default)]
+    pub contributors: Vec<ArtistRef>,
     /// "YYYY-MM-DD". Present on /track/{id} and /track/isrc responses; absent on
     /// /search hits. The release year (for Home's Decade Mixes) is parsed from it.
     #[serde(default)]

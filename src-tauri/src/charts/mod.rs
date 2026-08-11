@@ -563,11 +563,25 @@ pub async fn lastfm_track_similar(
         Ok(r) => r,
         Err(_) => return Vec::new(),
     };
-    let parsed: LfmSimilarTracks = match resp.json().await {
+    let body = match resp.text().await {
+        Ok(b) => b,
+        Err(_) => return Vec::new(),
+    };
+    parse_similar_tracks(&body, limit)
+}
+
+/// Parse a `track.getsimilar` response body into ranked (title, artist) pairs.
+/// Split from the fetch so the parsing — the part of the network path that is
+/// OURS to break — is testable against captured fixtures without a network.
+/// Last.fm returns tracks already ranked by `match` (descending), so order is
+/// preserved; entries with a blank title or artist are dropped. Any shape we
+/// don't recognise (including Last.fm's `{"error": ...}` envelope) parses to
+/// empty, which the callers already treat as "no shelf".
+fn parse_similar_tracks(body: &str, limit: usize) -> Vec<(String, String)> {
+    let parsed: LfmSimilarTracks = match serde_json::from_str(body) {
         Ok(p) => p,
         Err(_) => return Vec::new(),
     };
-    // Last.fm returns them already ranked by `match` (descending), so preserve order.
     parsed
         .similartracks
         .track
@@ -638,5 +652,79 @@ pub fn genre_to_tag(name: &str) -> String {
             .unwrap_or(other)
             .trim()
             .replace(' ', "-"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The fixture below is hand-written to Last.fm's DOCUMENTED track.getsimilar
+    // schema (the same shape `LfmSimilarTracks` deserializes), not captured from
+    // the wire — capturing needs an API key this environment doesn't hold. That
+    // means these tests guard OUR parsing rules; drift in Last.fm's real schema
+    // is guarded by the live smoke test below, run by whoever holds a key.
+    const SIMILAR_OK: &str = r#"{
+      "similartracks": {
+        "track": [
+          {"name": "Strong Enough", "playcount": 1, "match": 1.0,
+           "artist": {"name": "Cher", "mbid": ""}},
+          {"name": "Ray of Light", "match": 0.72,
+           "artist": {"name": "Madonna"}},
+          {"name": "  ", "artist": {"name": "Blank Title Records"}},
+          {"name": "No Artist Given"},
+          {"name": "Vogue", "artist": {"name": "Madonna"}}
+        ],
+        "@attr": {"artist": "Cher"}
+      }
+    }"#;
+
+    #[test]
+    fn parse_similar_tracks_keeps_order_and_drops_blank_fields() {
+        let got = parse_similar_tracks(SIMILAR_OK, 10);
+        assert_eq!(
+            got,
+            vec![
+                ("Strong Enough".to_string(), "Cher".to_string()),
+                ("Ray of Light".to_string(), "Madonna".to_string()),
+                ("Vogue".to_string(), "Madonna".to_string()),
+            ],
+            "blank titles and missing artists are dropped; ranked order is preserved"
+        );
+    }
+
+    #[test]
+    fn parse_similar_tracks_honors_the_limit() {
+        assert_eq!(parse_similar_tracks(SIMILAR_OK, 2).len(), 2);
+    }
+
+    #[test]
+    fn parse_similar_tracks_survives_the_shapes_lastfm_actually_sends() {
+        // The error envelope (bad key, unknown track) — not a panic, not junk.
+        assert!(parse_similar_tracks(r#"{"error":6,"message":"Track not found"}"#, 10).is_empty());
+        // An empty result list.
+        assert!(parse_similar_tracks(r#"{"similartracks":{"track":[]}}"#, 10).is_empty());
+        // Not JSON at all (an HTML error page from a proxy).
+        assert!(parse_similar_tracks("<html>502</html>", 10).is_empty());
+        // Missing envelope entirely.
+        assert!(parse_similar_tracks("{}", 10).is_empty());
+    }
+
+    /// Live smoke test against the real Last.fm API — the guard against schema
+    /// drift that the fixtures above cannot catch. Ignored by default; run with
+    /// `BEETBOT_LASTFM_KEY=… cargo test -- --ignored lastfm`.
+    #[tokio::test]
+    #[ignore = "live network; needs BEETBOT_LASTFM_KEY"]
+    async fn lastfm_track_similar_returns_ranked_pairs_for_a_known_song() {
+        let Some(key) = default_lastfm_key() else {
+            eprintln!("skipped: BEETBOT_LASTFM_KEY not set at build time");
+            return;
+        };
+        let got = lastfm_track_similar(key, "Cher", "Believe", 10).await;
+        assert!(!got.is_empty(), "a globally known track should have similars");
+        assert!(
+            got.iter().all(|(t, a)| !t.is_empty() && !a.is_empty()),
+            "every pair carries both fields"
+        );
     }
 }

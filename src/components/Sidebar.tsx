@@ -2,7 +2,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Wordmark } from '@shared/components/Wordmark';
 import { ipc, type PlaylistSummary } from '@/lib/tauri';
 import { isPinned, pinId, usePinStore, type Pin } from '@/lib/pins';
-import { useSavedStore, savedArtistId, type SavedArtist } from '@/lib/saved';
+import {
+  useSavedStore,
+  savedArtistId,
+  isStalePortraitMiss,
+  type SavedArtist,
+} from '@/lib/saved';
 import { hasRealPortrait, isReplaceableArt, pickArtistForName } from '@shared/artistName';
 import { ContextMenu, MenuGlyphs, type MenuState } from '@shared/components/ContextMenu';
 import { useNavStore } from '@/lib/nav';
@@ -187,6 +192,15 @@ export function Sidebar({
   //     portrait — which looks like a valid portrait by URL, so the stand-in
   //     check alone can't catch it. Storing only a real portrait or null means
   //     this converges and never loops.
+  //   • Re-check a resolved MISS once its answer goes stale. A null used to be
+  //     final — `setArtwork(name, null)` marks `portrait`, and a null is not a
+  //     stand-in, so nothing ever asked again. But a miss is Deezer's answer on
+  //     one day, not a fact: a throttled search or a temporarily image-less
+  //     entry got frozen in for good. Measured against this library, Deezer has
+  //     a portrait for ~97% of artists, so most stored nulls are stale answers
+  //     rather than real gaps. `isStalePortraitMiss` expires them on the same
+  //     7-day clock the server uses for iTunes art misses; convergence still
+  //     holds, since a miss costs at most one search per artist per week.
   const backfillTried = useRef<Set<string>>(new Set());
   const backfillProfile = useRef<number | null>(null);
   useEffect(() => {
@@ -219,8 +233,9 @@ export function Sidebar({
       .getState()
       .artists.filter(
         (a) =>
-          // v2 pass: everyone once. Afterwards: only stand-in (blank/cover) art.
-          (!v2Done || !a.portrait || isReplaceableArt(a.art)) &&
+          // v2 pass: everyone once. Afterwards: stand-in (blank/cover) art, or
+          // a resolved miss whose answer has aged out.
+          (!v2Done || !a.portrait || isReplaceableArt(a.art) || isStalePortraitMiss(a)) &&
           !backfillTried.current.has(savedArtistId(a.name)),
       );
     if (pending.length === 0) {
@@ -236,7 +251,8 @@ export function Sidebar({
           const res = await searchCatalog(a.name, sessionToken, 'artist', 8);
           // Same relevance-not-popularity trap as onboarding: pick the real
           // artist by name + fans, not Deezer's result [0].
-          const best = pickArtistForName(res.artists ?? [], a.name);
+          const candidates = res.artists ?? [];
+          const best = pickArtistForName(candidates, a.name);
           // Store a real portrait if we found one; else keep any real art we
           // already had, else null — NEVER re-persist a blank/cover, so this
           // can't loop.
@@ -245,6 +261,15 @@ export function Sidebar({
             : hasRealPortrait(a.art)
               ? a.art
               : null;
+          // Only record a DEFINITIVE answer. A search that came back with no
+          // artists at all is ambiguous — a throttled hub, a degraded
+          // Deezer-direct fallback and a genuinely unknown name are
+          // indistinguishable here — and writing null for it would start a
+          // fresh 7-day silence on what may be a transient failure. Leaving it
+          // unwritten costs one more search next session. Same rule the server
+          // applies to iTunes art misses; a real answer (candidates existed,
+          // none had a usable portrait) still gets stored and dated.
+          if (next === null && candidates.length === 0) continue;
           if (!cancelled) setArtwork(a.name, next);
         } catch {
           /* leave unresolved → retried next session */

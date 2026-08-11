@@ -46,6 +46,13 @@ body,
   height: 100vh;
   margin: 0;
   padding: 0;
+  /* Nothing outside the app's own scroller may move. Without this the page
+     itself rubber-bands on iOS: drag anywhere and the whole app slides,
+     sticky header and bottom bar included, because the elastic bounce is the
+     DOCUMENT moving rather than the list scrolling. `overscroll-y-contain`
+     on <main> stops scroll CHAINING, but it cannot stop the document's own
+     bounce — that needs to be refused here, at the root. */
+  overscroll-behavior: none;
 }
 
 body {

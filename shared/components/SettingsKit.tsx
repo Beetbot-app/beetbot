@@ -54,7 +54,10 @@ const strokeProps = {
   'aria-hidden': true,
 };
 
-function ChevronRight({ className }: { className?: string }) {
+/** The drill-in chevron. Exported so anything that builds its own row — the
+ *  phone's profile card, which carries an avatar — matches the rows beside it
+ *  instead of approximating one with a text glyph. */
+export function ChevronRight({ className }: { className?: string }) {
   return (
     <svg width={16} height={16} {...strokeProps} className={className}>
       <path d="M9 6l6 6-6 6" />

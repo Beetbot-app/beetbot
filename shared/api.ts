@@ -559,6 +559,59 @@ export async function deleteProfile(profileId: number, token: string): Promise<v
   }
 }
 
+/** Rename a profile. The colour is the hub's to keep — it is not sent. */
+export async function renameProfile(
+  profileId: number,
+  name: string,
+  token: string,
+): Promise<Profile> {
+  const res = await fetch(
+    apiUrl(`/api/profiles/${profileId}?t=${encodeURIComponent(token)}`),
+    {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name }),
+    },
+  );
+  if (!res.ok) {
+    const msg = await res.text().catch(() => '');
+    throw new Error(msg || `rename profile → ${res.status}`);
+  }
+  return (await res.json()) as Profile;
+}
+
+/** Replace a profile's photo. Sends the file's bytes as-is; the hub decides the
+ *  format from them and keeps the file. */
+export async function setProfileAvatar(
+  profileId: number,
+  file: Blob,
+  token: string,
+): Promise<void> {
+  const res = await fetch(
+    apiUrl(`/api/profiles/${profileId}/avatar?t=${encodeURIComponent(token)}`),
+    { method: 'POST', body: file },
+  );
+  if (!res.ok) {
+    const msg = await res.text().catch(() => '');
+    throw new Error(msg || `set avatar → ${res.status}`);
+  }
+}
+
+/** Drop a profile's photo, back to the coloured initial. */
+export async function clearProfileAvatar(
+  profileId: number,
+  token: string,
+): Promise<void> {
+  const res = await fetch(
+    apiUrl(`/api/profiles/${profileId}/avatar?t=${encodeURIComponent(token)}`),
+    { method: 'DELETE' },
+  );
+  if (!res.ok) {
+    const msg = await res.text().catch(() => '');
+    throw new Error(msg || `clear avatar → ${res.status}`);
+  }
+}
+
 /** Verify a profile's PIN. Returns true for a correct PIN or no PIN set. */
 export async function verifyProfilePin(
   profileId: number,
@@ -740,6 +793,11 @@ export interface SearchTrackResult {
   title: string;
   artists: string[];
   album: string | null;
+  /** Catalog id of `album`. Match a track back to an album on THIS, not on the
+   *  name: "After Hours" and "After Hours (Deluxe)" are two strings for one
+   *  record. Optional — a hub older than this field, or a row the client
+   *  posted back, won't carry it, so callers still need a name fallback. */
+  album_id?: string | null;
   album_art_url: string | null;
   duration_ms: number;
   isrc: string | null;
@@ -1047,6 +1105,58 @@ const hubListeners = new Set<HubListener>();
  *  your computer" notice, the desktop's "restart the app" banner). Recovery
  *  stays instant: a single good beat clears it. */
 const HUB_DOWN_GRACE_MS = 5000;
+
+/** Where to send someone whose remote-access session has expired, or null when
+ *  nothing has said one is needed. Set from the gate's own 401 body, never
+ *  hardcoded — the core must not know which provider is in front of it. */
+let signInUrl: string | null = null;
+type SignInListener = (url: string | null) => void;
+const signInListeners = new Set<SignInListener>();
+
+/** The sign-in URL a remote-access gate asked us to send the owner to, if any.
+ *
+ *  This is a DIFFERENT failure from the hub being unreachable, and telling them
+ *  apart is the whole point: the gate answering 401 means the request got all
+ *  the way to the far end and was turned back for want of a session. Reporting
+ *  that as "can't reach your library" sends the owner to go and check a computer
+ *  that is working perfectly — which it did, on 28 Jul 2026, and cost an evening. */
+export function getSignInUrl(): string | null {
+  return signInUrl;
+}
+/** Subscribe to sign-in-required changes. Returns an unsubscribe fn. */
+export function onSignInRequired(fn: SignInListener): () => void {
+  signInListeners.add(fn);
+  return () => {
+    signInListeners.delete(fn);
+  };
+}
+function setSignInUrl(v: string | null): void {
+  if (signInUrl === v) return;
+  signInUrl = v;
+  for (const fn of signInListeners) fn(v);
+}
+
+/** Read a gate's "you are not signed in" answer, if that is what this is.
+ *
+ *  Deliberately narrow. A 401 alone is not enough — the hub itself answers 401
+ *  for an invalid *device* token, which is a pairing problem and not something a
+ *  browser sign-in fixes. The signal we act on is a 401 whose JSON body carries a
+ *  `signIn` URL, which is the gate explicitly telling us where to send them.
+ *  Anything else returns null and the caller carries on treating it as "answered". */
+async function readSignInChallenge(resp: Response): Promise<string | null> {
+  if (resp.status !== 401) return null;
+  try {
+    const body = (await resp.clone().json()) as { signIn?: unknown };
+    const url = typeof body.signIn === 'string' ? body.signIn.trim() : '';
+    // Only ever follow an absolute http(s) URL the gate supplied. A relative or
+    // javascript: value here would be somebody else's idea of where to send the
+    // owner's credentials.
+    if (/^https?:\/\//i.test(url)) return url;
+  } catch {
+    // Not JSON, or an empty body — an ordinary 401, nothing to offer.
+  }
+  return null;
+}
 
 /** Did the desktop hub answer recently? (Reachability, debounced — see
  *  HUB_DOWN_GRACE_MS.) */
@@ -2410,9 +2520,13 @@ export async function pingHub(token: string): Promise<boolean> {
   try {
     const params = new URLSearchParams({ device_id: getDeviceId(), t: token });
     // Any resolved response (even 401/5xx) means the desktop answered.
-    await fetch(apiUrl(`/api/devices?${params.toString()}`), {
+    const resp = await fetch(apiUrl(`/api/devices?${params.toString()}`), {
       signal: ctrl.signal,
     });
+    // Reachability is unchanged by a 401 — something answered, which is the only
+    // question this flag asks. What a 401-with-a-signIn-URL adds is WHY it said
+    // no, so the banner can offer the fix instead of blaming the computer.
+    setSignInUrl(await readSignInChallenge(resp));
     setHubReachable(true);
     return true;
   } catch {

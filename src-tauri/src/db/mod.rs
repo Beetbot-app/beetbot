@@ -46,6 +46,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (24, include_str!("../../migrations/024_profile_foreign_keys.sql")),
     (25, include_str!("../../migrations/025_profile_downloads.sql")),
     (26, include_str!("../../migrations/026_profile_identity.sql")),
+    (27, include_str!("../../migrations/027_home_impressions_shelf.sql")),
 ];
 
 #[derive(Debug, thiserror::Error)]

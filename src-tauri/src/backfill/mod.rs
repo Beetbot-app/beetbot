@@ -387,6 +387,25 @@ fn title_modifier_mismatch(local_title: &str, hit_title: &str) -> bool {
 ///
 /// A wrong ISRC mis-tags a track with another recording's identity, so every
 /// gate here fails closed: a false reject just means "no backfill".
+/// The credit-backfill write decision, given a stored single-artist row and a
+/// /track/{id} detail's contributors. Same-song discipline as the metadata
+/// backfill (a wrong write is worse than none): the detail's PRIMARY artist
+/// must match the stored one — matched with `artist_key`, the same
+/// normalization the library groups by — or the id points at something we
+/// didn't think it did and we leave the row alone. Solo tracks (fewer than two
+/// contributors) return None so the caller can mark them checked and never pay
+/// the lookup again.
+pub fn credit_update(stored_primary: &str, hit: &TrackHit) -> Option<Vec<String>> {
+    if hit.contributors.len() < 2 {
+        return None;
+    }
+    let detail_primary = &hit.contributors[0].name;
+    if crate::tags::artist_key(detail_primary) != crate::tags::artist_key(stored_primary) {
+        return None;
+    }
+    Some(crate::server::credit_names(&hit.contributors, stored_primary))
+}
+
 pub fn confirm_match(gap: &TrackGap, hit: &TrackHit) -> bool {
     let la = normalize_title(&gap.primary_artist);
     // No artist to corroborate with → too risky to adopt a foreign ISRC.
@@ -550,7 +569,32 @@ mod tests {
             preview: None,
             explicit_lyrics: false,
             rank: 0,
+            contributors: Vec::new(),
         }
+    }
+
+    #[test]
+    fn credit_update_applies_same_song_discipline() {
+        let with_contribs = |names: &[&str]| -> TrackHit {
+            let mut h = hit("When I'm Home", "James Blake", 326, None);
+            h.contributors =
+                names.iter().map(|n| ArtistRef { name: (*n).into() }).collect();
+            h
+        };
+        // Primary matches (case/space-insensitively) → full credits.
+        assert_eq!(
+            credit_update("james  blake", &with_contribs(&["James Blake", "Travis Scott"])),
+            Some(vec!["James Blake".to_string(), "Travis Scott".to_string()])
+        );
+        // The detail's primary is someone else → the id isn't what we thought;
+        // leave the row alone.
+        assert_eq!(
+            credit_update("James Blake", &with_contribs(&["Travis Scott", "James Blake"])),
+            None
+        );
+        // Genuinely solo → None, so the caller marks it checked.
+        assert_eq!(credit_update("James Blake", &with_contribs(&["James Blake"])), None);
+        assert_eq!(credit_update("James Blake", &with_contribs(&[])), None);
     }
 
     fn gap(title: &str, artist: &str, dur_ms: i64) -> TrackGap {

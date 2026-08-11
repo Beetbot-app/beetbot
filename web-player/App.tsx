@@ -40,6 +40,7 @@ import { useConnectivity } from './lib/useConnectivity';
 import { StatsScreen } from '@shared/components/StatsScreen';
 import { HomeScreen } from '@shared/components/HomeScreen';
 import { cn, BAR, INPUT, CALLOUT_ERROR, BTN_PRIMARY, BTN_SECONDARY } from '@shared/ui';
+import { notifyLibraryChanged } from '@shared/libraryChanged';
 import { SettingsScreen } from './components/SettingsScreen';
 import { usePlayerStore, useCatalogNav, currentTrack } from './store';
 
@@ -181,6 +182,9 @@ export default function App() {
         const trackId =
           t.local_track_id ?? (await resolveCatalogTrack(t, token)).track_id;
         await setTrackLiked(token, trackId, true, profileId);
+        // Favorites is a playlist, and its cached read is why "liked it, then
+        // could not find it" is the example in notifyLibraryChanged's own doc.
+        notifyLibraryChanged();
       } catch (e) {
         console.warn('[beetbot] favorite-from-album failed', e);
       }
@@ -616,7 +620,10 @@ export default function App() {
         onTouchMove={onMainTouchMove}
         onTouchEnd={onMainTouchEnd}
         onScroll={onMainScroll}
-        className="flex-1 min-h-0 overflow-y-auto overscroll-y-contain"
+        // No scrollbar gutter: this is a phone app, and every other scroller
+        // in it already hides its bar. The visible track read as a desktop
+        // artefact against the native apps this sits next to.
+        className="flex-1 min-h-0 overflow-y-auto overscroll-y-contain [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden"
         // Apply iOS safe-area insets at the App level so they cover
         // *every* branch a screen might render -- including transient
         // "Loading library…" / "Couldn't load library" placeholders
@@ -840,19 +847,18 @@ export default function App() {
           ]}
           items={[
             ...(albumSheetTrack.artists[0]
-              ? [
-                  {
-                    key: 'artist',
-                    label: 'Go to Artist',
-                    icon: (
-                      <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-                        <circle cx="12" cy="8" r="4" />
-                        <path d="M5.5 21a6.5 6.5 0 0 1 13 0" />
-                      </svg>
-                    ),
-                    onClick: () => openArtistNav(albumSheetTrack.artists[0]),
-                  },
-                ]
+              ? albumSheetTrack.artists.slice(0, 4).map((a, ai) => ({
+                  key: `artist-${ai}`,
+                  label:
+                    albumSheetTrack.artists.length > 1 ? `Go to ${a}` : 'Go to Artist',
+                  icon: (
+                    <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                      <circle cx="12" cy="8" r="4" />
+                      <path d="M5.5 21a6.5 6.5 0 0 1 13 0" />
+                    </svg>
+                  ),
+                  onClick: () => openArtistNav(a),
+                }))
               : []),
             ...(albumSheetTrack.album
               ? [

@@ -34,7 +34,7 @@ import {
 } from '@shared/api';
 import { cn, CALLOUT_ERROR } from '@shared/ui';
 import { useConnectStore } from '@/lib/connect';
-import { Marquee } from '@shared/components/Marquee';
+import { AutoMarquee } from './AutoMarquee';
 import { LikeButton } from '@shared/components/LikeButton';
 import { useAddAudio } from '@/lib/addAudio';
 import { useDownloadsStore, trackHasFile } from '@/lib/downloads';
@@ -381,12 +381,22 @@ export function PlayerBar() {
             icon: MenuGlyphs.addToPlaylist,
             onClick: openAddToPlaylist,
           },
-          {
-            label: 'Go to artist',
-            icon: MenuGlyphs.artist,
-            onClick: () => openArtistPage(t.artists[0]),
-            disabled: !t.artists[0],
-          },
+          // One entry per credited artist (capped at 4); a single credit
+          // keeps the classic label.
+          ...(t.artists.length > 1
+            ? t.artists.slice(0, 4).map((a) => ({
+                label: `Go to ${a}`,
+                icon: MenuGlyphs.artist,
+                onClick: () => openArtistPage(a),
+              }))
+            : [
+                {
+                  label: 'Go to artist',
+                  icon: MenuGlyphs.artist,
+                  onClick: () => openArtistPage(t.artists[0]),
+                  disabled: !t.artists[0],
+                },
+              ]),
           {
             label: 'Go to album',
             icon: MenuGlyphs.album,
@@ -1534,29 +1544,36 @@ export function PlayerBar() {
             </button>
             <div className="group min-w-0">
               {/* Song title → opens the album it came from. Falls back to
-                  plain (non-link) text when the track has no album name. Long
-                  titles marquee-scroll while the hovering the now-playing text. */}
+                  plain (non-link) text when the track has no album name. */}
+              {/* The whole line lives in an AutoMarquee: a long title scrolls
+                  through one pass when the track starts; hovering pauses any glide
+                  so the line sits still under the cursor, and it resumes — or
+                  replays from rest — as the pointer leaves. Short
+                  titles render static. */}
               {track.album ? (
-                <button
-                  type="button"
-                  onClick={() =>
-                    openAlbumPage(track.album!, track.artists[0] ?? null)
-                  }
-                  className="block max-w-full text-sm font-medium text-left hover:underline"
-                  title={`Go to album: ${track.album}`}
-                >
-                  <Marquee text={track.title} />
-                </button>
+                <AutoMarquee announceKey={track.id} className="max-w-full text-sm font-medium">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      openAlbumPage(track.album!, track.artists[0] ?? null)
+                    }
+                    className="hover:underline"
+                    title={`Go to album: ${track.album}`}
+                  >
+                    {track.title}
+                  </button>
+                </AutoMarquee>
               ) : (
-                <div className="text-sm font-medium" title={track.title}>
-                  <Marquee text={track.title} />
-                </div>
+                <AutoMarquee announceKey={track.id} className="max-w-full text-sm font-medium">
+                  <span title={track.title}>{track.title}</span>
+                </AutoMarquee>
               )}
               {/* Each artist name → opens that artist's page. */}
-              <div
-                className="text-xs text-neutral-500 truncate"
-                title={track.artists.join(', ')}
-              >
+              {/* Same ticker for the credits: a long collab line announces once
+                  on track start; hovering pauses it so every artist link sits
+                  still and clickable, and it glides on as the pointer leaves. */}
+              <AutoMarquee announceKey={track.id} className="max-w-full text-xs text-neutral-500">
+                <span title={track.artists.join(', ')}>
                 {track.artists.length > 0
                   ? track.artists.map((a, i) => (
                       <span key={`${a}-${i}`}>
@@ -1572,7 +1589,8 @@ export function PlayerBar() {
                       </span>
                     ))
                   : '—'}
-              </div>
+                </span>
+              </AutoMarquee>
             </div>
             <div className="flex items-center gap-0.5 shrink-0">
               <LikeButton

@@ -40,6 +40,7 @@ import {
   navPill,
 } from '@shared/ui';
 import { Group, Row, Toggle, Slider, Segmented, Picker } from '@shared/components/SettingsKit';
+import { notifyProfilesChanged } from '@shared/profilesChanged';
 import { useCanDownload } from '@/lib/capabilities';
 import {
   useAppearanceStore,
@@ -59,11 +60,21 @@ import {
 type Banner = { kind: 'error' | 'info'; text: string } | null;
 
 // The DuckDNS "connect without a relay" path (DuckDNS + Let's Encrypt cert +
-// router port-forward + network check) is hidden for now: ngrok already covers
-// trusted remote access, so this direct route is kept in the code but not shown,
-// to avoid cluttering the page with a second way to connect. Flip to `true` to
-// bring it back.
-const SHOW_DUCKDNS = false;
+// router port-forward + network check) is shown again.
+//
+// It was hidden on the reasoning that "ngrok already covers trusted remote
+// access". That turned out to be false for a music app specifically: ngrok's free
+// tier allows 1 GB a month, which is roughly seven hours of 320kbps listening — or
+// under three of FLAC. Every listener runs out, every month, and the way they find
+// out is their music stopping. Worse, it fails silently: the tunnel stays connected
+// and the agent logs nothing while ngrok's edge turns every visitor away (see the
+// edge probe in `ngrok/mod.rs`, added after exactly that went unnoticed).
+//
+// So this route is the honest recommendation for anyone actually listening —
+// unlimited, no third party in the audio path — and ngrok is the five-minute option
+// for trying remote access out. Both stay: an app whose only remote path is a paid
+// service isn't much of a free one.
+const SHOW_DUCKDNS = true;
 
 /**
  * Settings page — every knob that used to live in the Library header now
@@ -1364,6 +1375,10 @@ export function SettingsPage() {
           onClose={() => setEditingProfile(null)}
           onSaved={() => {
             setEditingProfile(null);
+            // Tell the rest of the window (the top bar's avatar, chiefly) —
+            // it holds its own copy and would otherwise wait for a focus
+            // change to notice a rename or a new photo.
+            notifyProfilesChanged();
             void ipc
               .listProfiles()
               .then((fresh) => {
@@ -2466,17 +2481,31 @@ function RemoteStreamingCard({
           you automatically.
         </p>
       </div>
-      {/* The DuckDNS one-button setup + its port-forward status only belong with
-          the advanced self-hosting route (hidden while SHOW_DUCKDNS is off). */}
+      {/* The DuckDNS one-button setup + its port-forward status. This is the route
+          to recommend for real listening: no monthly cap and nothing between the
+          listener and the music. */}
       {advanced && SHOW_DUCKDNS && (
         <>
+          <div className="rounded-lg border border-neutral-800 p-3 space-y-1">
+            <h3 className="text-sm font-medium">
+              Your own address (best for everyday listening)
+            </h3>
+            <p className="text-xs text-neutral-500">
+              Your music travels straight from this Mac to your phone, with no
+              service in between and nothing to run out. Beetbot claims a free
+              address, gets a certificate for it, and opens the router port for you.
+              It needs a router that allows this — most home routers do — so it takes
+              a minute longer to set up than the quick link above, and then it keeps
+              working.
+            </p>
+          </div>
           <button
             type="button"
             onClick={onGoLive}
             disabled={goingLive || busy}
             className={cn(BTN_PRIMARY, 'w-full')}
           >
-            {goingLive ? 'Going live…' : 'Go live anywhere (DuckDNS, no relay)'}
+            {goingLive ? 'Going live…' : 'Set up my own address'}
           </button>
           {upnpMapped && (
             <div className={cn(CALLOUT_INFO, 'text-[11px]')}>
@@ -2830,11 +2859,20 @@ function NgrokCard({
     <div className="rounded-lg border border-white/10 p-4 space-y-3">
       <div className="space-y-2">
         <div>
-          <h3 className="text-sm font-medium">Your link (works anywhere)</h3>
+          <h3 className="text-sm font-medium">
+            Quick link (good for trying it out)
+          </h3>
           <p className="text-xs text-neutral-500 mt-0.5">
             A private, secure link to this Mac — on your Wi-Fi and away from home,
             no router settings, nothing extra to install. Make a free account and
             paste in two things; Beetbot handles the rest.
+          </p>
+          <p className="text-xs text-amber-300/80 mt-1.5">
+            Worth knowing before you set this up: ngrok’s free plan includes 1 GB a
+            month, which is roughly <strong>seven hours of listening</strong> — under
+            three if your music is lossless. When it runs out, ngrok turns visitors
+            away and your music stops until the month resets. For everyday listening,
+            use the router route below instead — it has no limit.
           </p>
         </div>
         <ol className="text-xs text-neutral-400 space-y-1.5 list-decimal pl-4 leading-relaxed">

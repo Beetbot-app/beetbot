@@ -1016,7 +1016,118 @@ async fn drive_backfill(app: tauri::AppHandle, db: Arc<Mutex<Connection>>) -> Ba
             break;
         }
     }
+    // Credit pass: after the metadata sweep, under the same single-flight
+    // guard, so the two passes can't interleave their Deezer traffic.
+    credit_backfill_run(db.clone()).await;
     first.unwrap_or_default()
+}
+
+/// Backfill full artist credits onto Deezer-sourced rows that predate the
+/// import-time enrichment (or whose enrichment fetch failed). Unlike the
+/// metadata sweep this needs NO search heuristics: every candidate carries its
+/// exact Deezer id, so the lookup is /track/{id} and the only judgment is
+/// `backfill::credit_update`'s same-song discipline.
+///
+/// Rows whose detail says "genuinely solo" (or whose id no longer matches the
+/// stored primary) get a `credits_done1:{id}` marker so they never pay the
+/// lookup again — the itunes-miss pattern, versioned the same way so a logic
+/// improvement can re-attempt everything once. Transient fetch failures get no
+/// marker and retry on the next sweep. The Deezer client self-paces (110ms
+/// floor), so a first full run over a few thousand rows is minutes of quiet
+/// background traffic.
+async fn credit_backfill_run(db: Arc<Mutex<Connection>>) {
+    type Candidate = (i64, u64, String);
+    let candidates: Vec<Candidate> = {
+        let Ok(conn) = db.lock() else { return };
+        let rows: Result<Vec<Candidate>, rusqlite::Error> = (|| {
+            let mut stmt = conn.prepare(
+                // Playlist-linked rows first: they are the ones on screen.
+                "SELECT t.id, CAST(substr(t.spotify_id, 8) AS INTEGER),
+                        json_extract(t.artists, '$[0]')
+                 FROM tracks t
+                 LEFT JOIN settings s ON s.key = 'credits_done1:' || t.id
+                 WHERE t.spotify_id LIKE 'deezer:%'
+                   AND json_array_length(t.artists) = 1
+                   AND s.key IS NULL
+                 ORDER BY EXISTS(
+                     SELECT 1 FROM playlist_tracks pt WHERE pt.track_id = t.id
+                 ) DESC, t.id",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)? as u64,
+                    r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                ))
+            })?;
+            Ok(rows.filter_map(|x| x.ok()).collect())
+        })();
+        match rows {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(?e, "credit backfill: candidate query failed");
+                return;
+            }
+        }
+    };
+    if candidates.is_empty() {
+        return;
+    }
+    let client = crate::deezer::DeezerClient::new();
+    let (mut updated, mut done, mut failed) = (0usize, 0usize, 0usize);
+    let now = chrono::Utc::now().timestamp().to_string();
+    for (track_id, deezer_id, stored_primary) in candidates {
+        if deezer_id == 0 || stored_primary.trim().is_empty() {
+            failed += 1;
+            continue;
+        }
+        match client.get_track(deezer_id).await {
+            Ok(hit) => {
+                if let Some(names) = backfill::credit_update(&stored_primary, &hit) {
+                    let Ok(json) = serde_json::to_string(&names) else {
+                        failed += 1;
+                        continue;
+                    };
+                    let Ok(conn) = db.lock() else { return };
+                    // Only replace a row that is STILL thin — the import-time
+                    // enrichment or a rich re-touch may have beaten us here.
+                    let res = conn.execute(
+                        "UPDATE tracks SET artists = ?2,
+                                updated_at = strftime('%s','now')
+                         WHERE id = ?1 AND json_array_length(artists) = 1",
+                        rusqlite::params![track_id, json],
+                    );
+                    match res {
+                        Ok(n) if n > 0 => updated += 1,
+                        Ok(_) => done += 1, // someone else enriched it first
+                        Err(e) => {
+                            tracing::warn!(?e, track_id, "credit backfill: write failed");
+                            failed += 1;
+                        }
+                    }
+                } else {
+                    // Genuinely solo, or the id's primary doesn't match ours:
+                    // definitive either way — mark it so we never refetch.
+                    let Ok(conn) = db.lock() else { return };
+                    let _ = crate::settings::set_setting(
+                        &conn,
+                        &format!("credits_done1:{track_id}"),
+                        &now,
+                    );
+                    done += 1;
+                }
+            }
+            Err(_) => {
+                // No marker on ANY error: network blips must retry, and a
+                // delisted track is indistinguishable from one (Deezer answers
+                // it as an in-band error envelope that fails to decode, not a
+                // 404). Retrying a rare delisted row each sweep costs one paced
+                // call; wrongly marking a blip done would silence it forever.
+                failed += 1;
+            }
+        }
+    }
+    tracing::info!(updated, done, failed, "credit backfill pass complete");
 }
 
 /// Fire-and-forget the automatic library-wide metadata backfill after an
@@ -3195,9 +3306,19 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .setup(setup_app)
         .invoke_handler(invoke_handler())
+        .on_window_event(hide_instead_of_closing)
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {
+            // Clicking the Dock icon reopens the window. This is now the usual
+            // way back in, not an edge case: the window spends most of its life
+            // hidden rather than closed. `Reopen` is macOS-only — the variant
+            // does not exist elsewhere and referencing it is a hard compile
+            // error, so the arm is gated rather than the body.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = event {
+                show_main(app_handle);
+            }
             // Close the ngrok tunnel cleanly on exit (either event may be the one
             // that fires) so its edge releases the reserved domain immediately.
             if matches!(
@@ -3643,7 +3764,92 @@ pub fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>>
                     tracing::warn!(?e, "media controls unavailable; skipping");
                 }
             }
+
+            // Stay in the menu bar when the window is shut, and give the owner
+            // a way back to it (and a way to actually stop). See "Staying
+            // resident" for why the red traffic light used to end the music on
+            // every other device in the house.
+            if let Err(e) = build_tray(app) {
+                tracing::warn!(?e, "tray icon unavailable; skipping");
+            }
+            if launched_at_login() {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.hide();
+                }
+            }
             Ok(())
+}
+
+// --- staying resident --------------------------------------------------------
+//
+// Closing the window is not a request to stop serving.
+//
+// The window is the player. It is not the service. Somebody who shuts it on the
+// machine that hosts the library has not asked the phone in the next room to
+// stop playing — but that is exactly what happened, because the server runs on
+// this process's async runtime and Tauri exits the process when the last window
+// is destroyed. The chain is in `tauri-runtime-wry`: `Destroyed` on an empty
+// window map emits `ExitRequested`, and unless something calls `prevent_exit()`
+// the runtime sets `ControlFlow::Exit`. Nothing did.
+//
+// The fix is to never let the window be destroyed: hide it instead. Then the
+// window map is never empty, `ExitRequested` never fires, and the only ways out
+// are the two that mean it — the tray's Quit, and Cmd-Q.
+
+/// The flag a login item passes, so a launch nobody asked to see stays out of
+/// the way. A hand launch has no flag and shows the window as it always did.
+/// Public because the shell registers the login item and must pass this exact
+/// string; the core only reads it.
+pub const AUTOSTART_FLAG: &str = "--autostart";
+
+/// Was this launch a login item's doing rather than a person's?
+pub fn launched_at_login() -> bool {
+    std::env::args().any(|a| a == AUTOSTART_FLAG)
+}
+
+/// Hide the window rather than let it close. Wired by both builds' `run()`.
+pub fn hide_instead_of_closing(window: &tauri::Window, event: &tauri::WindowEvent) {
+    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+        api.prevent_close();
+        let _ = window.hide();
+    }
+}
+
+/// Bring the window back — from the tray, or from a Dock click.
+pub fn show_main(app: &tauri::AppHandle) {
+    use tauri::Manager;
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.set_focus();
+    }
+}
+
+/// The menu-bar presence. With the window hidden this is the only thing telling
+/// the owner Beetbot is still up — and the only way to say "stop", which is why
+/// Quit lives here rather than being left to Cmd-Q alone.
+fn build_tray(app: &tauri::App) -> tauri::Result<()> {
+    use tauri::menu::{Menu, MenuItem};
+    use tauri::tray::TrayIconBuilder;
+
+    let open = MenuItem::with_id(app, "open", "Open Beetbot", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit Beetbot", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&open, &quit])?;
+
+    TrayIconBuilder::new()
+        .icon(tauri::include_image!("icons/tray-icon.png"))
+        // A template image is black-plus-alpha and macOS recolours it for the
+        // menu bar it lands in, so it stays legible in both appearances. A
+        // coloured icon has to guess, and guesses wrong half the time.
+        .icon_as_template(true)
+        .menu(&menu)
+        .tooltip("Beetbot")
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "quit" => app.exit(0),
+            "open" => show_main(app),
+            _ => {}
+        })
+        .build(app)?;
+    Ok(())
 }
 
 /// The core command handler. Exposed so the full-build shell composes it with

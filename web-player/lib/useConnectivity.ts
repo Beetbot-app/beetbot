@@ -1,5 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
-import { isHubReachable, onHubReachability, pingHub } from '@shared/api';
+import {
+  getSignInUrl,
+  isHubReachable,
+  onHubReachability,
+  onSignInRequired,
+  pingHub,
+} from '@shared/api';
 
 /**
  * The connection banner's state machine.
@@ -13,6 +19,11 @@ import { isHubReachable, onHubReachability, pingHub } from '@shared/api';
  *     answering (desktop asleep / powered off / off the LAN / tunnel down).
  *     Browsing still works via the metadata fallback; playing your library and
  *     saving don't.
+ *   - `signed-out`     — the phone reached the far end and was turned back for
+ *     want of a session. NOT the same as the server being down, and the
+ *     difference matters: the computer is fine and the fix is on this phone.
+ *     Reported as `hub-offline` before 30 Jul 2026, which sent the owner to
+ *     debug a working machine.
  *   - `reconnected`    — a transient success pulse shown once when the server
  *     comes back after either kind of outage (the user's explicit ask).
  *   - `online`         — everything reachable; no banner.
@@ -21,6 +32,7 @@ export type ConnPhase =
   | 'online'
   | 'device-offline'
   | 'hub-offline'
+  | 'signed-out'
   | 'reconnected';
 
 /** How long the "Back online" pulse stays up before it fades on its own. */
@@ -49,6 +61,10 @@ export function useConnectivity(token: string | null): ConnPhase {
   const [deviceOnline, setDeviceOnline] = useState(readOnline);
   const [hubOnline, setHubOnline] = useState(isHubReachable);
   const [reconnected, setReconnected] = useState(false);
+  const [signInAt, setSignInAt] = useState<string | null>(getSignInUrl);
+
+  // The gate's own answer, surfaced by pingHub / the heartbeat.
+  useEffect(() => onSignInRequired(setSignInAt), []);
 
   // Did the user actually see an offline banner this cycle? Gates the reconnect
   // pulse so it never fires on the first successful connect at launch.
@@ -132,6 +148,9 @@ export function useConnectivity(token: string | null): ConnPhase {
   );
 
   if (!deviceOnline) return 'device-offline';
+  // Ranked ABOVE hub-offline on purpose: a gate that answers 401 has proved the
+  // far end is up, so "can't reach your library" would be actively misleading.
+  if (signInAt) return 'signed-out';
   if (!hubOnline) return 'hub-offline';
   if (reconnected) return 'reconnected';
   return 'online';

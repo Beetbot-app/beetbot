@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type CSSProperties } from 'react';
+import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 
 /**
  * One-line text that, when its enclosing `.group` (a card/tile) is hovered AND
@@ -15,6 +15,7 @@ export function Marquee({
   text,
   className,
   lines = 1,
+  children,
 }: {
   text: string;
   className?: string;
@@ -22,6 +23,11 @@ export function Marquee({
    *  uses 2 for the quick-pick tiles, 1 for card titles). Ignored on desktop,
    *  which scrolls the single line on hover. */
   lines?: number;
+  /** Rendered in place of the raw text when given — this is how a card line
+   *  carries LINKS (per-artist buttons, an album link) while `text` keeps
+   *  doing the measuring and the tooltip. The links stay clickable while the
+   *  line slides, since the hover-peek is just a transform. */
+  children?: ReactNode;
 }) {
   // A touch device can't hover to scroll, so a long title would just sit
   // clipped. Fall back to a clean line-clamped ellipsis there — the Spotify-
@@ -71,7 +77,7 @@ export function Marquee({
           WebkitBoxOrient: 'vertical',
         } as CSSProperties}
       >
-        {text}
+        {children ?? text}
       </div>
     );
   }
@@ -98,7 +104,7 @@ export function Marquee({
         className="inline-block whitespace-nowrap will-change-transform [transform:translateX(0)] transition-transform ease-linear group-hover:[transform:translateX(var(--mq))]"
         style={{ ['--mq' as string]: `-${shift}px`, transitionDuration: `${dur}s` }}
       >
-        {text}
+        {children ?? text}
       </span>
     </div>
   );

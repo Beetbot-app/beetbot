@@ -24,6 +24,7 @@ import { playlistTrackToSearch } from '@/lib/trackAdapter';
 import { ensureSession, getTrackPlaylistIds, type SearchTrackResult } from '@shared/api';
 import { useLyrics } from '@/lib/useLyrics';
 import { QueuePanel } from '@/components/QueuePanel';
+import { AutoMarquee } from '@/components/AutoMarquee';
 import { LyricsIcon, QueueIcon } from '@/components/PlayerIcons';
 
 /**
@@ -169,12 +170,22 @@ export function NowPlayingView() {
             icon: MenuGlyphs.addToPlaylist,
             onClick: openAddToPlaylist,
           },
-          {
-            label: 'Go to artist',
-            icon: MenuGlyphs.artist,
-            onClick: () => goArtist(track.artists[0]),
-            disabled: !track.artists[0],
-          },
+          // One entry per credited artist (capped at 4); a single credit
+          // keeps the classic label.
+          ...(track.artists.length > 1
+            ? track.artists.slice(0, 4).map((a) => ({
+                label: `Go to ${a}`,
+                icon: MenuGlyphs.artist,
+                onClick: () => goArtist(a),
+              }))
+            : [
+                {
+                  label: 'Go to artist',
+                  icon: MenuGlyphs.artist,
+                  onClick: () => goArtist(track.artists[0]),
+                  disabled: !track.artists[0],
+                },
+              ]),
           {
             label: 'Go to album',
             icon: MenuGlyphs.album,
@@ -309,31 +320,38 @@ export function NowPlayingView() {
               {/* Title + artist on the left; heart + ⋯ on the right (Apple Music). */}
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
-                  {track.album ? (
-                    <button
-                      type="button"
-                      onClick={goAlbum}
-                      className="block max-w-full text-2xl font-bold tracking-tight truncate text-left hover:underline"
-                      title={track.title}
-                    >
-                      {track.title}
-                    </button>
-                  ) : (
-                    <div className="text-2xl font-bold tracking-tight truncate">{track.title}</div>
-                  )}
-                  <div className="mt-1 text-base text-neutral-300 truncate">
-                    {track.artists.length > 0
-                      ? track.artists.map((a, i) => (
-                          <span key={`${a}-${i}`}>
-                            {i > 0 ? ', ' : ''}
-                            <button type="button" onClick={() => goArtist(a)} className="hover:underline hover:text-neutral-100">
-                              {a}
-                            </button>
-                          </span>
-                        ))
-                      : '—'}
-                    {track.album ? <span className="text-neutral-500"> — {track.album}</span> : null}
-                  </div>
+                  {/* Same one-shot ticker as the player bar: a long line glides once
+                      per track, pauses under the cursor, and resumes — or replays from
+                      rest — as the pointer leaves; links stay clickable while it rests. */}
+                  <AutoMarquee announceKey={track.id} className="max-w-full text-2xl font-bold tracking-tight">
+                    {track.album ? (
+                      <button
+                        type="button"
+                        onClick={goAlbum}
+                        className="text-left hover:underline"
+                        title={`Go to album: ${track.album}`}
+                      >
+                        {track.title}
+                      </button>
+                    ) : (
+                      <span>{track.title}</span>
+                    )}
+                  </AutoMarquee>
+                  <AutoMarquee announceKey={track.id} className="mt-1 max-w-full text-base text-neutral-300">
+                    <span title={track.artists.join(', ')}>
+                      {track.artists.length > 0
+                        ? track.artists.map((a, i) => (
+                            <span key={`${a}-${i}`}>
+                              {i > 0 ? ', ' : ''}
+                              <button type="button" onClick={() => goArtist(a)} className="hover:underline hover:text-neutral-100">
+                                {a}
+                              </button>
+                            </span>
+                          ))
+                        : '—'}
+                      {track.album ? <span className="text-neutral-500"> — {track.album}</span> : null}
+                    </span>
+                  </AutoMarquee>
                 </div>
                 <div className="flex items-center gap-1 shrink-0 mt-0.5">
                   <LikeButton

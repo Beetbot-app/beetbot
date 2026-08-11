@@ -37,7 +37,9 @@ export function StatsPage({ onBack }: { onBack: () => void }) {
   }
 
   return (
-    <div className="h-full overflow-y-auto">
+    // No wrapping scroller: StatsScreen owns one, below its header, so the
+    // scrollbar spans the numbers rather than the whole card.
+    <>
       {/* Desktop hides the in-header back chevron — the global top-bar
           Back/Forward already covers it. */}
       <StatsScreen
@@ -45,7 +47,8 @@ export function StatsPage({ onBack }: { onBack: () => void }) {
         profileId={activeProfileId}
         onBack={onBack}
         showBack={false}
+        ownScroller
       />
-    </div>
+    </>
   );
 }
