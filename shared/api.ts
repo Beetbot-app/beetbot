@@ -221,7 +221,23 @@ export function setTokenReissuer(
  * the caller, not routed through here — several of those messages contain the
  * word "failed" and would be mis-mapped to the connection line.
  */
+/**
+ * An error whose message is already written for a person — the hub's own
+ * `failure_reason`, passed through rather than invented. {@link friendlyError}
+ * hands these back untouched: its heuristics exist to keep raw network and
+ * HTTP text off the screen, and applied to copy the hub wrote deliberately
+ * they only throw it away (the age-restricted sentence is 138 characters and
+ * lost to the 140-char cut-off, which is how it went missing the first time).
+ */
+export class HubRefusal extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'HubRefusal';
+  }
+}
+
 export function friendlyError(e: unknown): string {
+  if (e instanceof HubRefusal) return e.message;
   const msg = e instanceof Error ? e.message : String(e ?? '');
   const name = e instanceof Error ? e.name : '';
   // Genuinely can't reach the host: a fetch network failure, our abort timeout,
@@ -348,6 +364,42 @@ export async function submitPairing(
  * and request a fresh one from the server. Returns the live token or throws
  * if pairing is required (caller handles that case).
  */
+/** An {@link Error} that also knows where the visitor should go to sign in. */
+export type SignInRequiredError = Error & { signIn?: string };
+
+/**
+ * The sign-in destination a refusal carries, when it carries one.
+ *
+ * Only an absolute `https:` URL is accepted. This value decides where a person's
+ * browser is sent, so it is treated as data to be checked rather than an
+ * instruction to be followed — even though it arrives from the hub over TLS.
+ * Anything else (an older hub, a proxy that replaced the body, a plain-text error
+ * page) yields null and the caller falls back to the generic failure, which is
+ * the honest answer when there is nothing to act on.
+ */
+async function readSignInUrl(res: Response): Promise<string | null> {
+  try {
+    const body: unknown = await res.json();
+    const url = (body as { signIn?: unknown } | null)?.signIn;
+    return typeof url === 'string' && url.startsWith('https://') ? url : null;
+  } catch {
+    return null; // not JSON, or the body was already consumed
+  }
+}
+
+/**
+ * Where to send a visitor to sign in, if this is the error that says so.
+ *
+ * Exported so a screen can ask the question without importing the error's shape
+ * or string-matching on `name` — the UI decides how to present it, this decides
+ * what it means.
+ */
+export function signInUrlOf(e: unknown): string | null {
+  if (!(e instanceof Error) || e.name !== 'SignInRequiredError') return null;
+  const url = (e as SignInRequiredError).signIn;
+  return typeof url === 'string' ? url : null;
+}
+
 export async function ensureSession(): Promise<string> {
   const existing = getStoredToken();
   if (existing) {
@@ -405,6 +457,23 @@ export async function ensureSession(): Promise<string> {
     const err = new Error('pairing-required');
     err.name = 'PairingRequiredError';
     throw err;
+  }
+  if (res.status === 401) {
+    // Signed out of whatever sits in front of the hub. The 401 carries the URL
+    // to send the visitor to, so this is not a failure — it is a state with an
+    // action attached, and the action is the only part that helps.
+    //
+    // Flattening it into "/api/session failed: 401" produced a Retry button that
+    // repeated the same unauthenticated request forever (24 Aug 2026). Retry
+    // could not have worked: navigations are served cache-first by the service
+    // worker, so a reload never follows the hub's redirect to sign-in either.
+    const signIn = await readSignInUrl(res);
+    if (signIn) {
+      const err: SignInRequiredError = new Error('sign-in-required');
+      err.name = 'SignInRequiredError';
+      err.signIn = signIn;
+      throw err;
+    }
   }
   if (!res.ok) {
     throw new Error(`/api/session failed: ${res.status}`);
@@ -2747,6 +2816,68 @@ export async function ensurePersistentStorage(): Promise<boolean> {
  *     avoids accidental rejects.
  *   - Returns the number of bytes cached so the caller can roll up totals.
  */
+/**
+ * Ask the hub to fetch this track's audio (the phone can only COPY files the
+ * hub already has; this is how it asks for one it doesn't).
+ *
+ * Returns as soon as the hub accepts — acquiring takes up to a minute, far too
+ * long to hold a request open through a tunnel. Poll {@link trackAcquireState} to
+ * learn when it lands, or when the hub gives up. `false` means this build can't fetch audio itself.
+ */
+export async function acquireTrack(trackId: number, token: string): Promise<boolean> {
+  const r = await fetch(apiUrl(`/api/tracks/${trackId}/acquire?t=${token}`), {
+    method: 'POST',
+  });
+  if (r.status === 501) return false;
+  if (!r.ok) throw new Error(`acquire failed (${r.status})`);
+  return true;
+}
+
+/** Whether the hub now holds audio for this track — the acquire poll. */
+export async function trackHasAudio(trackId: number, token: string): Promise<boolean> {
+  return (await trackAcquireState(trackId, token)).state === 'ready';
+}
+
+/**
+ * How an acquire is going. `has_audio` alone can't tell "still fetching" from
+ * "gave up" — both read false — so a track the hub will never get (age-gated,
+ * taken down, no match) would spin its row for the full poll timeout. The hub
+ * writes `failed` the moment it stops trying; watching for it ends the wait
+ * honestly instead of running out the clock.
+ */
+/** Outcome of an acquire poll; `reason` is the hub's own words when it gave up. */
+export type AcquireState =
+  | { state: 'ready' }
+  | { state: 'pending' }
+  | { state: 'failed'; reason: string | null };
+
+const TERMINAL_ACQUIRE_STATUS = new Set(['failed', 'needs-review', 'skipped']);
+
+export async function trackAcquireState(
+  trackId: number,
+  token: string,
+): Promise<AcquireState> {
+  const r = await fetch(apiUrl(`/api/tracks/${trackId}?t=${token}`));
+  if (!r.ok) return { state: 'pending' };
+  const t = (await r.json()) as {
+    has_audio?: boolean | null;
+    status?: string | null;
+    failure_reason?: string | null;
+  };
+  if (t.has_audio) return { state: 'ready' };
+  // Three ways the hub stops trying, not one. `failed` is a download that
+  // won't work (age-gated, taken down); `needs-review` is the matcher finding
+  // no candidate it trusts; `skipped` is a deliberate pass. Watching only for
+  // `failed` — as the first cut did — leaves the commonest of the three,
+  // `needs-review`, polling until the timeout for an answer already on record.
+  if (!TERMINAL_ACQUIRE_STATUS.has(t.status ?? '')) return { state: 'pending' };
+  // The hub writes a sentence meant for a person -- age-gated, nothing
+  // matched, needs a key. Carry it through; the caller has nothing better to
+  // say than a generic "it didn't work", and the three cases differ in whether
+  // there is anything to do about them.
+  return { state: 'failed', reason: t.failure_reason || null };
+}
+
 export async function cacheTrack(
   trackId: number,
   token: string,

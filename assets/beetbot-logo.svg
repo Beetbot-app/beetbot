@@ -1,4 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 128" width="120" height="128">
+<!-- viewBox y offset by 10.75 so the artwork is centred in its own frame.
+     Kept in step with the brand kit master and src/assets/logo.svg. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 10.75 120 128" width="120" height="128">
   <title>Beetbot</title>
   <defs>
     <linearGradient id="beet" x1="0" y1="0" x2="1" y2="1">

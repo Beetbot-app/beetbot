@@ -513,14 +513,14 @@ export function NowPlayingView() {
             label="Lyrics"
             onClick={() => togglePane('lyrics')}
           >
-            <LyricsIcon size={20} />
+            <LyricsIcon size={24} />
           </CornerToggle>
           <CornerToggle
             on={paneOpen && tab === 'queue'}
             label="Up next"
             onClick={() => togglePane('queue')}
           >
-            <QueueIcon size={20} />
+            <QueueIcon size={24} />
           </CornerToggle>
         </div>
       )}

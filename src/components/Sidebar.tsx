@@ -388,12 +388,17 @@ export function Sidebar({
               wordmark (cream "beet", crimson "bot") in the display serif.
               Collapsed drops back to the mark alone (above). */}
           <div className="flex items-center px-1">
-            {/* Nudge the mark up slightly: its visual mass (the round root) sits
-                below the artwork's geometric center, so plain items-center leaves
-                the body reading low against the wordmark. The beet art has its own
-                ~5px of whitespace inside its square box, so pull the wordmark left
-                (-ml) to about halve the dead space between them. */}
-            <Logo size={30} className="-translate-y-[3px]" />
+            {/* -2px is an OPTICAL choice, not a geometry fix. The artwork is
+                centred in its own viewBox now, so items-center already centres
+                it exactly — and exact reads a touch low beside the wordmark.
+                Measuring the mark alone does not predict this: its mass centre
+                and its ink centre agree within a unit, yet against lowercase
+                text the beet still wants lifting. Judged by eye, against the
+                shipped app, and kept because the shipped app looked better.
+                The horizontal -ml stays: the beet art carries its own
+                whitespace either side, so the wordmark is pulled left to halve
+                the dead space between them. */}
+            <Logo size={30} className="-translate-y-[2px]" />
             <Wordmark className="-ml-[2px]" />
           </div>
         </div>

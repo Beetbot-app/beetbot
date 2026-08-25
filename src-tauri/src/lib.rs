@@ -551,7 +551,61 @@ pub(crate) fn playlist_source(spotify_id: &str) -> &'static str {
 /// Caller's responsibility to warn the user that re-importing the source
 /// archive re-creates an imported playlist (we don't enforce that here so
 /// the API stays a thin DB wrapper).
+/// How to order a playlist's tracks for display.
+///
+/// Ordinary playlists keep hand position. Favorites is ordered **newest
+/// first**, because it isn't a hand-ordered playlist at all — nothing in
+/// either UI can reorder it — it's a running log of what you liked, and the
+/// thing you just starred is the thing you want to see.
+///
+/// It also fixes a list that disagreed with itself. The Spotify import wrote
+/// its rows newest-first, so position 2 was the most recent song; every like
+/// since was appended at `MAX(position) + 1` and landed at the bottom. The
+/// newest songs sat at BOTH ends of the same list. `added_at` is real data
+/// here — 381 distinct timestamps across 394 imported rows, reaching back to
+/// 2014 — so ordering by it puts the whole history in one honest sequence
+/// rather than only fixing likes made from here on.
+///
+/// Undated rows sort last: SQLite puts NULLs at the end of a DESC ordering,
+/// which is where a row with no known date belongs.
+pub(crate) fn playlist_track_order(conn: &rusqlite::Connection, id: i64) -> &'static str {
+    if is_anchor_playlist(conn, id) {
+        "ORDER BY pt.added_at DESC, pt.position DESC"
+    } else {
+        "ORDER BY pt.position"
+    }
+}
+
+/// True when `id` is a profile's Favorites playlist — the anchor the star
+/// button writes into, identified by its stable id (never its display name,
+/// which users can change and older installs spell "Liked Songs").
+pub(crate) fn is_anchor_playlist(conn: &rusqlite::Connection, id: i64) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM playlists
+         WHERE id = ?1
+           AND (spotify_id = 'csv:liked-songs' OR spotify_id LIKE 'liked:%')",
+        rusqlite::params![id],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
+/// Delete a playlist. Refuses the Favorites anchor.
+///
+/// Favorites is not an ordinary playlist: it is the single destination of the
+/// star button, the way Spotify's Liked Songs and Apple's Favorites are, and
+/// neither app lets you delete it. Ours did — from the phone hero row, one tap
+/// plus a confirm — and deleting it would drop every favourite (394 of them on
+/// this machine) while `liked_playlist_id` silently minted a fresh empty one
+/// on the next star, so the loss would look like the favourites simply
+/// vanishing. Guarded HERE rather than in the UI because both entry points
+/// (the phone's HTTP DELETE and the desktop's IPC command) come through this
+/// helper, and a hidden button is not a protection.
 pub(crate) fn delete_playlist_row(conn: &rusqlite::Connection, id: i64) -> rusqlite::Result<bool> {
+    if is_anchor_playlist(conn, id) {
+        tracing::warn!(playlist_id = id, "refused to delete the Favorites anchor");
+        return Ok(false);
+    }
     let removed = conn.execute(
         "DELETE FROM playlists WHERE id = ?1",
         rusqlite::params![id],
@@ -1284,16 +1338,16 @@ fn list_tracks(
     playlist_id: i64,
 ) -> Result<Vec<PlaylistTrack>, String> {
     let conn = state.0.lock().map_err(|e| e.to_string())?;
+    let order = playlist_track_order(&conn, playlist_id);
     let mut stmt = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT t.id, t.spotify_id, t.title, t.artists, t.album, t.album_art_url,
                     t.duration_ms, t.isrc, t.status, t.failure_reason, t.local_path,
                     pt.position, pt.added_at
              FROM tracks t
              JOIN playlist_tracks pt ON pt.track_id = t.id
-             WHERE pt.playlist_id = ?1
-             ORDER BY pt.position",
-        )
+             WHERE pt.playlist_id = ?1 {order}"
+        ))
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map(rusqlite::params![playlist_id], |r| {
@@ -1884,6 +1938,17 @@ fn read_streaming_settings(conn: &rusqlite::Connection) -> (bool, u16) {
         .and_then(|s| s.parse().ok())
         .unwrap_or(47823);
     (enabled, port)
+}
+
+/// Whether instant streaming is degraded to its slower route (the provider's
+/// fast-path alarm), as a unix-seconds stamp — None while healthy. Lets the
+/// Settings page say so with a date instead of users discovering it as
+/// unexplained slowness.
+#[tauri::command]
+async fn streaming_health(state: tauri::State<'_, DbState>) -> Result<Option<i64>, String> {
+    Ok(crate::acquisition::active_provider()
+        .live_health(&state.0)
+        .await)
 }
 
 #[tauri::command]
@@ -3882,6 +3947,7 @@ pub fn invoke_handler(
             portable::portable_restart,
             import_local_file,
             streaming_status,
+            streaming_health,
             streaming_set_enabled,
             list_streaming_sessions,
             revoke_streaming_session,

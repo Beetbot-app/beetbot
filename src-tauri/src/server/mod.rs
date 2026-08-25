@@ -215,6 +215,10 @@ fn build_router(state: AppState, web_dir: Option<PathBuf>) -> Router {
         .route("/api/tracks/{id}", get(get_track))
         .route("/api/tracks/{id}/art", get(get_track_art))
         .route("/api/tracks/{id}/like", axum::routing::post(like_track))
+        .route(
+            "/api/tracks/{id}/acquire",
+            axum::routing::post(acquire_track_handler),
+        )
         .route("/api/tracks/{id}/playlists", get(get_track_playlists))
         .route("/api/tracks/resolve", axum::routing::post(resolve_catalog_track))
         .route(
@@ -278,6 +282,7 @@ fn build_router(state: AppState, web_dir: Option<PathBuf>) -> Router {
         )
         .route("/stream/{id}", get(stream_track))
         .route("/stream/{id}/live", get(stream_track_live))
+        .route("/api/streaming/health", get(streaming_health))
         // The /cert routes are deliberately auth-free: phones download the
         // cert *before* they can establish HTTPS / a session. IP allowlist
         // still applies, so only LAN peers can fetch.
@@ -1716,6 +1721,15 @@ struct StreamTrack {
     /// Track lifecycle state -- the web player uses this to know whether the
     /// track has playable audio yet or still needs a file attached.
     status: String,
+    /// Why the hub stopped trying, when it did. The phone polls this endpoint
+    /// while a download runs; without the reason it can only say "it didn't
+    /// work", which reads the same for an age-gated video (fixable -- point it
+    /// at another upload) and an unmatchable one (nothing to do). Only the
+    /// single-track read fills this in; the playlist lists leave it None
+    /// rather than widen a query that returns hundreds of rows for a field
+    /// that is NULL on nearly all of them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_reason: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1777,12 +1791,13 @@ async fn get_playlist(
         }
     };
 
-    let mut stmt = match conn.prepare(
+    let order = crate::playlist_track_order(&conn, pid);
+    let mut stmt = match conn.prepare(&format!(
         "SELECT t.id, t.title, t.artists, t.album, t.album_art_url, t.duration_ms,
                 pt.position, t.local_path, t.status
          FROM tracks t JOIN playlist_tracks pt ON pt.track_id = t.id
-         WHERE pt.playlist_id = ?1 ORDER BY pt.position",
-    ) {
+         WHERE pt.playlist_id = ?1 {order}"
+    )) {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(?e, "get_playlist tracks prepare");
@@ -1805,6 +1820,7 @@ async fn get_playlist(
                 position: r.get(6)?,
                 has_audio: local_path.is_some(),
                 status: r.get(8)?,
+                failure_reason: None,
             })
         })
         .ok()
@@ -1875,6 +1891,7 @@ async fn get_library_songs(
                 position: 0,
                 has_audio: local_path.is_some(),
                 status: r.get(7)?,
+                failure_reason: None,
             })
         })
         .ok()
@@ -1905,6 +1922,20 @@ async fn delete_playlist_handler(
     }
     if let Err(r) = enforce_playlist_owner(&state, &headers, &addr, &q, id) {
         return r;
+    }
+    // Separate "protected" from "gone" BEFORE deleting: both come back as
+    // `removed == false`, and answering 404 for a playlist the caller can
+    // plainly see is the kind of misleading signal that costs someone an
+    // afternoon. Favorites is the star button's anchor and cannot be deleted.
+    {
+        let conn = state.db.lock().expect("db mutex poisoned");
+        if crate::is_anchor_playlist(&conn, id) {
+            return (
+                StatusCode::CONFLICT,
+                "Favorites can't be deleted — it's where the star button saves songs.",
+            )
+                .into_response();
+        }
     }
     let removed = {
         let conn = state.db.lock().expect("db mutex poisoned");
@@ -2098,7 +2129,7 @@ async fn cast_start(
     let is_live = local_path.is_none();
     if is_live {
         match crate::acquisition::active_provider()
-            .live_path(&state.app, &state.db, body.track_id)
+            .live_path(&state.app, &state.db, body.track_id, false)
             .await
         {
             Ok(Some(_)) => {} // warmed — the /live URL will serve instantly
@@ -2401,7 +2432,8 @@ async fn get_track(
     }
     let conn = state.db.lock().expect("db mutex poisoned");
     let row = conn.query_row(
-        "SELECT id, title, artists, album, album_art_url, duration_ms, local_path, status
+        "SELECT id, title, artists, album, album_art_url, duration_ms, local_path, status,
+                failure_reason
          FROM tracks WHERE id = ?1",
         params![id],
         |r| {
@@ -2419,6 +2451,7 @@ async fn get_track(
                 position: 0,
                 has_audio: local_path.is_some(),
                 status: r.get(7)?,
+                failure_reason: r.get(8)?,
             })
         },
     );
@@ -6515,6 +6548,32 @@ struct ResolveTracksResult {
 /// library track rows in one round-trip, so "play from this list" can seed the
 /// full queue (and auto-advance down it) instead of resolving one tap at a time.
 /// One DB lock for the batch; reuses `upsert_track` (ISRC-deduped, no playlist
+/// Re-derive a playlist's cached `track_count` from the rows it actually holds.
+///
+/// The counter used to be nudged by `+1` / `-1` beside each insert and delete,
+/// which is only correct while every one of those writes succeeds — and they
+/// were all issued as `let _ = conn.execute(...)`, so a failure was invisible
+/// and the nudge went ahead regardless. `playlist_tracks` is keyed on
+/// `(playlist_id, position)`, so an insert CAN fail: two writers computing
+/// `MAX(position) + 1` from the same starting point collide, one row is
+/// rejected, and the count walks one ahead of reality for good. Measured on a
+/// real library 18 Aug: 3 playlists of 78 reading exactly one too high.
+///
+/// Counting is O(rows) rather than O(1), but these are playlists — hundreds of
+/// rows, behind a lock already held — and a number that cannot drift is worth
+/// more than the microseconds. It also repairs itself: any row already wrong
+/// becomes right the next time its playlist is written to.
+fn resync_track_count(conn: &rusqlite::Connection, playlist_id: i64) {
+    if let Err(e) = conn.execute(
+        "UPDATE playlists SET track_count =
+            (SELECT COUNT(*) FROM playlist_tracks WHERE playlist_id = ?1)
+         WHERE id = ?1",
+        params![playlist_id],
+    ) {
+        tracing::warn!(?e, playlist_id, "resync_track_count");
+    }
+}
+
 /// link) exactly like the single-track resolve.
 async fn resolve_catalog_tracks(
     State(state): State<AppState>,
@@ -6608,10 +6667,7 @@ fn upsert_track_and_link(
          VALUES (?1, ?2, ?3, strftime('%s','now'))",
         params![playlist_id, track_id, next_pos],
     )?;
-    conn.execute(
-        "UPDATE playlists SET track_count = track_count + 1 WHERE id = ?1",
-        params![playlist_id],
-    )?;
+    resync_track_count(conn, playlist_id);
     Ok((track_id, true))
 }
 
@@ -6657,6 +6713,72 @@ fn liked_playlist_id(conn: &Connection, profile_id: Option<i64>) -> rusqlite::Re
 struct LikeBody {
     liked: bool,
     profile_id: Option<i64>,
+}
+
+/// POST /api/tracks/:id/acquire — ask the hub to make this track playable.
+///
+/// The phone could already copy a file the hub HAS; it had no way to ask for
+/// one it hasn't. That left the "on neither" tracks with no action anywhere in
+/// the phone UI — the row showed a blank badge and the menu offered nothing,
+/// so the only way to get them was to walk to the Mac.
+///
+/// Fire-and-forget by design: acquiring can take a minute (match, fetch,
+/// convert), which is far too long to hold a phone's HTTP request open through
+/// a tunnel. Returns 202 immediately; the caller watches `has_audio` on
+/// `/api/tracks/:id` to know when it lands.
+///
+/// The open build's provider returns `Unavailable` for `Auto`, so this answers
+/// 501 there rather than pretending — the core names no acquisition source.
+async fn acquire_track_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Path(id): Path<i64>,
+) -> Response {
+    if let Err(r) = require_token(&state, &headers, &q) {
+        return r;
+    }
+    // Must exist, and must not already have audio — re-acquiring a track we
+    // already hold would be a silent no-op the caller can't distinguish.
+    let already: Option<bool> = {
+        let conn = state.db.lock().expect("db mutex poisoned");
+        conn.query_row(
+            "SELECT (local_path IS NOT NULL AND local_path != '') FROM tracks WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .ok()
+    };
+    match already {
+        None => return (StatusCode::NOT_FOUND, "no such track").into_response(),
+        Some(true) => {
+            return Json(serde_json::json!({ "status": "already" })).into_response();
+        }
+        Some(false) => {}
+    }
+    if !crate::acquisition::active_provider().auto_acquires() {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "this build can't fetch audio on its own",
+        )
+            .into_response();
+    }
+    let app = state.app.clone();
+    let db = state.db.clone();
+    tauri::async_runtime::spawn(async move {
+        match crate::acquisition::active_provider()
+            .acquire(&app, &db, id, crate::acquisition::AcquireSource::Auto)
+            .await
+        {
+            Ok(_) => tracing::info!(track_id = id, "acquire: requested from a phone — done"),
+            Err(e) => tracing::warn!(track_id = id, error = %e, "acquire: requested from a phone — failed"),
+        }
+    });
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "status": "started" })),
+    )
+        .into_response()
 }
 
 /// POST /api/tracks/:id/like — add/remove a (library) track to the profile's
@@ -6712,19 +6834,13 @@ async fn like_track(
              VALUES (?1, ?2, ?3, strftime('%s','now'))",
             params![pid, id, next_pos],
         );
-        let _ = conn.execute(
-            "UPDATE playlists SET track_count = track_count + 1 WHERE id = ?1",
-            params![pid],
-        );
+        resync_track_count(&conn, pid);
     } else if !body.liked && already {
         let _ = conn.execute(
             "DELETE FROM playlist_tracks WHERE playlist_id = ?1 AND track_id = ?2",
             params![pid, id],
         );
-        let _ = conn.execute(
-            "UPDATE playlists SET track_count = MAX(0, track_count - 1) WHERE id = ?1",
-            params![pid],
-        );
+        resync_track_count(&conn, pid);
     }
     Json(serde_json::json!({ "liked": body.liked })).into_response()
 }
@@ -12254,10 +12370,7 @@ async fn patch_track_playlists(
                 tracing::error!(?e, "patch_track: link insert");
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
-            let _ = tx.execute(
-                "UPDATE playlists SET track_count = track_count + 1 WHERE id = ?1",
-                params![pid],
-            );
+            resync_track_count(&tx, *pid);
         }
         for pid in &body.remove {
             let removed = match tx.execute(
@@ -12272,11 +12385,7 @@ async fn patch_track_playlists(
                 }
             };
             if removed > 0 {
-                let _ = tx.execute(
-                    "UPDATE playlists SET track_count = MAX(track_count - 1, 0)
-                     WHERE id = ?1",
-                    params![pid],
-                );
+                resync_track_count(&tx, *pid);
             }
         }
         // Snapshot the new state inside the same tx so the response
@@ -12407,21 +12516,59 @@ async fn stream_track(
 /// seekable local file (the full build resolves + remuxes the source to a temp
 /// file; the open build returns `None`), then range-serve it exactly like
 /// `stream_track`. `None`/error -> 404, and the player falls back to a preview.
+/// GET /api/streaming/health — whether instant streaming is degraded.
+///
+/// `degraded_since` is unix seconds when the provider's fast route tripped its
+/// alarm, or null while healthy. Lets the Settings page say "using the slower
+/// route since <date>" instead of users discovering it as unexplained
+/// slowness. The built-in provider always reports healthy.
+async fn streaming_health(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<TokenQuery>,
+) -> Response {
+    if let Err(r) = require_token(&state, &headers, &q) {
+        return r;
+    }
+    let since = crate::acquisition::active_provider()
+        .live_health(&state.db)
+        .await;
+    Json(serde_json::json!({ "degraded_since": since })).into_response()
+}
+
+/// Query for `/stream/{id}/live`: the session token plus an optional `warm`
+/// marker. Players send `warm=1` on the prefetch that readies the NEXT queue
+/// entries — nobody is listening for that response, so the provider may let a
+/// real tap overtake it. Absent on actual playback loads, including the
+/// element's own fallback when a prefetched copy is missing.
+#[derive(Deserialize, Default)]
+struct LiveStreamQuery {
+    t: Option<String>,
+    warm: Option<String>,
+}
+
 async fn stream_track_live(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Query(q): Query<TokenQuery>,
+    Query(q): Query<LiveStreamQuery>,
     Path(id): Path<i64>,
     req: Request,
 ) -> Response {
     if !is_private_addr(&effective_client_ip(&addr, &headers)) {
-        if let Err(r) = require_token(&state, &headers, &q) {
+        let tq = TokenQuery { t: q.t.clone() };
+        if let Err(r) = require_token(&state, &headers, &tq) {
             return r;
         }
     }
+    // Any value but an explicit off counts as warm — the marker either
+    // travelled or it didn't.
+    let warm = q
+        .warm
+        .as_deref()
+        .is_some_and(|w| w != "0" && !w.eq_ignore_ascii_case("false"));
     let path = match crate::acquisition::active_provider()
-        .live_path(&state.app, &state.db, id)
+        .live_path(&state.app, &state.db, id, warm)
         .await
     {
         Ok(Some(p)) => p,
@@ -13427,6 +13574,225 @@ mod tests {
     fn open_test_db() -> Connection {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         crate::db::open(tmp.path()).unwrap()
+    }
+
+    /// Favorites is the star button's single destination — Spotify's Liked
+    /// Songs, Apple's Favorites — and neither app lets you delete it. Ours did:
+    /// a Delete control sat in the phone's playlist hero for every playlist
+    /// alike, and the handler behind it checked the token and the owner but
+    /// never what it was deleting. One tap and a confirm would have dropped
+    /// every favourite, and the next star would mint a fresh empty anchor, so
+    /// the damage would read as "my favourites disappeared" with no error.
+    ///
+    /// The guard lives in `delete_playlist_row` because BOTH entry points (the
+    /// phone's HTTP DELETE and the desktop's IPC command) funnel through it —
+    /// hiding the button only fixes the client that was asked nicely.
+    /// The phone polls `GET /api/tracks/{id}` while a download runs, and it is
+    /// the only place it can learn WHY the hub stopped trying. The hub writes a
+    /// sentence meant for a person -- age-gated, nothing matched, needs a key --
+    /// but the query behind this endpoint selected `status` and not
+    /// `failure_reason`, so the phone knew only that something failed and fell
+    /// back to "isn't on your Mac" for all three. That reads the same for a case
+    /// you can fix (point it at another upload) and one you can't (unmatchable).
+    ///
+    /// Asserted on the serialized JSON, not the struct: the field is
+    /// `skip_serializing_if = "Option::is_none"`, so a wrong attribute would
+    /// leave the struct correct and the wire silent.
+    /// Favorites is a log of what you liked, not a hand-ordered playlist —
+    /// nothing in either UI can reorder it — so the song you just starred
+    /// belongs at the top. It was landing at the bottom, and the list
+    /// disagreed with itself: the Spotify import wrote its rows newest-first
+    /// (position 2 = most recent), while every like since was appended at
+    /// `MAX(position) + 1`. The newest songs sat at BOTH ends.
+    ///
+    /// Ordering by `added_at` rather than renumbering positions on every like
+    /// also repairs the imported history in place, instead of only fixing
+    /// likes made from here on.
+    /// `track_count` was nudged `+1` / `-1` beside each insert and delete, and
+    /// every one of those writes was issued as `let _ = ...`. An insert CAN
+    /// fail — `playlist_tracks` is keyed on `(playlist_id, position)`, so two
+    /// writers computing `MAX(position) + 1` from the same point collide — and
+    /// the nudge went ahead regardless, walking the count permanently out of
+    /// step. Found on a real library: 3 playlists of 78, each exactly one high.
+    ///
+    /// Deriving the count means a drifted row REPAIRS itself on the next write,
+    /// which is what this asserts — not merely that fresh counts are right.
+    #[test]
+    fn a_drifted_track_count_repairs_itself_on_the_next_write() {
+        let conn = open_test_db();
+        conn.execute(
+            "INSERT INTO playlists (id, spotify_id, name, track_count)
+             VALUES (1, 'local:abc', 'Road Trip', 999)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tracks (id, spotify_id, title, artists, duration_ms, status)
+             VALUES (1, 's1', 'Song', '[\"A\"]', 1000, 'downloaded')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO playlist_tracks (playlist_id, track_id, position, added_at)
+             VALUES (1, 1, 0, 1700000000)",
+            [],
+        )
+        .unwrap();
+
+        let count = || -> i64 {
+            conn.query_row("SELECT track_count FROM playlists WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(count(), 999, "starts wildly wrong, as a drifted row would");
+        resync_track_count(&conn, 1);
+        assert_eq!(count(), 1, "one write is enough to put it right");
+
+        // And it tracks a delete without a decrement anywhere.
+        conn.execute("DELETE FROM playlist_tracks WHERE playlist_id = 1", [])
+            .unwrap();
+        resync_track_count(&conn, 1);
+        assert_eq!(count(), 0);
+    }
+
+    #[test]
+    fn favorites_reads_newest_first_and_other_playlists_keep_their_order() {
+        let conn = open_test_db();
+        conn.execute(
+            "INSERT INTO playlists (id, spotify_id, name, track_count) VALUES
+             (1, 'liked:1', 'Favorites', 0),
+             (2, 'local:abc', 'Road Trip', 0)",
+            [],
+        )
+        .unwrap();
+        for id in 1..=3 {
+            conn.execute(
+                "INSERT INTO tracks (id, spotify_id, title, artists, duration_ms, status)
+                 VALUES (?1, 's' || ?1, 'Song ' || ?1, '[\"A\"]', 1000, 'downloaded')",
+                rusqlite::params![id],
+            )
+            .unwrap();
+        }
+        // The shape the bug produced: the import's newest row sits at a LOW
+        // position, and the like made afterwards is appended at a high one.
+        conn.execute(
+            "INSERT INTO playlist_tracks (playlist_id, track_id, position, added_at) VALUES
+             (1, 1, 2, 1700000000),
+             (1, 2, 3, 1600000000),
+             (1, 3, 99, 1800000000),
+             (2, 1, 2, 1700000000),
+             (2, 2, 3, 1600000000),
+             (2, 3, 99, 1800000000)",
+            [],
+        )
+        .unwrap();
+
+        let titles = |pid: i64| -> Vec<String> {
+            let order = crate::playlist_track_order(&conn, pid);
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT t.title FROM tracks t
+                     JOIN playlist_tracks pt ON pt.track_id = t.id
+                     WHERE pt.playlist_id = ?1 {order}"
+                ))
+                .unwrap();
+            let rows = stmt
+                .query_map(rusqlite::params![pid], |r| r.get::<_, String>(0))
+                .unwrap()
+                .filter_map(Result::ok)
+                .collect();
+            rows
+        };
+
+        assert_eq!(
+            titles(1),
+            vec!["Song 3", "Song 1", "Song 2"],
+            "Favorites reads newest first — the freshly liked Song 3 leads despite its high position"
+        );
+        assert_eq!(
+            titles(2),
+            vec!["Song 1", "Song 2", "Song 3"],
+            "an ordinary playlist still reads in hand position order"
+        );
+    }
+
+    #[test]
+    fn a_failed_track_reports_why_on_the_wire() {
+        let conn = open_test_db();
+        conn.execute(
+            "INSERT INTO tracks (id, spotify_id, title, artists, duration_ms, status, failure_reason)
+             VALUES (1, 's1', 'Age Gated', '[\"A\"]', 1000, 'failed', 'YouTube age-restricts this one.'),
+                    (2, 's2', 'Fine', '[\"A\"]', 1000, 'downloaded', NULL)",
+            [],
+        )
+        .unwrap();
+
+        let read = |id: i64| -> serde_json::Value {
+            let t = conn
+                .query_row(
+                    "SELECT id, title, artists, album, album_art_url, duration_ms, local_path,
+                            status, failure_reason
+                     FROM tracks WHERE id = ?1",
+                    rusqlite::params![id],
+                    |r| {
+                        let artists_json: String = r.get(2)?;
+                        let local_path: Option<String> = r.get(6)?;
+                        Ok(StreamTrack {
+                            id: r.get(0)?,
+                            title: r.get(1)?,
+                            artists: serde_json::from_str(&artists_json).unwrap_or_default(),
+                            album: r.get(3)?,
+                            album_art_url: r.get(4)?,
+                            duration_ms: r.get(5)?,
+                            position: 0,
+                            has_audio: local_path.is_some(),
+                            status: r.get(7)?,
+                            failure_reason: r.get(8)?,
+                        })
+                    },
+                )
+                .unwrap();
+            serde_json::to_value(t).unwrap()
+        };
+
+        assert_eq!(
+            read(1)["failure_reason"],
+            serde_json::json!("YouTube age-restricts this one."),
+            "a failed track carries the hub's own words to the phone"
+        );
+        assert!(
+            read(2).get("failure_reason").is_none(),
+            "a healthy track adds no key -- the field is skipped when None"
+        );
+    }
+
+    #[test]
+    fn the_favorites_anchor_cannot_be_deleted() {
+        let conn = open_test_db();
+        // Both spellings of the anchor: the CSV-import id and the per-profile
+        // one. Identified by stable id, never by display name.
+        conn.execute(
+            "INSERT INTO playlists (id, spotify_id, name, track_count) VALUES
+             (1, 'liked:1', 'Favorites', 0),
+             (2, 'csv:liked-songs', 'Liked Songs', 0),
+             (3, 'local:abc', 'Road Trip', 0)",
+            [],
+        )
+        .unwrap();
+
+        assert!(crate::is_anchor_playlist(&conn, 1));
+        assert!(crate::is_anchor_playlist(&conn, 2));
+        assert!(!crate::is_anchor_playlist(&conn, 3), "an ordinary playlist is not the anchor");
+
+        assert!(!crate::delete_playlist_row(&conn, 1).unwrap(), "refused");
+        assert!(!crate::delete_playlist_row(&conn, 2).unwrap(), "refused");
+        assert!(crate::delete_playlist_row(&conn, 3).unwrap(), "ordinary playlists still delete");
+
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM playlists", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 2, "both anchors survive; only the ordinary one is gone");
     }
 
     /// The desktop mint must collapse only its OWN stale prior sessions, never a

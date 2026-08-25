@@ -681,7 +681,12 @@ export function PlaylistPage({ playlistId, onBack, onChanged }: Props) {
           <div className="min-w-0">
             {/* Shared eyebrow recipe — album/artist/genre/phone all use it;
                 this page had a hand-rolled variant that drifted. */}
-            <p className={cn(EYEBROW_ON_ART, 'mb-1')}>Playlist</p>
+            {/* Favorites carries no kind label — it is the star button's
+                anchor, not a playlist among playlists (same rule as the
+                phone's PlaylistScreen). */}
+            {detail.source !== 'liked' && (
+              <p className={cn(EYEBROW_ON_ART, 'mb-1')}>Playlist</p>
+            )}
             <h1 className="mb-2">
               <button
                 type="button"
@@ -824,6 +829,12 @@ export function PlaylistPage({ playlistId, onBack, onChanged }: Props) {
               </button>
               {/* Rename/edit lives on the cover + title click now (Spotify-
                   style), so no always-shown pencil here. */}
+              {/* Favorites is the star button's one destination, not an
+                  ordinary playlist — Spotify and Apple both refuse to delete
+                  their equivalent. The server refuses it regardless
+                  (`delete_playlist_row` guards the anchor), so without this the
+                  button would sit here doing nothing. */}
+              {detail.source !== 'liked' && (
               <button
                 type="button"
                 onClick={() => setDeleteState('pending')}
@@ -852,6 +863,7 @@ export function PlaylistPage({ playlistId, onBack, onChanged }: Props) {
                   <path d="M14 11v6" />
                 </svg>
               </button>
+              )}
             </div>
           </div>
         </div>

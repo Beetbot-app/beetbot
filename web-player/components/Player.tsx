@@ -1607,6 +1607,11 @@ export function Player({
         const url = playbackUrl(track, token);
         if (!url) return;
         if (prefetchedRef.current.has(track.id)) return;
+        // Mark the request as a warm-up: nobody is listening for THIS response,
+        // so the hub lets a real tap's resolve overtake it instead of queueing
+        // the tap behind us. Only here — the element's own fallback load (when
+        // no prefetched copy exists) is a person waiting, and stays unmarked.
+        const warmUrl = `${url}&warm=1`;
         // Pull the whole track and KEEP it. Warming the HTTP cache is not
         // enough: a media element's own loader is suspended while the page is
         // backgrounded and its range requests miss the cache `fetch()` filled,
@@ -1619,7 +1624,7 @@ export function Player({
         // 2-byte range request purely to make the desktop de-fragment them, but
         // they are the slowest to start (2-4s observed) and so the likeliest to
         // run the fuse down.
-        fetch(url, { signal: ctrl.signal })
+        fetch(warmUrl, { signal: ctrl.signal })
           .then((r) => (r.ok ? r.blob() : null))
           .then((blob) => {
             if (!blob || ctrl.signal.aborted) return;

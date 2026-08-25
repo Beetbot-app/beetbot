@@ -284,6 +284,15 @@ export function SettingsPage() {
   const [streamingStatus, setStreamingStatus] = useState<StreamingStatus | null>(
     null,
   );
+  // Unix seconds since instant streaming degraded to its slower route; null
+  // while healthy. Best-effort — an open build has no fast path to degrade.
+  const [streamingDegradedSince, setStreamingDegradedSince] = useState<number | null>(null);
+  useEffect(() => {
+    ipc
+      .streamingHealth()
+      .then(setStreamingDegradedSince)
+      .catch(() => {});
+  }, []);
   const [streamingSessions, setStreamingSessions] = useState<StreamingSession[]>(
     [],
   );
@@ -1933,6 +1942,17 @@ export function SettingsPage() {
             name and URL come from the host build at runtime; this core never
             names one. Rendered FIRST as the primary option. */}
         <ExternalSharingCard />
+        {streamingDegradedSince != null && (
+          <p className="mt-3 text-xs text-amber-400/90">
+            Instant streaming is using its slower route since{' '}
+            {new Date(streamingDegradedSince * 1000).toLocaleDateString(undefined, {
+              month: 'short',
+              day: 'numeric',
+            })}
+            {' '}— songs that aren't downloaded take ~10s longer to start.
+            Downloaded songs aren't affected.
+          </p>
+        )}
         {/* Beetbot's own direct link (an ngrok tunnel with a 6-digit code) is the
             fallback for people not using the provider above. Tucked into a
             disclosure so it isn't mistaken for a step the provider needs. */}

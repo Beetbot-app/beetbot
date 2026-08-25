@@ -153,14 +153,30 @@ pub trait AcquisitionProvider: Send + Sync {
     /// full-build provider resolves the source and remuxes it to a temp file,
     /// returning a path the caller range-serves. Default = `Ok(None)` so the
     /// open build needs no implementation.
+    ///
+    /// `background` distinguishes a listener actively waiting on this stream
+    /// (a tap, a cast) from a warm-up the player fires for the NEXT queue
+    /// entries. Providers that queue or prioritize work may let foreground
+    /// requests overtake background ones; the built-in provider ignores it.
     #[allow(unused_variables)]
     async fn live_path(
         &self,
         app: &tauri::AppHandle,
         db: &Arc<Mutex<Connection>>,
         track_id: i64,
+        background: bool,
     ) -> Result<Option<String>, AcquisitionError> {
         Ok(None)
+    }
+
+    /// When did instant streaming degrade to its slower route, if it has?
+    /// `None` = healthy (or the provider doesn't track it — the built-in one
+    /// serves local files only, where there is nothing to degrade). Unix
+    /// seconds when set; surfaced by `/api/streaming/health` so the UI can
+    /// say so instead of leaving users to wonder why first plays got slow.
+    #[allow(unused_variables)]
+    async fn live_health(&self, db: &Arc<Mutex<Connection>>) -> Option<i64> {
+        None
     }
 }
 

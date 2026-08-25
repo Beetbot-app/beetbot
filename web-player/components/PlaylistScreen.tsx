@@ -1,11 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
+  acquireTrack,
   cacheTrack,
   canLiveStream,
   canPlayNow,
   deletePlaylist,
   evictTrack,
+  trackAcquireState,
+  HubRefusal,
   friendlyError,
   getCachedTrackIds,
   getOfflinePlaylistIds,
@@ -87,7 +90,15 @@ export function PlaylistScreen({ token, playlistId, profileId, onBack }: Props) 
   const { toast, showToast } = useToast();
   const enqueue = usePlayerStore((s) => s.enqueue);
   // Per-track "⋯" action sheet (Apple Music-style) + its add-to-playlist modal.
-  const [sheetTrack, setSheetTrack] = useState<StreamTrack | null>(null);
+  // The track whose "⋯" is open, plus that button's rect so the menu opens
+  // against it rather than at a fixed spot on the screen.
+  const [sheetTrack, setSheetTrack] = useState<
+    { track: StreamTrack; anchor: DOMRect } | null
+  >(null);
+  // Playlist-level "⋯" menu (Apple Music puts one top-right). Its existence is
+  // what lets the hero carry a single dominant action instead of four equal
+  // circles — secondary and destructive actions live in here.
+  const [headerMenu, setHeaderMenu] = useState<DOMRect | null>(null);
   const [addTrack, setAddTrack] = useState<StreamTrack | null>(null);
   const openArtistNav = useCatalogNav((s) => s.openArtist);
   const openAlbumNav = useCatalogNav((s) => s.openAlbum);
@@ -130,6 +141,9 @@ export function PlaylistScreen({ token, playlistId, profileId, onBack }: Props) 
   const onToggleDownload = useCallback(
     async (t: StreamTrack) => {
       const wasCached = cachedIds.has(t.id);
+      // Saving to the phone is a real transfer too — spin for it, or the row
+      // sits there looking untouched while several MB copy across.
+      if (!wasCached) setAcquiring((prev) => new Set(prev).add(t.id));
       try {
         if (wasCached) {
           await evictTrack(t.id);
@@ -146,9 +160,104 @@ export function PlaylistScreen({ token, playlistId, profileId, onBack }: Props) 
         }
       } catch (e) {
         showToast(friendlyError(e));
+      } finally {
+        setAcquiring((prev) => {
+          const next = new Set(prev);
+          next.delete(t.id);
+          return next;
+        });
       }
     },
     [cachedIds, token, showToast],
+  );
+  // Tracks with a download in flight — the hub fetch, the phone copy, or
+  // both. Drives the row's spinner and stops a second tap starting a
+  // duplicate. One set for every path, so the badge tells the same story
+  // whichever route the download took.
+  const [acquiring, setAcquiring] = useState<Set<number>>(new Set());
+  /**
+   * "Download" for a track the hub doesn't have: fetch it to the Mac, then
+   * follow it onto this phone.
+   *
+   * Both hops, because either alone leaves the user short. Fetching only to
+   * the Mac gives a song that still needs the Mac awake; caching only to the
+   * phone is impossible — the phone copies the hub's file, and there isn't
+   * one. The hub call returns immediately (acquiring takes up to a minute), so
+   * we poll `has_audio` and cache the moment it lands.
+   */
+  const onFetchToMacThenPhone = useCallback(
+    async (t: StreamTrack) => {
+      if (acquiring.has(t.id)) return;
+      setAcquiring((prev) => new Set(prev).add(t.id));
+      showToast('Downloading to your Mac…');
+      try {
+        const supported = await acquireTrack(t.id, token);
+        if (!supported) {
+          showToast("This build can't download on its own");
+          return;
+        }
+        // Poll: every 2s, capped at 3 minutes. The cap matters — a track that
+        // can't be matched never lands, and a poll with no end would leave the
+        // row spinning forever.
+        const deadline = Date.now() + 180_000;
+        let landed = false;
+        let gaveUp: string | null | undefined;
+        while (Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 2000));
+          const res = await trackAcquireState(t.id, token);
+          if (res.state === 'ready') {
+            landed = true;
+            break;
+          }
+          if (res.state === 'failed') {
+            gaveUp = res.reason;
+            break;
+          }
+        }
+        if (gaveUp !== undefined) {
+          // The hub's sentence says which of these it was and whether there's
+          // anything to do about it; ours could only say "it didn't work".
+          showToast(gaveUp ?? "Your Mac couldn't get this one");
+          return;
+        }
+        if (!landed) {
+          showToast("Still working — check your Mac");
+          return;
+        }
+        // The hub has it. Apply that to the row we're already showing rather
+        // than refetching: this screen loads its detail once (keyed on the
+        // playlist id), and a re-read of a cacheable GET can be served the
+        // state from BEFORE the write. Evict + announce for everyone else.
+        setDetail((prev) =>
+          prev
+            ? {
+                ...prev,
+                tracks: prev.tracks.map((x) =>
+                  x.id === t.id ? { ...x, has_audio: true } : x,
+                ),
+              }
+            : prev,
+        );
+        notifyLibraryChanged();
+        try {
+          await cacheTrack(t.id, token);
+          setCachedIds((prev) => new Set(prev).add(t.id));
+          showToast('Downloaded');
+        } catch {
+          // On the Mac but not cacheable here (no secure context) — still a win.
+          showToast('Saved to your Mac');
+        }
+      } catch (e) {
+        showToast(friendlyError(e));
+      } finally {
+        setAcquiring((prev) => {
+          const next = new Set(prev);
+          next.delete(t.id);
+          return next;
+        });
+      }
+    },
+    [acquiring, token, showToast],
   );
   const [offlineMode, setOfflineMode] = useState<boolean>(false);
   const [progress, setProgress] = useState<OfflineProgress>({ state: 'idle' });
@@ -225,16 +334,23 @@ export function PlaylistScreen({ token, playlistId, profileId, onBack }: Props) 
 
   const handleEnableOffline = useCallback(async () => {
     if (!detail) return;
-    const targets = detail.tracks.filter((t) => t.has_audio);
-    if (targets.length === 0) {
-      setProgress({
-        state: 'done',
-        cached: 0,
-        failed: 0,
-        bytes: 0,
-        lastError: 'No downloaded tracks to cache.',
-      });
-      return;
+    // Every track, not just the ones the hub already holds. This used to skip
+    // the missing ones silently — you'd tap Download on a 394-track playlist,
+    // get 388, and never be told the other 6 were left behind. "Download" now
+    // means the same thing here as it does in a row's ⋯ menu: fetch it to the
+    // Mac if needed, then onto this phone.
+    const targets = detail.tracks;
+    if (targets.length === 0) return;
+    const toFetch = targets.filter((t) => !t.has_audio).length;
+    // Fetching to the Mac costs ~10-20s EACH — a big playlist is a long job,
+    // and starting one silently from a single tap is the kind of surprise
+    // that gets an app force-quit. Above a handful, ask first.
+    if (toFetch > 5) {
+      const ok = window.confirm(
+        `${toFetch} of these aren't on your Mac yet. Downloading them could take about ` +
+          `${Math.max(1, Math.round((toFetch * 15) / 60))} minutes. Continue?`,
+      );
+      if (!ok) return;
     }
     // Persist the toggle now so a mid-flow refresh still shows the intent.
     const ids = getOfflinePlaylistIds();
@@ -255,13 +371,60 @@ export function PlaylistScreen({ token, playlistId, profileId, onBack }: Props) 
     let bytes = 0;
     let lastError: string | null = null;
     for (const t of targets) {
+      // Spin THIS row while it's being worked on, so the list shows where the
+      // batch is — the banner says "12 of 394", the row says "this one".
+      setAcquiring((prev) => new Set(prev).add(t.id));
       try {
+        if (!t.has_audio) {
+          // Hop one: ask the Mac to fetch it, then wait for it to land.
+          if (await acquireTrack(t.id, token)) {
+            const deadline = Date.now() + 180_000;
+            let landed = false;
+            let reason: string | null = null;
+            while (Date.now() < deadline) {
+              await new Promise((r) => setTimeout(r, 2000));
+              const res = await trackAcquireState(t.id, token);
+              if (res.state === 'ready') {
+                landed = true;
+                break;
+              }
+              // The hub gave up — don't sit on it for the rest of the timeout
+              // while thirteen other songs wait their turn behind this one.
+              if (res.state === 'failed') {
+                reason = res.reason;
+                break;
+              }
+            }
+            if (!landed) {
+              throw new HubRefusal(
+                reason ? `${t.title}: ${reason}` : `${t.title} isn't on your Mac`,
+              );
+            }
+            setDetail((prev) =>
+              prev
+                ? {
+                    ...prev,
+                    tracks: prev.tracks.map((x) =>
+                      x.id === t.id ? { ...x, has_audio: true } : x,
+                    ),
+                  }
+                : prev,
+            );
+          }
+        }
+        // Hop two: onto the phone.
         bytes += await cacheTrack(t.id, token);
       } catch (e) {
         // Track-level failures don't abort the whole batch -- mobile
         // networks blip. We keep counting and surface the final tally.
         failed += 1;
         lastError = friendlyError(e);
+      } finally {
+        setAcquiring((prev) => {
+          const next = new Set(prev);
+          next.delete(t.id);
+          return next;
+        });
       }
       done += 1;
       setProgress({
@@ -434,6 +597,24 @@ export function PlaylistScreen({ token, playlistId, profileId, onBack }: Props) 
   // zero files. `has_audio` is the server's `local_path IS NOT NULL`, which is
   // the question both the header and the offline toggle are actually asking.
   const downloaded = detail.tracks.filter((t) => t.has_audio);
+  // Favorites is the star button's one destination, not an ordinary playlist —
+  // the same role Spotify gives Liked Songs and Apple gives Favorites, and
+  // neither lets you delete or rename it. The server refuses either way
+  // (`delete_playlist_row` guards the anchor); this just stops offering it.
+  const isAnchor = detail.source === 'liked';
+  // "44 minutes" / "3 hours, 12 minutes" — the tally under the last row. Zero
+  // durations (a track whose metadata never landed) simply don't contribute
+  // rather than rendering "0 minutes" for a playlist that plainly has music.
+  const totalRuntime = (() => {
+    const ms = detail.tracks.reduce((sum, t) => sum + (t.duration_ms || 0), 0);
+    const mins = Math.round(ms / 60000);
+    if (mins <= 0) return '';
+    if (mins < 60) return `${mins} ${mins === 1 ? 'minute' : 'minutes'}`;
+    const h = Math.floor(mins / 60);
+    const m = mins % 60;
+    const hours = `${h} ${h === 1 ? 'hour' : 'hours'}`;
+    return m ? `${hours}, ${m} ${m === 1 ? 'minute' : 'minutes'}` : hours;
+  })();
   // Whether THIS playlist is the current playback source — so the hero + sticky
   // play buttons reflect ⏸ while it plays and toggle play/pause (instead of
   // always restarting). When a track from another source is current, the button
@@ -542,6 +723,20 @@ export function PlaylistScreen({ token, playlistId, profileId, onBack }: Props) 
             </svg>
           )}
         </button>
+        {/* Secondary + destructive actions, Apple-style: one "⋯" top-right
+            rather than more circles competing with Play in the hero. */}
+        <button
+          type="button"
+          onClick={(e) => setHeaderMenu(e.currentTarget.getBoundingClientRect())}
+          aria-label={isAlbum ? 'Album options' : 'Playlist options'}
+          className="h-9 w-9 shrink-0 grid place-items-center rounded-full text-neutral-300 active:bg-white/10 active:text-neutral-100"
+        >
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+            <circle cx="5" cy="12" r="1.8" />
+            <circle cx="12" cy="12" r="1.8" />
+            <circle cx="19" cy="12" r="1.8" />
+          </svg>
+        </button>
         {/* Rename lives on the title tap and Delete lives in the action row
             below (Spotify-style, same as desktop) — so the sticky bar stays
             back + condensed title + play, never a row of edit/delete icons. */}
@@ -574,7 +769,15 @@ export function PlaylistScreen({ token, playlistId, profileId, onBack }: Props) 
         </div>
         <div className="mt-4 w-full min-w-0 flex flex-col items-center">
           {/* Kind eyebrow — matches the catalog album / playlist heroes. */}
-          <p className={cn(EYEBROW_ON_ART, 'mb-1')}>{isAlbum ? 'Album' : 'Playlist'}</p>
+          {/* Favorites is not "a playlist" to a listener — it is the one place
+              the star button saves to, the way Liked Songs is on Spotify. It
+              carries no kind label because there is no other thing it could be
+              confused with, and calling it a playlist invites the question the
+              rest of this screen now answers no to (can I rename it? delete
+              it?). Albums and ordinary playlists keep theirs. */}
+          {!isAnchor && (
+            <p className={cn(EYEBROW_ON_ART, 'mb-1')}>{isAlbum ? 'Album' : 'Playlist'}</p>
+          )}
           {/* Tap the title to rename (Spotify-style, same as desktop). Gated
               on reachability — renaming is a hub write; when the desktop is
               unreachable the title stays readable but isn't a rename trigger. */}
@@ -586,11 +789,11 @@ export function PlaylistScreen({ token, playlistId, profileId, onBack }: Props) 
             <button
               type="button"
               onClick={() => {
-                if (!hubUp) return;
+                if (!hubUp || isAnchor) return;
                 setRenameError(null);
                 setRenameState('pending');
               }}
-              title={hubUp ? 'Edit details' : undefined}
+              title={hubUp && !isAnchor ? 'Edit details' : undefined}
               className={`block max-w-full truncate ${
                 hubUp ? 'active:opacity-70' : ''
               }`}
@@ -601,21 +804,22 @@ export function PlaylistScreen({ token, playlistId, profileId, onBack }: Props) 
           {/* Sentinel: once this scrolls above the top, the sticky bar condenses. */}
           <div ref={heroSentinelRef} className="h-px w-px" aria-hidden />
           {/* h1 above is the sentinel anchor; keep the meta line below it. */}
-          <p className="mt-1 text-xs text-neutral-400">
-            {detail.tracks.length} songs · {downloaded.length} downloaded
-            {cachedInPlaylist > 0 ? (
-              <>
-                {' '}· {cachedInPlaylist} offline
-              </>
-            ) : null}
-          </p>
+          {/* No counts here. Every phrasing of the download state we tried in
+              this spot ("388 downloaded", "6 need your Mac") described the
+              Mac's state in words a phone user read as the phone's, and the
+              per-row icons now say it precisely and per-track. What's left —
+              how big is this and how long — belongs at the END of a list, the
+              way Apple does it: it's a footnote you look for after scrolling,
+              not a headline. See the summary under the last row.  */}
           {detail.description && (
             <p className="mt-1.5 max-w-md text-sm text-neutral-300 whitespace-pre-wrap">
               {detail.description}
             </p>
           )}
           <div className="mt-4 flex items-center justify-center gap-4">
-            {/* Apple-style order: shuffle · Play (dominant) · offline · delete. */}
+            {/* Apple-style: shuffle · Play (dominant) · download. Delete moved
+                to the header ⋯ — a destructive control does not belong one 40px
+                target away from Download on a touch screen. */}
             <button
               type="button"
               disabled={streamableCount === 0}
@@ -641,24 +845,31 @@ export function PlaylistScreen({ token, playlistId, profileId, onBack }: Props) 
                 <path d="M4 4l5 5" />
               </svg>
             </button>
-            {/* Canonical white play circle — identical to the catalog album /
-                playlist detail pages and the desktop hero. */}
+            {/* A labelled pill, not another circle. Four equal circles gave the
+                hero no focal point; a wide white Play states the primary action
+                and takes a far easier thumb target with it. */}
             <button
               type="button"
               disabled={streamableCount === 0}
               onClick={togglePlay}
               aria-label={playlistPlaying ? 'Pause' : `Play ${detail.name}`}
-              className="grid h-14 w-14 shrink-0 place-items-center rounded-full bg-neutral-100 text-neutral-950 shadow-lg transition active:scale-95 disabled:bg-neutral-800 disabled:text-neutral-500"
+              className="flex h-12 min-w-[9.5rem] shrink-0 items-center justify-center gap-2 rounded-full bg-neutral-100 px-6 text-[15px] font-semibold text-neutral-950 shadow-lg transition active:scale-95 disabled:bg-neutral-800 disabled:text-neutral-500"
             >
               {playlistPlaying ? (
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-                  <rect x="6" y="5" width="4" height="14" rx="1" />
-                  <rect x="14" y="5" width="4" height="14" rx="1" />
-                </svg>
+                <>
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                    <rect x="6" y="5" width="4" height="14" rx="1" />
+                    <rect x="14" y="5" width="4" height="14" rx="1" />
+                  </svg>
+                  Pause
+                </>
               ) : (
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-                  <path d="M8 5v14l11-7z" />
-                </svg>
+                <>
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                    <path d="M8 5v14l11-7z" />
+                  </svg>
+                  Play
+                </>
               )}
             </button>
             {offlineCacheAvailable() && (
@@ -672,40 +883,6 @@ export function PlaylistScreen({ token, playlistId, profileId, onBack }: Props) 
                 onDisable={handleDisableOffline}
               />
             )}
-            {/* Delete lives in the action row (same as desktop), not the top
-                bar. Gated on reachability like the other hub-write controls. */}
-            <button
-              type="button"
-              onClick={() => setDeleteState('pending')}
-              disabled={!hubUp}
-              aria-label={isAlbum ? 'Delete album' : 'Delete playlist'}
-              title={
-                hubUp
-                  ? isAlbum
-                    ? 'Delete album'
-                    : 'Delete playlist'
-                  : 'Needs your computer'
-              }
-              className="grid h-10 w-10 place-items-center rounded-full bg-white/10 text-neutral-300 active:text-red-400 disabled:opacity-40 disabled:pointer-events-none"
-            >
-              <svg
-                width="18"
-                height="18"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="1.8"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                aria-hidden
-              >
-                <path d="M3 6h18" />
-                <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
-                <path d="M19 6 18 20a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
-                <path d="M10 11v6" />
-                <path d="M14 11v6" />
-              </svg>
-            </button>
           </div>
         </div>
       </div>
@@ -812,11 +989,27 @@ export function PlaylistScreen({ token, playlistId, profileId, onBack }: Props) 
                     </div>
                   </div>
                 </button>
-                {t.has_audio && <CacheBadge cached={isCached} />}
+                <CacheBadge
+                  state={
+                    acquiring.has(t.id)
+                      ? 'working'
+                      : // Cached wins outright: the bytes are ON this phone, so
+                        // the hub's state can't make it unplayable — and asking
+                        // about has_audio first showed "Not saved yet" for a
+                        // track sitting in the phone's own cache.
+                        isCached
+                        ? 'phone'
+                        : t.has_audio
+                          ? 'mac'
+                          : 'none'
+                  }
+                />
                 <button
                   type="button"
                   aria-label={`More options for ${t.title}`}
-                  onClick={() => setSheetTrack(t)}
+                  onClick={(e) =>
+                    setSheetTrack({ track: t, anchor: e.currentTarget.getBoundingClientRect() })
+                  }
                   className="h-11 w-9 -my-2 -mr-2 grid place-items-center text-neutral-500 active:text-neutral-200 shrink-0"
                 >
                   <svg width="19" height="19" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
@@ -831,6 +1024,13 @@ export function PlaylistScreen({ token, playlistId, profileId, onBack }: Props) 
           );
         })}
       </ul>
+
+      {/* Apple's placement: the tally sits under the last track, not in the
+          hero. You want it after you've scrolled the list, not before. */}
+      <p className="px-4 pt-4 pb-2 text-[13px] text-neutral-500">
+        {detail.tracks.length} {detail.tracks.length === 1 ? 'song' : 'songs'}
+        {totalRuntime ? `, ${totalRuntime}` : ''}
+      </p>
 
       {deleteState !== null && (
         <DeleteConfirmModal
@@ -859,8 +1059,88 @@ export function PlaylistScreen({ token, playlistId, profileId, onBack }: Props) 
           }}
         />
       )}
+      {headerMenu && (
+        <TrackActionSheet
+          anchor={headerMenu}
+          quick={[
+            {
+              key: 'shuffle',
+              label: 'Shuffle',
+              icon: (
+                <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                  <path d="M16 3h5v5" /><path d="M4 20 21 3" /><path d="M21 16v5h-5" /><path d="m15 15 6 6" /><path d="M4 4l5 5" />
+                </svg>
+              ),
+              onClick: handleShuffle,
+            },
+            {
+              key: 'play',
+              label: playlistPlaying ? 'Pause' : 'Play',
+              icon: (
+                <svg width="21" height="21" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                  {playlistPlaying ? (
+                    <>
+                      <rect x="6" y="5" width="4" height="14" rx="1" />
+                      <rect x="14" y="5" width="4" height="14" rx="1" />
+                    </>
+                  ) : (
+                    <path d="M8 5v14l11-7z" />
+                  )}
+                </svg>
+              ),
+              onClick: togglePlay,
+            },
+          ]}
+          items={[
+            // Rename is also the title tap; surfaced here because a tap-the-title
+            // affordance is invisible until you try it.
+            ...(hubUp && !isAnchor
+              ? [
+                  {
+                    key: 'rename',
+                    // "Edit" for both, matching Apple: the sheet's title
+                    // already establishes what you're editing, so repeating
+                    // the noun just makes the row longer.
+                    label: 'Edit',
+                    icon: (
+                      <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                        <path d="M12 20h9" />
+                        <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z" />
+                      </svg>
+                    ),
+                    onClick: () => {
+                      setRenameError(null);
+                      setRenameState('pending');
+                    },
+                  },
+                ]
+              : []),
+            // Destructive, last, behind the divider the sheet draws.
+            ...(hubUp && !isAnchor
+              ? [
+                  {
+                    key: 'delete',
+                    label: isAlbum ? 'Delete album' : 'Delete playlist',
+                    destructive: true,
+                    icon: (
+                      <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                        <path d="M3 6h18" />
+                        <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                        <path d="M19 6 18 20a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+                        <path d="M10 11v6" /><path d="M14 11v6" />
+                      </svg>
+                    ),
+                    onClick: () => setDeleteState('pending'),
+                  },
+                ]
+              : []),
+          ]}
+          onClose={() => setHeaderMenu(null)}
+        />
+      )}
       {sheetTrack && (
         <TrackActionSheet
+          anchor={sheetTrack.anchor}
           onClose={() => setSheetTrack(null)}
           quick={[
             {
@@ -871,7 +1151,7 @@ export function PlaylistScreen({ token, playlistId, profileId, onBack }: Props) 
                   <path d="M12 2.6l2.9 5.88 6.49.94-4.7 4.58 1.11 6.46L12 17.9l-5.8 3.05 1.11-6.46-4.7-4.58 6.49-.94z" />
                 </svg>
               ),
-              onClick: () => onSwipeSave(sheetTrack),
+              onClick: () => onSwipeSave(sheetTrack.track),
             },
             {
               key: 'add',
@@ -882,19 +1162,41 @@ export function PlaylistScreen({ token, playlistId, profileId, onBack }: Props) 
                   <path d="M16 14v7M12.5 17.5h7" />
                 </svg>
               ),
-              onClick: () => setAddTrack(sheetTrack),
+              onClick: () => setAddTrack(sheetTrack.track),
             },
           ]}
           items={[
+            // The hub doesn't have this one: offer the two-hop Download —
+            // fetch to the Mac, then onto this phone. Without it these tracks
+            // (the blank badge) had no action anywhere in the phone UI, and
+            // the only way to get one was to walk over to the Mac.
+            ...(!sheetTrack.track.has_audio && hubUp
+              ? [
+                  {
+                    key: 'acquire',
+                    label: acquiring.has(sheetTrack.track.id)
+                      ? 'Downloading…'
+                      : 'Download',
+                    icon: (
+                      <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                        <path d="M12 4v11" />
+                        <path d="M7 11l5 5 5-5" />
+                        <path d="M5 20h14" />
+                      </svg>
+                    ),
+                    onClick: () => void onFetchToMacThenPhone(sheetTrack.track),
+                  },
+                ]
+              : []),
             ...(offlineCacheAvailable() &&
-            (cachedIds.has(sheetTrack.id) || (sheetTrack.has_audio && hubUp))
+            (cachedIds.has(sheetTrack.track.id) || (sheetTrack.track.has_audio && hubUp))
               ? [
                   {
                     key: 'download',
-                    label: cachedIds.has(sheetTrack.id)
+                    label: cachedIds.has(sheetTrack.track.id)
                       ? 'Remove download'
                       : 'Download',
-                    icon: cachedIds.has(sheetTrack.id) ? (
+                    icon: cachedIds.has(sheetTrack.track.id) ? (
                       <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
                         <circle cx="12" cy="12" r="9" />
                         <path d="m8.5 12 2.5 2.5 4.5-5" />
@@ -906,11 +1208,11 @@ export function PlaylistScreen({ token, playlistId, profileId, onBack }: Props) 
                         <path d="M5 20h14" />
                       </svg>
                     ),
-                    onClick: () => onToggleDownload(sheetTrack),
+                    onClick: () => onToggleDownload(sheetTrack.track),
                   },
                 ]
               : []),
-            ...(sheetTrack.artists[0]
+            ...(sheetTrack.track.artists[0]
               ? [
                   {
                     key: 'artist',
@@ -921,11 +1223,11 @@ export function PlaylistScreen({ token, playlistId, profileId, onBack }: Props) 
                         <path d="M5.5 21a6.5 6.5 0 0 1 13 0" />
                       </svg>
                     ),
-                    onClick: () => openArtistNav(sheetTrack.artists[0]),
+                    onClick: () => openArtistNav(sheetTrack.track.artists[0]),
                   },
                 ]
               : []),
-            ...(sheetTrack.album
+            ...(sheetTrack.track.album
               ? [
                   {
                     key: 'album',
@@ -937,7 +1239,7 @@ export function PlaylistScreen({ token, playlistId, profileId, onBack }: Props) 
                       </svg>
                     ),
                     onClick: () =>
-                      openAlbumNav(sheetTrack.album!, sheetTrack.artists[0] ?? null),
+                      openAlbumNav(sheetTrack.track.album!, sheetTrack.track.artists[0] ?? null),
                   },
                 ]
               : []),
@@ -1179,25 +1481,68 @@ function RenameModal({
   );
 }
 
-function CacheBadge({ cached }: { cached: boolean }) {
+/**
+ * Where a track's audio lives, in one glyph, Apple-Music-style.
+ *
+ *   ⤓ in a filled circle — saved on THIS phone; plays with the Mac asleep.
+ *   ○ ring              — on the Mac; streams while the Mac is awake.
+ *   (blank)             — on neither yet.
+ *
+ * The three states are unchanged from the first version; what was wrong was
+ * that you couldn't SEE them. The ring was `neutral-700` on a near-black row —
+ * invisible in practice — and the "saved" glyph was a bare arrow that read as
+ * "tap to download" rather than "already here". The slot is now rendered for
+ * every row, blank included, so the icons form a column instead of shunting
+ * the "⋯" left and right as states differ.
+ */
+function CacheBadge({ state }: { state: 'phone' | 'mac' | 'none' | 'working' }) {
   return (
     <span
-      className={`shrink-0 ${cached ? 'text-neutral-400' : 'text-neutral-700'}`}
-      title={cached ? 'Cached for offline' : 'Streams from server'}
+      className="grid h-6 w-6 shrink-0 place-items-center"
+      title={
+        state === 'working'
+          ? 'Downloading…'
+          : state === 'phone'
+            ? 'Saved on this phone — plays anywhere'
+            : state === 'mac'
+              ? 'On your Mac — streams while it\'s awake'
+              : 'Not saved yet'
+      }
+      aria-label={
+        state === 'working'
+          ? 'Downloading'
+          : state === 'phone'
+            ? 'Saved on this phone'
+            : state === 'mac'
+              ? 'On your Mac'
+              : undefined
+      }
+      aria-live={state === 'working' ? 'polite' : undefined}
     >
-      {cached ? (
-        // Download / cached glyph
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-          <path d="M12 4v11" />
-          <path d="M7 11l5 5 5-5" />
-          <path d="M5 20h14" />
+      {state === 'working' ? (
+        // Spins in the same 18px circle the finished state occupies, so the
+        // glyph swaps in place rather than the row twitching when it lands.
+        <svg
+          className="h-[18px] w-[18px] animate-spin text-neutral-300"
+          viewBox="0 0 24 24"
+          fill="none"
+          aria-hidden
+        >
+          <circle cx="12" cy="12" r="9" stroke="currentColor" strokeOpacity="0.25" strokeWidth="3" />
+          <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
         </svg>
-      ) : (
-        // Not-cached / streams glyph
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden>
-          <circle cx="12" cy="12" r="7" />
+      ) : state === 'phone' ? (
+        <span className="grid h-[18px] w-[18px] place-items-center rounded-full bg-white/85 text-neutral-950">
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+            <path d="M12 5v11" />
+            <path d="M6 12l6 6 6-6" />
+          </svg>
+        </span>
+      ) : state === 'mac' ? (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" aria-hidden className="text-neutral-500">
+          <circle cx="12" cy="12" r="7.5" />
         </svg>
-      )}
+      ) : null}
     </span>
   );
 }

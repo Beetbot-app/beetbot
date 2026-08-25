@@ -1,4 +1,10 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="8 17 108 108" width="108" height="108">
+<!-- viewBox y offset so the artwork is centred in its own frame. The rendered
+     ink centres on y=74.75; this frame spans 20.75-128.75, centring on the
+     same point. Consumers can now centre the box and get a centred mark, with
+     no per-surface nudge. Changing this shifts every <Logo> render down by
+     ~1px at size 30, which is why Sidebar's -translate-y-[3px] was removed at
+     the same time. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="8 20.75 108 108" width="108" height="108">
   <title>Beetbot mark</title>
   <defs>
     <linearGradient id="beet" x1="0" y1="0" x2="1" y2="1">

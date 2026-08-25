@@ -241,6 +241,9 @@ export const ipc = {
     invoke<string>('import_local_file', { trackId, sourcePath }),
 
   streamingStatus: () => invoke<StreamingStatus>('streaming_status'),
+  /** Unix seconds since instant streaming degraded to its slower route, or
+   *  null while healthy. */
+  streamingHealth: () => invoke<number | null>('streaming_health'),
   streamingSetEnabled: (enabled: boolean) =>
     invoke<void>('streaming_set_enabled', { enabled }),
   listStreamingSessions: () =>

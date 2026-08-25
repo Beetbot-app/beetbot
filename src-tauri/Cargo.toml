@@ -1,6 +1,6 @@
 [package]
 name = "beetbot"
-version = "0.2.0"
+version = "0.2.1"
 description = "Local-first music player and personal media server"
 authors = ["Beetbot"]
 edition = "2021"

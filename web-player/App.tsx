@@ -15,6 +15,7 @@ import {
   setSessionRefreshedHandler,
   setTokenReissuer,
   setTrackLiked,
+  signInUrlOf,
   submitPairing,
   type Genre,
   type ResolvedTrack,
@@ -147,6 +148,10 @@ type SessionState =
   | { kind: 'loading' }
   | { kind: 'ready'; token: string }
   | { kind: 'pairing-required' }
+  // Signed out of whatever serves this library from outside. Its own state
+  // rather than an 'error' because there is exactly one thing to do about it,
+  // and the hub told us what it is.
+  | { kind: 'sign-in-required'; signIn: string }
   | { kind: 'error'; message: string };
 
 export default function App() {
@@ -492,8 +497,11 @@ export default function App() {
         if (!cancelled) setSession({ kind: 'ready', token });
       } catch (e) {
         if (cancelled) return;
+        const signIn = signInUrlOf(e);
         if (e instanceof Error && e.name === 'PairingRequiredError') {
           setSession({ kind: 'pairing-required' });
+        } else if (signIn) {
+          setSession({ kind: 'sign-in-required', signIn });
         } else {
           setSession({ kind: 'error', message: friendlyError(e) });
         }
@@ -539,6 +547,24 @@ export default function App() {
       <PairingScreen
         onPaired={(token) => setSession({ kind: 'ready', token })}
       />
+    );
+  }
+  if (session.kind === 'sign-in-required') {
+    // A link, not a fetch: signing in happens on another site, and this one is
+    // served cache-first by the service worker — a reload would be answered from
+    // cache and never leave the app. Only a real navigation gets there.
+    return (
+      <div className="h-full grid place-items-center p-6 text-center">
+        <div>
+          <h1 className="text-xl font-bold tracking-tight mb-2">Sign in to continue</h1>
+          <p className="text-sm text-neutral-400 break-words">
+            This library is shared with you privately. Sign in to listen.
+          </p>
+          <a href={session.signIn} className={cn(BTN_SECONDARY, 'mt-4 inline-block')}>
+            Sign in
+          </a>
+        </div>
+      </div>
     );
   }
   if (session.kind === 'error') {

@@ -153,7 +153,15 @@
 // three ancestors were each adding space under the artist page's closing band.
 // v398: Essential Albums no longer repeats the Latest Release — a new record
 // usually dominates its artist's top songs, so both were showing one cover.
-const SHELL_CACHE = 'beetbot-shell-v400';
+// v419: MUST BE BUMPED — a signed-out visitor used to get "Couldn't connect" and
+// a Retry button, because ensureSession() flattened the hub's 401 (which carries
+// the sign-in URL) into a generic failure. The fix gives that state its own
+// screen and a real link. But the phones that need it are precisely the ones
+// stuck on it, and navigation here is cache-first: without this bump they would
+// keep rendering the old bundle from the shell cache and keep seeing the dead
+// end. Same reasoning as v371 — reaping the stale shell is the only way an
+// already-affected phone recovers.
+const SHELL_CACHE = 'beetbot-shell-v419';
 // Bump the cache name to invalidate everything ever cached at v1. The
 // v1 cache held m4a files downloaded before we started embedding album
 // art via ffmpeg post-process — those old bytes have no `covr` atom,

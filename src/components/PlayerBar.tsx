@@ -637,9 +637,10 @@ export function PlayerBar() {
           const url = srcFor(t);
           // Only server-streamed URLs benefit; a local file (convertFileSrc)
           // needs no resolve. We don't keep the bytes — the server-side prep is
-          // the point.
+          // the point. `warm=1` tells the hub nobody is listening for this
+          // response, so a real tap's resolve may overtake it.
           if (!url.startsWith('http')) return;
-          void fetch(url, {
+          void fetch(`${url}${url.includes('?') ? '&' : '?'}warm=1`, {
             method: 'GET',
             headers: { Range: 'bytes=0-1' },
             cache: 'no-store',
