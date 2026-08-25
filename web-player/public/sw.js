@@ -161,7 +161,11 @@
 // keep rendering the old bundle from the shell cache and keep seeing the dead
 // end. Same reasoning as v371 — reaping the stale shell is the only way an
 // already-affected phone recovers.
-const SHELL_CACHE = 'beetbot-shell-v419';
+// v420: playback punch-list (handoff carries real playability, cheap dead-track
+// probe, /live stall patience, degraded-streaming notice).
+// v421: structured live-stream denials — the probe now distinguishes a dead
+// source from the Mac being offline, and says the right thing for each.
+const SHELL_CACHE = 'beetbot-shell-v421';
 // Bump the cache name to invalidate everything ever cached at v1. The
 // v1 cache held m4a files downloaded before we started embedding album
 // art via ffmpeg post-process — those old bytes have no `covr` atom,

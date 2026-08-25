@@ -3625,6 +3625,9 @@ pub fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>>
 
                 let server_state = server::AppState {
                     db: db_handle.clone(),
+                    live_denials: std::sync::Arc::new(std::sync::Mutex::new(
+                        std::collections::HashMap::new(),
+                    )),
                     cert_pem: cert_pem_arc.clone(),
                     hostname_bare: host_arc.clone(),
                     pairing: pairing.clone(),

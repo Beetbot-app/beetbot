@@ -48,6 +48,12 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<Mutex<Connection>>,
+    /// The last live-stream denial per track (wire code + when), kept ~60s.
+    /// An <audio> element can't read its failed response's body, so the
+    /// players' cheap error probe reads the reason back through
+    /// `/api/tracks/{id}` instead — without this memory, the only way to
+    /// learn WHY a play failed was to re-run the whole failed resolve.
+    pub live_denials: Arc<Mutex<std::collections::HashMap<i64, (&'static str, std::time::Instant)>>>,
     /// PEM-encoded self-signed cert served at /cert/beetbot.crt so phones
     /// can install it and trust HTTPS. None during HTTP-only deployments.
     pub cert_pem: Option<Arc<String>>,
@@ -694,6 +700,13 @@ struct SessionResponse {
     /// full build's engine resolves + remuxes the source). The open build leaves
     /// this false, so its UI keeps treating non-downloaded tracks as preview-only.
     live_stream: bool,
+    /// Unix seconds since instant streaming degraded to its slower route;
+    /// absent while healthy. The phone is the surface that actually FEELS a
+    /// degraded fast path (+10s starts), and until 25 Aug 2026 nothing it
+    /// could reach carried this state — the alarm existed and the listener
+    /// was never told.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    streaming_degraded_since: Option<i64>,
 }
 
 async fn session_handler(
@@ -734,7 +747,10 @@ async fn session_handler(
             .into_response();
     }
 
-    Json(issue_session_for(&state, ip, &headers)).into_response()
+    {
+        let degraded = crate::acquisition::active_provider().live_health(&state.db).await;
+        Json(issue_session_for(&state, ip, &headers, degraded)).into_response()
+    }
 }
 
 #[derive(Serialize)]
@@ -823,7 +839,10 @@ async fn pair_submit(
             headers.insert(header::USER_AGENT, v);
         }
     }
-    Json(issue_session_for(&state, ip, &headers)).into_response()
+    {
+        let degraded = crate::acquisition::active_provider().live_health(&state.db).await;
+        Json(issue_session_for(&state, ip, &headers, degraded)).into_response()
+    }
 }
 
 fn rate_limited_response(retry_in: std::time::Duration) -> Response {
@@ -841,7 +860,12 @@ fn rate_limited_response(retry_in: std::time::Duration) -> Response {
 /// Mint a fresh session token + persist it. Shared by the LAN session
 /// path and the post-pair path so device_label / IP plumbing stays in
 /// one place.
-fn issue_session_for(state: &AppState, ip: IpAddr, headers: &HeaderMap) -> SessionResponse {
+fn issue_session_for(
+    state: &AppState,
+    ip: IpAddr,
+    headers: &HeaderMap,
+    streaming_degraded_since: Option<i64>,
+) -> SessionResponse {
     let token = generate_token();
     let user_agent = headers
         .get(header::USER_AGENT)
@@ -874,6 +898,7 @@ fn issue_session_for(state: &AppState, ip: IpAddr, headers: &HeaderMap) -> Sessi
         // Full build (engine registered) auto-acquires, so it can also live-stream
         // non-downloaded tracks; the open build leaves this false.
         live_stream: crate::acquisition::active_provider().auto_acquires(),
+        streaming_degraded_since,
     }
 }
 
@@ -1721,6 +1746,12 @@ struct StreamTrack {
     /// Track lifecycle state -- the web player uses this to know whether the
     /// track has playable audio yet or still needs a file attached.
     status: String,
+    /// A live-stream denial recorded for this track in the last ~60s, as its
+    /// wire code (`source-gone` / `upstream-unreachable` / `unsupported`).
+    /// The players' error probe reads this instead of re-running the failed
+    /// resolve — an <audio> element cannot see its failed response's body.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    live_denial: Option<&'static str>,
     /// Why the hub stopped trying, when it did. The phone polls this endpoint
     /// while a download runs; without the reason it can only say "it didn't
     /// work", which reads the same for an age-gated video (fixable -- point it
@@ -1820,6 +1851,7 @@ async fn get_playlist(
                 position: r.get(6)?,
                 has_audio: local_path.is_some(),
                 status: r.get(8)?,
+                live_denial: None,
                 failure_reason: None,
             })
         })
@@ -1891,6 +1923,7 @@ async fn get_library_songs(
                 position: 0,
                 has_audio: local_path.is_some(),
                 status: r.get(7)?,
+                live_denial: None,
                 failure_reason: None,
             })
         })
@@ -2132,8 +2165,8 @@ async fn cast_start(
             .live_path(&state.app, &state.db, body.track_id, false)
             .await
         {
-            Ok(Some(_)) => {} // warmed — the /live URL will serve instantly
-            Ok(None) | Err(_) => {
+            Ok(crate::acquisition::LiveOutcome::Ready(_)) => {} // warmed — /live serves instantly
+            Ok(crate::acquisition::LiveOutcome::Denied(_)) | Err(_) => {
                 return (StatusCode::CONFLICT, "couldn't prepare this track to cast")
                     .into_response();
             }
@@ -2421,6 +2454,20 @@ async fn cast_status(
     .into_response()
 }
 
+/// A denial recorded for this track within the last minute, or None. Sixty
+/// seconds comfortably covers the probe that follows a failed play (fires
+/// within ~10s) without letting a stale verdict outlive the conditions —
+/// an upstream blip that healed should stop being reported as soon as a
+/// play succeeds (successes evict eagerly) or the window lapses.
+const LIVE_DENIAL_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn fresh_live_denial(state: &AppState, track_id: i64) -> Option<&'static str> {
+    let map = state.live_denials.lock().expect("denials mutex");
+    map.get(&track_id)
+        .filter(|(_, at)| at.elapsed() < LIVE_DENIAL_TTL)
+        .map(|(code, _)| *code)
+}
+
 async fn get_track(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2451,12 +2498,16 @@ async fn get_track(
                 position: 0,
                 has_audio: local_path.is_some(),
                 status: r.get(7)?,
+                live_denial: None,
                 failure_reason: r.get(8)?,
             })
         },
     );
     match row {
-        Ok(t) => Json(t).into_response(),
+        Ok(mut t) => {
+            t.live_denial = fresh_live_denial(&state, id);
+            Json(t).into_response()
+        }
         Err(rusqlite::Error::QueryReturnedNoRows) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
             tracing::error!(?e, "get_track");
@@ -12571,13 +12622,42 @@ async fn stream_track_live(
         .live_path(&state.app, &state.db, id, warm)
         .await
     {
-        Ok(Some(p)) => p,
-        Ok(None) => {
-            return (StatusCode::NOT_FOUND, "no live stream for this track").into_response()
+        Ok(crate::acquisition::LiveOutcome::Ready(p)) => {
+            // A success clears any remembered denial — the probe must not
+            // read yesterday's weather.
+            state.live_denials.lock().expect("denials mutex").remove(&id);
+            p
+        }
+        Ok(crate::acquisition::LiveOutcome::Denied(denial)) => {
+            let code = denial.code();
+            state
+                .live_denials
+                .lock()
+                .expect("denials mutex")
+                .insert(id, (code, std::time::Instant::now()));
+            // Structured on purpose: the players' error probe reads `reason`
+            // back via /api/tracks/{id} and says the RIGHT thing — a durable
+            // dead end skips forward; an unreachable network stops and says
+            // so, instead of blaming every song in the queue for it.
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "no live stream for this track",
+                    "reason": code,
+                })),
+            )
+                .into_response();
         }
         Err(e) => {
             tracing::warn!(error = %e, id, "live stream resolve failed");
-            return (StatusCode::NOT_FOUND, "live stream unavailable").into_response();
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "live stream unavailable",
+                    "reason": "upstream-unreachable",
+                })),
+            )
+                .into_response();
         }
     };
     let path: PathBuf = path.into();
@@ -13748,6 +13828,7 @@ mod tests {
                             position: 0,
                             has_audio: local_path.is_some(),
                             status: r.get(7)?,
+                            live_denial: None,
                             failure_reason: r.get(8)?,
                         })
                     },

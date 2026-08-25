@@ -3,6 +3,8 @@ import { createPortal } from 'react-dom';
 import { heartbeatQueue, upcomingQueueIndices } from '@shared/playerStore';
 import { canStream, currentTrack, usePlayerStore, useCatalogNav } from '../store';
 import {
+  apiUrl,
+  getStreamingDegradedSince,
   AUDIO_CACHE_NAME,
   cacheKeyFor,
   castControl,
@@ -163,6 +165,12 @@ const TRACK_CHANGE_GRACE_MS = 15_000;
  *  of the error-driven recovery below ever sees it. Long enough not to fight a
  *  slow cellular buffer; short enough that a stall doesn't cost a whole song. */
 const STALL_RECOVER_MS = 8_000;
+/** Stall interval for /live sources. The engine's fallback legitimately needs
+ *  up to ~90s for one attempt; the old 8s x4 ladder (~40s) aborted the request
+ *  before it could succeed — and each abort orphaned the server-side work, so
+ *  the retry raced its own predecessor (audit, 25 Aug). 25s x4 outlasts one
+ *  full attempt while still bounding the wait. */
+const STALL_RECOVER_LIVE_MS = 25_000;
 /** How many times a stalled stream may be reloaded before we stop and hand it
  *  back to the user. Matches the error path's cap: past this, retrying is not
  *  the problem. */
@@ -1308,6 +1316,8 @@ export function Player({
                 album: t.album,
                 album_art_url: t.album_art_url,
                 duration_ms: t.duration_ms,
+                has_audio: t.has_audio,
+                status: t.status ?? null,
               })),
               index: st.currentIndex,
               position: audioRef.current?.currentTime ?? st.currentTime ?? 0,
@@ -1341,8 +1351,11 @@ export function Player({
         album_art_url: t.album_art_url,
         duration_ms: t.duration_ms,
         position: i,
-        has_audio: true,
-        status: 'ready',
+        // Default FALSE when the sender predates the field: /live serves a
+        // downloaded track's file instantly, whereas assuming `true` sent
+        // streamed tracks to /stream — a full synchronous download per play.
+        has_audio: t.has_audio ?? false,
+        status: t.status ?? 'matched',
       }));
       if (castActive) {
         castStop(token).catch(() => {});
@@ -1611,7 +1624,7 @@ export function Player({
         // so the hub lets a real tap's resolve overtake it instead of queueing
         // the tap behind us. Only here — the element's own fallback load (when
         // no prefetched copy exists) is a person waiting, and stays unmarked.
-        const warmUrl = `${url}&warm=1`;
+        const warmUrl = `${url}${url.includes('?') ? '&' : '?'}warm=1`;
         // Pull the whole track and KEEP it. Warming the HTTP cache is not
         // enough: a media element's own loader is suspended while the page is
         // backgrounded and its range requests miss the cache `fetch()` filled,
@@ -1776,6 +1789,7 @@ export function Player({
    *  phone stays locked, and the request that replaces it usually does. */
   const armStallWatchdog = useCallback(() => {
     clearStallWatchdog();
+    const isLive = audioRef.current?.currentSrc?.includes('/live') ?? false;
     stallTimerRef.current = window.setTimeout(() => {
       stallTimerRef.current = 0;
       const a = audioRef.current;
@@ -1792,7 +1806,7 @@ export function Player({
       r.count += 1;
       raiseBuffering();
       setReloadNonce((n) => n + 1);
-    }, STALL_RECOVER_MS);
+    }, isLive ? STALL_RECOVER_LIVE_MS : STALL_RECOVER_MS);
   }, [clearStallWatchdog]);
   useEffect(() => clearStallWatchdog, [clearStallWatchdog]);
 
@@ -2834,15 +2848,42 @@ export function Player({
                 usePlayerStore.setState({ isPlaying: true });
               }, Math.min(700 * r.count, 4000));
             };
-            void fetch(failedSrc, {
+            // Probe /api/tracks/{id} — a DB read — NOT the failed /live URL:
+            // re-fetching that URL re-ran the ENTIRE dead resolve (matcher,
+            // fallback, up to ~90s) at interactive priority, doubling the
+            // wait the listener had already paid (audit, 25 Aug). A 200 here
+            // means the track exists and its SOURCE failed; 404 means a ghost
+            // row; only a network error means connectivity.
+            const probeId = usePlayerStore.getState().queue[
+              usePlayerStore.getState().currentIndex
+            ]?.id;
+            const probeCtl = new AbortController();
+            const probeTimer = window.setTimeout(() => probeCtl.abort(), 5000);
+            void fetch(apiUrl(`/api/tracks/${probeId}?t=${encodeURIComponent(token ?? '')}`), {
               method: 'GET',
               cache: 'no-store',
-              headers: { Range: 'bytes=0-0' },
+              signal: probeCtl.signal,
             })
-              .then((res) => {
+              .then(async (res) => {
+                window.clearTimeout(probeTimer);
+                // A fresh live denial rides the track row for ~60s. The one
+                // that changes behavior is upstream-unreachable: the SONG is
+                // fine, the Mac's network isn't — skip-flashing through the
+                // queue blaming each track would be a lie, so stop and say
+                // the true thing once.
+                const denial =
+                  res.ok
+                    ? ((await res.json().catch(() => null))?.live_denial ?? null)
+                    : null;
                 if (res.status === 401) {
                   notifyUnauthorized();
-                } else if (res.status === 404) {
+                } else if (denial === 'upstream-unreachable') {
+                  retryRef.current.count = 0;
+                  setErrorMsg(
+                    'Your Mac can\u2019t reach the internet right now. Downloaded songs still play.',
+                  );
+                  usePlayerStore.setState({ isPlaying: false });
+                } else if (res.ok || res.status === 404) {
                   // The track no longer exists (a stale queue after a library
                   // change, or a pruned discovery row). Retrying a ghost is
                   // futile — quietly skip to the next playable track. Capped by
@@ -2882,7 +2923,10 @@ export function Player({
                   scheduleRetry();
                 }
               })
-              .catch(() => scheduleRetry());
+              .catch(() => {
+                window.clearTimeout(probeTimer);
+                scheduleRetry();
+              });
             return;
           }
           const msg = describeAudioError(err);
@@ -2894,6 +2938,17 @@ export function Player({
       {(errorMsg ?? flashMsg) ? (
         <div className={cn(CALLOUT_ERROR, 'mx-4 mt-3 text-xs break-words')}>
           {errorMsg ?? flashMsg}
+        </div>
+      ) : isPlaying &&
+        getStreamingDegradedSince() != null &&
+        (audioRef.current?.currentSrc.includes('/live') ?? false) ? (
+        // The fast-path alarm, finally on the surface that feels it: streamed
+        // starts run ~10s instead of ~1s while degraded. Passive and quiet —
+        // it explains the slowness, it doesn't interrupt anything, and
+        // downloaded tracks (which are unaffected) never show it.
+        <div className="mx-4 mt-3 text-xs text-neutral-500">
+          Streaming is running slower than usual right now. Downloaded songs
+          aren&rsquo;t affected.
         </div>
       ) : null}
 

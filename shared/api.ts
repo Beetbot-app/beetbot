@@ -132,6 +132,10 @@ export interface SessionResponse {
   pairing_required: boolean;
   /** Full build can stream a not-yet-downloaded track on demand (`/stream/{id}/live`). */
   live_stream?: boolean;
+  /** Unix seconds since instant streaming degraded to its slower route; absent
+   *  while healthy. Lets the phone — the surface that feels the +10s starts —
+   *  say so, instead of the alarm living only in desktop Settings. */
+  streaming_degraded_since?: number | null;
 }
 
 /** Read the persisted token, if any. */
@@ -284,6 +288,14 @@ async function timedFetch(
   }
 }
 
+/** Unix seconds since instant streaming degraded, per the last session
+ *  response; null while healthy or unknown. Session-scoped on purpose — a
+ *  stale persisted value would show a warning the hub has already cleared. */
+let streamingDegradedSince: number | null = null;
+export function getStreamingDegradedSince(): number | null {
+  return streamingDegradedSince;
+}
+
 const LIVE_STREAM_KEY = 'beetbot.live_stream';
 // Persisted alongside the token so a reload knows the build's capability before
 // the session round-trips (avoids a brief window where a non-downloaded track
@@ -356,6 +368,7 @@ export async function submitPairing(
   const body = (await res.json()) as SessionResponse;
   setStoredToken(body.session_token);
   setLiveStreamCapable(body.live_stream ?? false);
+  streamingDegradedSince = body.streaming_degraded_since ?? null;
   return body.session_token;
 }
 
@@ -481,6 +494,7 @@ export async function ensureSession(): Promise<string> {
   const body = (await res.json()) as SessionResponse;
   setStoredToken(body.session_token);
   setLiveStreamCapable(body.live_stream ?? false);
+  streamingDegradedSince = body.streaming_degraded_since ?? null;
   return body.session_token;
 }
 
@@ -517,6 +531,7 @@ export async function reissuePhoneSession(
   const body = (await res.json()) as SessionResponse;
   setStoredToken(body.session_token);
   setLiveStreamCapable(body.live_stream ?? false);
+  streamingDegradedSince = body.streaming_degraded_since ?? null;
   sessionRefreshedHandler?.(body.session_token);
   return body.session_token;
 }
@@ -2509,6 +2524,14 @@ export interface HandoffTrack {
   album: string | null;
   album_art_url: string | null;
   duration_ms: number;
+  /** Whether the hub holds a file for this track. Optional for compatibility
+   *  with senders predating 25 Aug 2026 — receivers must default to FALSE:
+   *  routing a downloaded track to /live costs nothing (the engine serves the
+   *  local file instantly), while the old hardcoded `true` routed STREAMED
+   *  tracks to /stream, which on the full build runs a complete synchronous
+   *  match+download inside the play request. */
+  has_audio?: boolean;
+  status?: string | null;
 }
 
 export interface HandoffPayload {

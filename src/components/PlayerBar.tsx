@@ -1033,7 +1033,11 @@ export function PlayerBar() {
         album_art_url: t.album_art_url,
         duration_ms: t.duration_ms,
         isrc: null,
-        status: 'downloaded',
+        // Route on what the sender actually knew. 'downloaded' -> /stream by
+        // id; anything else -> /live (which serves a hub-side file instantly
+        // anyway). The old hardcoded 'downloaded' sent STREAMED tracks to
+        // /stream — a full synchronous download inside the play request.
+        status: t.status ?? (t.has_audio ? 'downloaded' : 'matched'),
         failure_reason: null,
         local_path: null,
         position: i,
@@ -1070,6 +1074,8 @@ export function PlayerBar() {
           album: t.album,
           album_art_url: t.album_art_url,
           duration_ms: t.duration_ms,
+          has_audio: t.status === 'downloaded' || !!t.local_path,
+          status: t.status ?? null,
         })),
         index: st.currentIndex,
         position: audioRef.current?.currentTime ?? st.currentTime ?? 0,
@@ -1340,13 +1346,37 @@ export function PlayerBar() {
                   usePlayerStore.setState({ isPlaying: true });
                 }, Math.min(700 * r.count, 4000));
               };
-              void fetch(failedSrc, {
-                method: 'GET',
-                cache: 'no-store',
-                headers: { Range: 'bytes=0-0' },
-              })
-                .then((res) => {
-                  if (res.status === 404) {
+              // Probe /api/tracks/{id} (a DB read), not the failed /live
+              // URL — re-fetching that re-ran the whole dead resolve (audit,
+              // 25 Aug). 200 = track exists, source failed; 404 = ghost row;
+              // network error = connectivity.
+              const probeId = usePlayerStore.getState().queue[
+                usePlayerStore.getState().currentIndex
+              ]?.id;
+              const probeCtl = new AbortController();
+              const probeTimer = window.setTimeout(() => probeCtl.abort(), 5000);
+              void fetch(
+                `http://127.0.0.1:47823/api/tracks/${probeId}?t=${encodeURIComponent(castToken ?? '')}`,
+                { method: 'GET', cache: 'no-store', signal: probeCtl.signal },
+              )
+                .then(async (res) => {
+                  window.clearTimeout(probeTimer);
+                  // upstream-unreachable = the hub itself is offline. Stop
+                  // with the truth instead of silently skipping the whole
+                  // queue and ending on "Song source not available".
+                  const denial =
+                    res.ok
+                      ? ((await res.json().catch(() => null))?.live_denial ?? null)
+                      : null;
+                  if (denial === 'upstream-unreachable') {
+                    r.count = 0;
+                    setErrorMsg(
+                      'Beetbot can\u2019t reach the internet \u2014 streaming needs a connection. Downloaded songs still play.',
+                    );
+                    usePlayerStore.getState().pause();
+                    return;
+                  }
+                  if (res.ok || res.status === 404) {
                     const store = usePlayerStore.getState();
                     const cap = Math.max(store.queue.length, 1);
                     goneRef.current += 1;
@@ -1368,7 +1398,10 @@ export function PlayerBar() {
                     scheduleRetry();
                   }
                 })
-                .catch(() => scheduleRetry());
+                .catch(() => {
+                  window.clearTimeout(probeTimer);
+                  scheduleRetry();
+                });
               return;
             }
             // Non-stream error (a corrupt/undecodable local file): skip past it,

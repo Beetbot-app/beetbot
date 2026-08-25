@@ -107,6 +107,39 @@ pub struct AcquisitionOutcome {
 /// The one boundary the closed engine implements. `LocalFileProvider` satisfies
 /// it via the user-import flow; an `EngineProvider` would satisfy it by
 /// match + download.
+/// What `live_path` produced: a servable file, or a denial that says why.
+#[derive(Debug, Clone)]
+pub enum LiveOutcome {
+    /// A seekable local file the caller can range-serve.
+    Ready(String),
+    Denied(LiveDenial),
+}
+
+/// Why a live stream could not be produced. The load-bearing split is
+/// durable-vs-transient: players skip past `SourceGone` with a note, but stop
+/// and explain `UpstreamUnreachable` instead of skip-flashing through a whole
+/// queue blaming each song for a network that is down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveDenial {
+    /// This build cannot live-stream (no provider with a source registered).
+    Unsupported,
+    /// The track — or every usable copy of it — is gone. Durable.
+    SourceGone,
+    /// The hub could not reach its upstream network right now. Transient.
+    UpstreamUnreachable,
+}
+
+impl LiveDenial {
+    /// Stable wire code for HTTP bodies and the `/api/tracks/{id}` echo.
+    pub fn code(self) -> &'static str {
+        match self {
+            LiveDenial::Unsupported => "unsupported",
+            LiveDenial::SourceGone => "source-gone",
+            LiveDenial::UpstreamUnreachable => "upstream-unreachable",
+        }
+    }
+}
+
 #[async_trait]
 pub trait AcquisitionProvider: Send + Sync {
     /// Stable identity, like [`crate::ddns`]'s provider. Built-in: `"local-file"`.
@@ -148,11 +181,19 @@ pub trait AcquisitionProvider: Send + Sync {
 
     /// Resolve a track to a seekable LOCAL file for *immediate* playback without
     /// permanently acquiring it — the "stream it now" path behind
-    /// `/stream/{id}/live`. The built-in open provider has no source to stream
-    /// and returns `Ok(None)` (the route then 404s and the player previews); a
-    /// full-build provider resolves the source and remuxes it to a temp file,
-    /// returning a path the caller range-serves. Default = `Ok(None)` so the
-    /// open build needs no implementation.
+    /// `/stream/{id}/live`. A full-build provider resolves the source and
+    /// remuxes it to a temp file, returning [`LiveOutcome::Ready`] with a path
+    /// the caller range-serves.
+    ///
+    /// A denial carries WHY, because the players need the distinction: a
+    /// durable dead end skips forward with a small note, while "the hub can't
+    /// reach its network right now" should stop and say so — before this enum,
+    /// both collapsed into one vague 404 and the phone blamed the SONG when
+    /// the problem was connectivity (playback audit, 25 Aug 2026).
+    ///
+    /// The default serves a downloaded track's own file (so surfaces that
+    /// route through `/live` regardless of download state still play on the
+    /// open build) and otherwise reports [`LiveDenial::Unsupported`].
     ///
     /// `background` distinguishes a listener actively waiting on this stream
     /// (a tap, a cast) from a warm-up the player fires for the NEXT queue
@@ -165,8 +206,19 @@ pub trait AcquisitionProvider: Send + Sync {
         db: &Arc<Mutex<Connection>>,
         track_id: i64,
         background: bool,
-    ) -> Result<Option<String>, AcquisitionError> {
-        Ok(None)
+    ) -> Result<LiveOutcome, AcquisitionError> {
+        let local = {
+            let conn = db.lock().map_err(|_| {
+                AcquisitionError::Provider("db lock poisoned".into())
+            })?;
+            self.resolve_local_path(&conn, track_id)?
+        };
+        if let Some(p) = local {
+            if std::path::Path::new(&p).exists() {
+                return Ok(LiveOutcome::Ready(p));
+            }
+        }
+        Ok(LiveOutcome::Denied(LiveDenial::Unsupported))
     }
 
     /// When did instant streaming degrade to its slower route, if it has?

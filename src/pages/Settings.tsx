@@ -288,10 +288,25 @@ export function SettingsPage() {
   // while healthy. Best-effort — an open build has no fast path to degrade.
   const [streamingDegradedSince, setStreamingDegradedSince] = useState<number | null>(null);
   useEffect(() => {
-    ipc
-      .streamingHealth()
-      .then(setStreamingDegradedSince)
-      .catch(() => {});
+    const fetchHealth = () => {
+      ipc
+        .streamingHealth()
+        .then(setStreamingDegradedSince)
+        .catch(() => {});
+    };
+    fetchHealth();
+    // Re-read when the window regains focus: the old once-on-mount read meant
+    // an alarm that tripped while Settings sat open (or in another space) was
+    // never shown, and a recovery never cleared the amber note.
+    const onVisible = () => {
+      if (!document.hidden) fetchHealth();
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('focus', onVisible);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('focus', onVisible);
+    };
   }, []);
   const [streamingSessions, setStreamingSessions] = useState<StreamingSession[]>(
     [],
