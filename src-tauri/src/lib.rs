@@ -3892,16 +3892,55 @@ pub fn show_main(app: &tauri::AppHandle) {
     }
 }
 
+/// Extra tray items contributed by a shell built on top of this core.
+///
+/// A shell can carry features this core does not, and those features need
+/// somewhere to be reached from — the window spends most of its life hidden, so
+/// the tray is often the only Beetbot on screen. A shell registers what it wants
+/// before `setup_app` runs; this build registers nothing and the tray menu is
+/// exactly what it has always been.
+///
+/// Only the label is stored here. Tauri hands every menu event to every menu
+/// listener in the process, so whoever registered an item handles its clicks
+/// itself and this core never needs to know what any of them mean.
+static TRAY_EXTRAS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+/// Register one extra tray item. Call before [`setup_app`]; the tray is built
+/// once, during setup, and anything registered after that arrives too late.
+pub fn add_tray_item(id: impl Into<String>, label: impl Into<String>) {
+    if let Ok(mut extras) = TRAY_EXTRAS.lock() {
+        extras.push((id.into(), label.into()));
+    }
+}
+
 /// The menu-bar presence. With the window hidden this is the only thing telling
 /// the owner Beetbot is still up — and the only way to say "stop", which is why
 /// Quit lives here rather than being left to Cmd-Q alone.
 fn build_tray(app: &tauri::App) -> tauri::Result<()> {
-    use tauri::menu::{Menu, MenuItem};
+    use tauri::menu::{IsMenuItem, Menu, MenuItem, PredefinedMenuItem};
     use tauri::tray::TrayIconBuilder;
 
     let open = MenuItem::with_id(app, "open", "Open Beetbot", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit Beetbot", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&open, &quit])?;
+
+    let extras = TRAY_EXTRAS
+        .lock()
+        .map(|e| e.clone())
+        .unwrap_or_default()
+        .iter()
+        .map(|(id, label)| MenuItem::with_id(app, id.as_str(), label, true, None::<&str>))
+        .collect::<tauri::Result<Vec<_>>>()?;
+
+    let separator = PredefinedMenuItem::separator(app)?;
+    let mut items: Vec<&dyn IsMenuItem<tauri::Wry>> = vec![&open];
+    for extra in &extras {
+        items.push(&separator);
+        items.push(extra);
+    }
+    items.push(&separator);
+    items.push(&quit);
+
+    let menu = Menu::with_items(app, &items)?;
 
     TrayIconBuilder::new()
         .icon(tauri::include_image!("icons/tray-icon.png"))
